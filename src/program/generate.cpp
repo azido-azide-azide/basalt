@@ -409,6 +409,7 @@ struct Options {
     bool coupled_draft = basalt::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
     bool mmap_experts = false;    ///< opt OUT of the resident arena, back to a file mapping
     std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes
+    int load_threads = 6;         ///< threads that read the pack into the resident arena at start-up
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM resident mode): `--resident-cpu-experts` with the copy
     /// page-locked when the driver allows (else locked in the working set), the RAM margin as headroom, and plain mmap
@@ -872,6 +873,9 @@ void usage() {
                  "  --shared-expert-arena FILE  back the resident arena with one MAP_SHARED file.\n"
                  "                       Put this file on /dev/shm, not ordinary SSD storage.\n"
                  "                       A small header binds an existing backing file to the same model.\n"
+                 "  --load-threads N     threads that read the pack into the resident arena at start-up (6).\n"
+                 "                       Start-up time only: raise it when the drive and the cores stream the\n"
+                 "                       pack faster than 6 threads pull. It changes no output.\n"
                  "  --resident-cpu-experts  with mmap and a static profile, keep the experts the GPU cache does not\n"
                  "                       hold resident in ordinary RAM (and the prompt path's lend region as far as\n"
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
@@ -1610,6 +1614,7 @@ int main(int argc, char** argv) {
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
+        else if (a == "--load-threads") o.load_threads = std::atoi(next("--load-threads"));
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
@@ -1955,7 +1960,8 @@ int main(int argc, char** argv) {
     }
     if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
         o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 ||
-        o.pool_workers < 0 || std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
+        o.pool_workers < 0 || o.load_threads < 1 ||
+        std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                            [](int slots) { return slots < 0; }) ||
         (o.expert_cache_remote[1] > 0 && o.expert_cache_remote[0] == 0) ||
         (o.expert_cache_remote[2] > 0 && o.expert_cache_remote[1] == 0)) {
@@ -3269,10 +3275,7 @@ int main(int argc, char** argv) {
         srcp = &src;
     } else {
         const uint64_t pin_limit = 0;   // the whole arena is pinned
-        // BASALT_LOAD_THREADS raises the thread count of the start-up arena read; 6 is the built-in value.
-        const char* load_threads_env = std::getenv("BASALT_LOAD_THREADS");
-        const int load_threads = std::max(1, std::atoi(load_threads_env ? load_threads_env : "6"));
-        if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/load_threads, err, pin_limit,
+        if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/o.load_threads, err, pin_limit,
                             o.shared_expert_arena)) {
             return fatal_start_error(err);
         }
