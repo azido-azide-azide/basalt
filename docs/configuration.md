@@ -125,7 +125,7 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `resident-budget-gib` | engine | number GiB | off | Like `resident-experts` but with at most N GiB of experts in RAM, hottest first. Refused when it would leave less than the RAM floor free; the error names the largest safe value. |
 | `resident-cpu-experts` | engine | switch | off | The lower-level form of `resident-experts` (with `mmap-experts`): experts in ordinary RAM. Use `resident-experts` instead. |
 | `mmap-experts` | engine | switch | off | Opt out of the resident arena and back to a file mapping. Speed then depends on the OS page cache. |
-| `shared-expert-arena` | engine | file path | off | Back the resident arena with one shared file so several processes use one copy. Put it on `/dev/shm`. |
+| `shared-expert-arena` | engine | file path | off | Back the resident arena with one shared file so several processes use one copy. Put it on `/dev/shm`, or on a hugetlbfs mount when a huge-page pool is reserved: the file is then rounded up to the huge-page size. |
 | `pool-workers` | engine | integer | 0 (every physical core but the host loop's) | CPU expert pool threads, lowered automatically to fit a container CPU quota. |
 | `pool-affinity` | engine | `all`, `auto`, `p-cores` | `all` | CPU affinity of the workers. `auto` and `p-cores` suit hybrid CPUs. |
 | `expert-profile-save` | engine | file path | off | Save what the adaptive tier learned (experts in VRAM and routing counts) to this file on exit and periodically. `tools/convert/convert.py --profile` reads it. |
