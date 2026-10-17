@@ -5,6 +5,25 @@
   </picture>
 </p>
 
+## This fork
+
+Upstream, plus the four patches one deployment runs on top of it - listed in
+[pull request #1](https://github.com/azido-azide-azide/basalt/pull/1):
+
+- **BF16 PLE rows** (`src/kernels/ngram.cpp`, `include/basalt/kernels/ngram.hpp`): the per-layer token
+  embedding table can be BF16 as well as IQ4_NL, Q5_0 or Q8_0; a row dequantises by a shift, so the pack's
+  values are used exactly.
+- **A shared arena on hugetlbfs** (`src/core/pinned.cu`): `--shared-expert-arena` takes a file on a
+  huge-page mount, not only `/dev/shm`. The file is truncated to a multiple of the huge page and its header
+  is reached through the mapping, since hugetlbfs accepts neither an unrounded `ftruncate` nor `read`/`write`;
+  a size mismatch is then told by the header, naming the size it wanted.
+- **`BASALT_LOAD_THREADS`** (`src/program/generate.cpp`): the thread count of the start-up arena read, 6 by
+  default. An environment variable, which `CONTRIBUTING.md` rules out - `--load-threads` is the upstream form.
+- **Tests for both**: BF16 rows through `ple_reader_test` (reader selftest plus an exact decode check), and
+  `pinned_shared_test` run with its arena file on hugetlbfs.
+
+Nothing else is changed.
+
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model. It targets one thing:
 Linux with an NVIDIA Blackwell GPU (sm_120). The experts that do not fit in VRAM live in system RAM (and optionally on
 a second GPU used as a peer expert tier), so a large MoE model runs on a single workstation.
