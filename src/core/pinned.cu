@@ -125,9 +125,18 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             SharedArenaHeader hdr{};
             std::memcpy(&hdr, map, sizeof hdr);
             if (std::memcmp(hdr.magic, kSharedArenaMagic, sizeof hdr.magic) != 0 ||
-                hdr.version != 1 || hdr.header_bytes != kSharedArenaHeaderBytes || hdr.arena_bytes != bytes) {
+                hdr.version != 1 || hdr.header_bytes != kSharedArenaHeaderBytes) {
                 munmap(map, (size_t) file_bytes);
                 note = "shared arena " + shared_file + " has an incompatible or missing header";
+                return nullptr;
+            }
+            // A hugetlbfs file's size is rounded up to the huge page, so two different
+            // arena sizes can share one size: the header's own count is what decides.
+            if (hdr.arena_bytes != bytes) {
+                munmap(map, (size_t) file_bytes);
+                note = "shared arena " + shared_file + " holds " +
+                       std::to_string((unsigned long long) hdr.arena_bytes) +
+                       " B of arena, expected " + std::to_string((unsigned long long) bytes) + " B";
                 return nullptr;
             }
             if (hdr.arena_hash != shared_hash) {
