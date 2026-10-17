@@ -17,8 +17,10 @@ Upstream, plus the four patches one deployment runs on top of it - listed in
   huge-page mount, not only `/dev/shm`. The file is truncated to a multiple of the huge page and its header
   is reached through the mapping, since hugetlbfs accepts neither an unrounded `ftruncate` nor `read`/`write`;
   a size mismatch is then told by the header, naming the size it wanted.
-- **`BASALT_LOAD_THREADS`** (`src/program/generate.cpp`): the thread count of the start-up arena read, 6 by
-  default. An environment variable, which `CONTRIBUTING.md` rules out - `--load-threads` is the upstream form.
+- **`--load-threads N`** (`src/program/generate.cpp`, `docs/configuration.md`): the thread count of the
+  start-up arena read. Upstream hardcodes 6 at the call site; this fork runs 16. A flag and a config entry, so it
+  follows `CONTRIBUTING.md` (no environment-variable knobs) - it replaces the `BASALT_LOAD_THREADS` variable the
+  first version of these patches used.
 - **Tests for both**: BF16 rows through `ple_reader_test` (reader selftest plus an exact decode check), and
   `pinned_shared_test` run with its arena file on hugetlbfs.
 
