@@ -3269,7 +3269,10 @@ int main(int argc, char** argv) {
         srcp = &src;
     } else {
         const uint64_t pin_limit = 0;   // the whole arena is pinned
-        if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
+        // BASALT_LOAD_THREADS raises the thread count of the start-up arena read; 6 is the built-in value.
+        const char* load_threads_env = std::getenv("BASALT_LOAD_THREADS");
+        const int load_threads = std::max(1, std::atoi(load_threads_env ? load_threads_env : "6"));
+        if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/load_threads, err, pin_limit,
                             o.shared_expert_arena)) {
             return fatal_start_error(err);
         }
