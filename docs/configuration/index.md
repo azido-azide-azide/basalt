@@ -2,7 +2,7 @@
 
 Every setting a user can pass to Basalt: the server options, the engine flags, the per-request sampling fields and
 the model file's sampling defaults. For what a setting does to speed, memory and output precision see the
-[README](../README.md) and [precision.md](precision.md).
+[running](../running.md) and [precision](../precision/index.md).
 
 - [How settings are given](#how-settings-are-given)
 - [Server](#server)
@@ -15,8 +15,9 @@ the model file's sampling defaults. For what a setting does to speed, memory and
 - [Conversation cache](#conversation-cache)
 - [Vision](#vision)
 - [Logging and diagnostics](#logging-and-diagnostics)
+- [Control vectors](#control-vectors)
 - [Sampling](#sampling)
-- [Example configurations](#example-configurations)
+- [Example configurations](examples.md)
 
 ## How settings are given
 
@@ -53,9 +54,7 @@ A config file is one JSON object with two optional blocks:
 - `model` and `tokenizer` paths are relative to the config file.
 - **Precedence:** command line > config file > built-in defaults. The engine receives the config file's flags, then
   the command line's, and a flag given twice takes its last value.
-- `spec`, `spec-min-p`, `mtp-max-t`, `peer-exclusive` and `max-context` are ordinary engine flags: on the command line
-  they pass through like any other, and in a config file they go in the `engine` block. An engine flag in `server`, or a
-  server option in `engine`, stops the server at startup, as does an unknown name.
+- An engine flag in `server`, or a server option in `engine`, stops the server at startup, as does an unknown name.
 - `api-key` cannot be set in a config file; a file that sets it is refused.
 - The built-in defaults are untuned (4096 context, fp16 KV, no speculation, no expert cache). A config file is how
   you tune them. The startup line `[server] engine: ...` lists what came from the file or the command line.
@@ -81,7 +80,8 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `idle-unload` | seconds | off | Unload the model after this long without requests; the next request loads it again. Frees VRAM for other programs. |
 | `min-free-vram-mib` | integer | off | Load an unloaded model only when this much VRAM is free, otherwise answer 503. Pairs with `lazy` and `idle-unload`. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
-| `tokenizer` | path | the model file's | Tokenizer directory; used only with the mock engine. |
+| `tokenizer` | path | `pack/full/tokenizer` in the source tree (a byte tokenizer if absent) | Tokenizer directory. Mock engine only. |
+| `mock-engine`, `script` | switch, string (repeatable) | off, a short greeting | Testing: run a scripted engine instead of the model, for clients and tests (no `model` needed); `script` is its answer, and given more than once, requests get them in turn. |
 | `config` | path | none | The config file. Command line only. |
 
 ## Model and GPUs
@@ -89,20 +89,25 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `gpu` | server | list of GPU numbers, e.g. `"0"` or `"0,1"` | every visible GPU | The cards to use, numbered as `nvidia-smi` numbers them. The first runs the model. A second card becomes the peer expert tier. Set it to keep other cards free or to pick which card is the main one. |
-| `peer-device` | engine | integer | the server sets `1` when two or more cards are visible | A second GPU as an adaptive expert-cache tier: it holds experts and computes their prompt rows. Rarely set by hand; `gpu` does it. Not with `layer-split` or `expert-cache-device1..3`. |
+| `peer-device` | engine | integer | off; the server sets `1` when two or more cards are visible | A second GPU as an adaptive expert-cache tier: it holds experts and computes their prompt rows. Rarely set by hand; `gpu` does it. Not with `layer-split` or `expert-cache-device1..3`. |
 | `peer-exclusive` | engine | switch | off | The peer card's experts live only there, not also in RAM. Uses less RAM, prefill is slower. Needs `resident-experts`. |
 | `peer-reserve-mib` | engine | integer MiB | 600 | VRAM the peer tier leaves free on its card. |
 | `peer-slots` | engine | integer | as many as fit | Expert slots on the peer card. Lower it to leave the card room for something else. |
 | `peer-prefill-rows` | engine | integer | half of chunk x top-k | Prompt rows per layer the peer computes. `0` keeps the prompt path on the main card. |
 | `layer-split` | engine | layer number, `K1,K2,...` or `auto` | off (one GPU) | Advanced: run the model in stages across GPUs, each stage a block of layers. The peer tier is the usual way to use a second card. |
 | `split-device` | engine | GPU numbers | the next visible GPUs | With `layer-split`, the devices of the later stages. |
+| `split-skip-if-fits` | engine | switch | off | Advanced. With `layer-split auto`, run on the first card alone when it holds every profiled expert, the session, the drafter and the reserve; a split then only adds hand-offs. |
+| `batch-groups` | engine | integer | 1 | Advanced. With `parallel` and `layer-split`, put the slots in this many groups pipelined through the GPUs; must divide the slot count. |
+| `trim-stage-weights` | engine | switch | off | Advanced. With an explicit `layer-split` list, each GPU loads only its own layers' dense weights. |
+| `pcie-frac` | engine | number 0..1 | 0.55, scaled down on a slow link | The share of each layer's missed experts the GPU reads over PCIe from the pinned RAM copy while the CPU computes the rest. `0` keeps every miss on the CPU (used to pin placement in identity checks). |
+| `pcie-mode` | engine | `auto`, `dma`, `kernel`, `direct` | `auto` (= `kernel`) | How that share reaches the GPU: `dma` copies through staging with the copy engine, `kernel` stages it with a copy kernel inside the graph, `direct` has the grouped kernel read the mapped arena. |
 
 ## Context and KV cache
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | integer tokens | 4096 | The longest context the engine allows. Raise it for long prompts; the KV cache grows with it. With `parallel`, this is shared by the slots. |
-| `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | KV storage. `int8` halves the VRAM. `q4_0` is 4-bit after a Hadamard rotation, half of `int8` again, slightly lower precision. `k8v4` keeps K in int8 and V in rotated 4-bit (816 B per cell against `int8`'s 1056); not with `kv-resident`. Use `int8` for long contexts; go lower when VRAM is short. See [precision.md](precision.md). |
+| `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | KV storage. `int8` halves the VRAM. `q4_0` is 4-bit after a Hadamard rotation, half of `int8` again, slightly lower precision. `k8v4` keeps K in int8 and V in rotated 4-bit (816 B per cell against `int8`'s 1056); not with `kv-resident`. Use `int8` for long contexts; go lower when VRAM is short. See [precision](../precision/index.md). |
 | `kv-resident` | engine | integer cells, minimum 20480, or `0` | 0 (all KV in VRAM) | Keep only this many cells of each attention layer's KV in VRAM and the whole K/V in pinned RAM; the freed VRAM goes to expert slots. A context that fits in N cells is not streamed. For very long contexts on a small card. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | the model file's, else `none` | Extend the context past the trained length. Fixed for the run: K in the cache is stored after RoPE. |
 | `rope-scale` | engine | number | the model file's, else 1 | The extension factor for `linear` and `yarn`. |
@@ -110,8 +115,9 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (262144), auto, 1, 32, 1 | YaRN's own parameters, as in llama.cpp. |
 | `mtp-window` | engine | integer cells | 32768 | The drafter attends to the last N cells; `0` is every cell. |
 
-With one GPU the KV cache is elastic: each session backs its first 32768 cells at startup and takes more from the
-expert cache only when a request needs it (not with `kv-resident` or `vram-elastic`). See the README.
+A server with `max-context` above 32768 has an elastic KV cache: each session backs its first 32768 cells at startup and
+takes more from the expert cache only when a request needs it. It is off when the model is split over GPUs with
+`layer-split` (a peer card is fine) and with `kv-resident` or `vram-elastic`. See [running](../running.md#concurrent-requests---parallel-n).
 
 ## Expert cache and memory
 
@@ -120,7 +126,7 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
 | `expert-cache` | engine | integer or `auto` | 0 (none) | Experts held in VRAM. `auto` uses every slot that fits after the weights, the sessions and `vram-reserve-mib`. Almost always `auto`. |
-| `vram-reserve-mib` | engine | integer MiB, at least 256 | 700 | VRAM left free on the main card for graphs, scratch and the head when `expert-cache auto` sizes the cache. Below 256 is refused. Raise it if the machine pages GPU memory or other programs need VRAM. |
+| `vram-reserve-mib` | engine | integer MiB, at least 256 | 700 (lowered automatically, down to 300, on a card that would otherwise get too few slots; a value you give is kept) | VRAM left free on the main card for graphs, scratch and the head when `expert-cache auto` sizes the cache. Below 256 is refused. Raise it if the machine pages GPU memory or other programs need VRAM. |
 | `resident-experts` | engine | switch | off | Keep the experts the GPU does not hold in page-locked RAM, so none is read from the file again. Leaves a RAM floor free for the OS. Recommended whenever the RAM can hold them. |
 | `resident-budget-gib` | engine | number GiB | off | Like `resident-experts` but with at most N GiB of experts in RAM, hottest first. Refused when it would leave less than the RAM floor free; the error names the largest safe value. |
 | `resident-cpu-experts` | engine | switch | off | The lower-level form of `resident-experts` (with `mmap-experts`): experts in ordinary RAM. Use `resident-experts` instead. |
@@ -133,6 +139,7 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | How often the profile is saved. |
 | `adapt-every` | engine | integer | 4 (`0` = static residency) | How many decode windows pass between adaptive rounds. A round moves experts between the tiers (see below). `1` follows the conversation fastest. |
 | `adapt-decay` | engine | number, 0 to 1 | 0.93 on a single card (with or without the peer); 0.7 when the experts are split over several cards | The factor the usage counts are multiplied by after each round. Lower forgets sooner; higher remembers longer. |
+| `prefill-cpu-share` | engine | number, 0 to 1 | 0.6 (`0` = the GPU streams every expert) | The share of the streamed (not VRAM-resident) experts that the CPU computes while a prompt is read; the GPU streams and computes the rest. The value is fixed, not tuned from timing, so the output is identical from run to run at a given value. A weaker CPU may do better with a lower value. |
 | `adapt-swaps` | engine | integer | 96 (`0` = static residency) | The most experts one round swaps into the main card's tier. |
 | `peer-adapt-swaps` | engine | integer | same as `adapt-swaps` (`0` = the peer's experts stay fixed) | The most experts one round moves on the peer card. |
 | `vram-elastic` | engine | switch | off | Hold the expert cache in segments so `POST /v1/vram` can lend VRAM to other programs between requests. |
@@ -151,21 +158,22 @@ each round every count is multiplied by `adapt-decay`, so recent routing outweig
 1 / (1 - decay) times the routing per round, so the decay sets how long the tier remembers: 0.93 is roughly the last 14
 rounds, 0.85 the last 7. Copies run on a side stream and land a few windows later; a window can wait for a landing while the tier is adapting. With `adapt-every 0` or `adapt-swaps 0`
 the tiers stay as loaded (`expert-profile-save` then has nothing to learn). Adaptation moves experts between the CPU and
-the GPUs, so output is not bit-identical from run to run; see [precision.md](precision.md).
+the GPUs, so output is not bit-identical from run to run; see [precision](../precision/index.md).
 
 A tuning note: on the NVIDIA NVFP4 pack (6-bit dense) with an RTX 5090 and an RTX 5060 Ti as the peer, both at a 400 W
 power limit, `--adapt-every 1 --adapt-decay 0.85` measured prose right after a topic switch 233.2 to 241.5 tok/s
 (+3.6%), a conversation 264.5 to 275.6 (+4.2%), and structured output 491.4 to 487.0 (neutral), each an ABBA run of 4
-processes per arm. A longer memory (`adapt-decay` 0.97 and up) cost 3 to 6% on prose.
+processes per arm. A longer memory (`adapt-decay` 0.97 and up) looked 3 to 6% slower on prose in single runs (about
+3% run-to-run noise).
 
 The startup lines `RAM floor ...` and `RAM ... free, guard ...` give the figures behind the memory floors. See the
-README's "Memory floors".
+[running](../running.md#memory-floors).
 
 ## Prefill
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a token count | 0 (the decode path) | Read prompts in batched chunks. `auto` takes the fewest equal chunks of at most 16384 tokens that the expert cache can lend buffers for; `auto:N` sets the ceiling; a number is a fixed chunk. Always set it to `auto` for serving. |
+| `prefill` | engine | `auto`, `auto:N` (N = 8192, 16384 or 32768), or a token count | 0 (the decode path) | Read prompts in batched chunks. `auto` takes the fewest equal chunks of at most 16384 tokens (32768 for packs whose expert blobs exceed 1.5 MiB, such as NVFP4) that the expert cache can lend buffers for; `auto:N` sets the ceiling; a number is a fixed chunk. Always set it to `auto` for serving. |
 | `no-prefill-borrow` | engine | switch | off | Reserve the prompt buffers' VRAM for the whole session instead of lending expert slots. Costs expert cache; only for experiments. |
 | `short-read` | engine | integer tokens | 64 | A text part of at most this many tokens goes through the decode windows instead of the batched path. `0` always uses the batched path. |
 
@@ -180,7 +188,7 @@ plain decoding would give.
 | `spec-min-p` | engine | number 0..1 | 0 (always draft to the cap; not set by the model file) | The drafter's cutoff: a draft enters the window only while it, and every draft before it, has at least this probability under the drafter. Higher values draft fewer, surer tokens. This is not the sampling `min_p` below. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Cap on the drafter's own window; longer windows then come from `suffix-draft` matches. |
 | `suffix-draft` | engine | integer tokens | 3 (`0` = drafter only) | Draft from an earlier repeat of the last N or more tokens of context (code edits, quoted text, tool-call JSON) when that is likelier to pay than the drafter. |
-| `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision.md](precision.md#relaxed-drafting). |
+| `relaxed-drafting` | engine (`[P]`) | `true`, or a number in (0, 1] | off | Optional, and it changes output. Under sampling, a draft the model gives probability P or more is kept even when the model's own draw would have been another token. Faster, but no longer the model's exact sampling distribution; lower P is faster and further from exact. Bare `true` or flag alone is 0.5. Greedy requests, `logit_bias`, JSON `response_format`, control tokens and tool calls stay exact. Single-stream only. Numbers: [precision](../precision/features.md#relaxed-drafting). |
 
 ## Parallel slots
 
@@ -206,7 +214,7 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `vision` | server | `off`, `on`, `peer`, `dynamic`, `cpu` | `off` | Image input; booleans are refused. `on`: encoder sidecar on the main GPU (about 2.2 GiB of expert cache). `peer`: the sidecar on the second `gpu` card. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: README, "Vision". `on` and `peer` need the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. |
+| `vision` | server | `off`, `on`, `peer`, `dynamic`, `cpu` | `off` | Image input; booleans are refused. `on`: encoder sidecar on the main GPU (about 2.2 GiB of expert cache). `peer`: the sidecar on the second `gpu` card. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). `on` and `peer` need the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. |
 
 ## Logging and diagnostics
 
@@ -219,6 +227,21 @@ plain decoding would give.
 | `decode-timing` | engine | switch | off | Diagnostic: one line per request on where its decode time went. |
 | `draft-log` | engine | file path | off | Diagnostic: one line per decode window, for studying draft policy. |
 | `stop-eos` | engine | switch | off | Stop when the model emits an end-of-turn token; the server handles stopping itself. |
+| `eos-ids` | engine | comma-separated token ids | 248044,248046 | The end-of-turn tokens `stop-eos` looks for. Setting it implies `stop-eos`. |
+| `exp` | engine | `NAME=VALUE[,...]` | none | Diagnostics. `concur9_logit_hash=1` prints a hash of each accepted row's logits on stderr, for the identity checks in [precision](../precision/builds.md#reproduce). |
+
+## Control vectors
+
+A control vector (a GGUF in llama.cpp's format) is added to the residual stream; with the server, a request switches it
+with `cvec` (0 or 1).
+
+| Setting | Where | Type, values | Default | What it does |
+| --- | --- | --- | --- | --- |
+| `control-vector` | engine | file path | off | A control vector at scale 1. |
+| `control-vector-scaled` | engine | `FILE:SCALE[,...]` | off | Control vectors with their scales. |
+| `control-vector-layer-range` | engine | two layer numbers, `A B` | 1 to the last layer | The layers it follows, inclusive. |
+| `cvec-mode` | engine | `add`, `project` | `add` | `add`: h += s v. `project`: h -= s (h.v) v with v a unit vector. |
+| `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Each layer's own direction, or layer L's direction everywhere (`project`). Not with `layer-split`. |
 
 ## Sampling
 
@@ -265,88 +288,3 @@ A bad value stops the server at startup; an unknown key is named in a warning an
 are printed at startup as `[server] sampling defaults: ...`, each marked `(command line)` or `(config)` when a launch
 option set it and unmarked when it comes from the model file. A launch option overrides the model file's value for
 that key; the others stay.
-
-## Example configurations
-
-The model path is relative to the config file. Start the server with `bin/basalt serve --config basalt_config.json`.
-
-### One GPU (32 GB) and RAM
-
-The experts the card cannot hold stay in page-locked RAM.
-
-```json
-{
-  "server": {
-    "model": "model.basalt",
-    "gpu": "0",
-    "host": "127.0.0.1",
-    "port": 8080
-  },
-  "engine": {
-    "expert-cache": "auto",
-    "prefill": "auto",
-    "spec": 7,
-    "spec-min-p": 0.5,
-    "max-context": 262144,
-    "kv": "int8",
-    "resident-experts": true,
-    "vram-reserve-mib": 700
-  }
-}
-```
-
-### A GPU and a second, smaller card as the peer expert tier
-
-Listing two cards makes the second one the peer tier. `vision: peer` puts the image encoder there too, and
-`peer-exclusive` keeps the peer's experts out of RAM.
-
-```json
-{
-  "server": {
-    "model": "model.basalt",
-    "gpu": "0,1",
-    "host": "127.0.0.1",
-    "port": 8080,
-    "vision": "peer"
-  },
-  "engine": {
-    "expert-cache": "auto",
-    "prefill": "auto",
-    "spec": 7,
-    "spec-min-p": 0.5,
-    "max-context": 262144,
-    "kv": "int8",
-    "resident-experts": true,
-    "peer-exclusive": true,
-    "vram-reserve-mib": 700
-  }
-}
-```
-
-### A low-VRAM card
-
-A smaller KV format and a shorter context leave more VRAM for experts; the rest stay in RAM.
-
-```json
-{
-  "server": {
-    "model": "model.basalt",
-    "gpu": "0",
-    "host": "127.0.0.1",
-    "port": 8080
-  },
-  "engine": {
-    "expert-cache": "auto",
-    "prefill": "auto",
-    "spec": 5,
-    "spec-min-p": 0.5,
-    "max-context": 65536,
-    "kv": "q4_0",
-    "resident-experts": true,
-    "vram-reserve-mib": 1024
-  }
-}
-```
-
-Optional on any of them: `"relaxed-drafting": 0.5` in `engine` trades exactness under sampling for speed (see
-[Speculative decoding](#speculative-decoding-mtp)).
