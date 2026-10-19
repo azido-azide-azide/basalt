@@ -1131,6 +1131,7 @@ __global__ void hc_l2_prefetch_kernel(const void* p0, size_t n0, const void* p1,
     }
 }
 
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 using KernelFn = void (*)(HcLaunch);
 constexpr KernelFn kKernels[2][MAXT] = {
     {hc_fused_kernel<1, false>, hc_fused_kernel<2, false>, hc_fused_kernel<3, false>, hc_fused_kernel<4, false>,
@@ -1140,7 +1141,9 @@ constexpr KernelFn kKernels[2][MAXT] = {
 
 unsigned long long* g_dbg = nullptr;
 int g_slot = 0;
+#endif
 }  // namespace
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 
 bool hc_fused_q8_rows_ok() { return true; }
 
@@ -1543,4 +1546,5 @@ void hc_l2_prefetch(const void* const* ptrs, const size_t* bytes, int n, void* s
     hc_l2_prefetch_kernel<<<8, 32, 0, (cudaStream_t) stream>>>(p[0], b[0], p[1], b[1], p[2], b[2], p[3], b[3]);
 }
 
+#endif
 }  // namespace basalt::kernels

@@ -352,6 +352,7 @@ __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T
 
 }  // namespace
 
+#ifndef FZ_DEV_ONLY   // host side: another translation unit (the mid chain) takes only the device code
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
     if (n_tok < 1 || n_tok > kDecMaxT || a.n_embd != 32 * 8 * NJ || a.h_k <= 0 || a.h_v % a.h_k != 0) {
         std::fprintf(stderr, "dec_gdn_rec: invalid arguments\n");
@@ -402,4 +403,5 @@ void dec_gdn_rec_norm(const DecRecArgs& a, int n_tok, void* stream) {
     if (e != cudaSuccess) { std::fprintf(stderr, "dec_gdn_rec_norm: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
+#endif
 }  // namespace basalt::kernels
