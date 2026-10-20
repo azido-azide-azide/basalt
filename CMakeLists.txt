@@ -243,6 +243,7 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/verify_kernels.cu
                         src/kernels/cuda/dec_gdn_rec.cu
                         src/kernels/cuda/dense_tc.cu
+                        src/kernels/cuda/mid_chain.cu
                         src/kernels/cuda/iq_kernels.cu
                         src/kernels/ngram.cpp
                         src/ngram/ple_reader.cpp)
@@ -512,6 +513,7 @@ add_executable(dec_commit_parity src/kernels/dec_commit_parity.cpp)
 target_include_directories(dec_commit_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(dec_commit_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME dec_commit_parity COMMAND dec_commit_parity)
+basalt_gpu_test(NAME dec_commit_finisher COMMAND dec_commit_parity --finisher)
 # the IQ kernels that decode a weight part once for every column/entry, bitwise vs the per-column ones
 # (GPU, synthetic, no model; --bench adds old/new timings)
 add_executable(iq_multi_parity src/kernels/iq_multi_parity.cpp)
@@ -552,6 +554,11 @@ target_link_libraries(pk_moe_bench PRIVATE kernels ${_gpu_runtime_target})
 add_executable(hc_fused_parity src/kernels/hc_fused_parity.cpp)
 target_include_directories(hc_fused_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(hc_fused_parity PRIVATE kernels ${_gpu_runtime_target})
+add_executable(mid_chain_parity src/kernels/mid_chain_parity.cpp)
+target_include_directories(mid_chain_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(mid_chain_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME mid_chain_parity COMMAND mid_chain_parity 20)
+set_tests_properties(mid_chain_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_executable(gr_parity src/kernels/gr_parity.cpp)
 target_include_directories(gr_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(gr_parity PRIVATE kernels ${_gpu_runtime_target})

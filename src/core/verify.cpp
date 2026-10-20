@@ -17,6 +17,7 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/fused_gr.hpp"
+#include "basalt/kernels/mid_chain.hpp"
 #include "basalt/kernels/hc_fused.hpp"
 #include "basalt/kernels/cvec.hpp"
 #include "basalt/kernels/dec_gdn.hpp"
@@ -261,6 +262,7 @@ struct Bump {
 // The commit graph is two launches, its GDN part from 32 persistent blocks so it trickles beside the draft instead of
 // filling the card
 constexpr int kCommitBlocks = 32;
+bool g_commit_async = false;   // see Verifier::set_commit_async
 
 // Every layer's BF16 router [n_expert x n_embd] as int8 with one scale per 32 values (the warm-ups' predictor, a
 // prediction only).  False when a layer's router is not such a table.
@@ -695,6 +697,7 @@ Verifier::~Verifier() {
         slot.compare_exchange_strong(me, nullptr);
     }
     if (cs_) cudaStreamSynchronize(cs_);
+    if (cm_) cudaStreamSynchronize(cm_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
     if (sh_hi_) cudaStreamSynchronize(sh_hi_);
     if (ring_hi_) cudaStreamSynchronize(ring_hi_);
@@ -723,6 +726,9 @@ Verifier::~Verifier() {
     if (h_segb_) cudaFreeHost(h_segb_);
     if (h_qseg_) cudaFreeHost(h_qseg_);
     if (cs_) cudaStreamDestroy(cs_);
+    if (cm_) cudaStreamDestroy(cm_);
+    if (ev_commit_go_) cudaEventDestroy(ev_commit_go_);
+    if (commit_ctl_) cudaFree(commit_ctl_);
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
     if (sh_hi_) cudaStreamDestroy(sh_hi_);
     if (ring_hi_) cudaStreamDestroy(ring_hi_);
@@ -740,7 +746,7 @@ Verifier::~Verifier() {
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_, h_pend_,
                      h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
@@ -871,6 +877,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     basalt::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     basalt::kernels::hc_fused_init();
+    basalt::kernels::mid_chain_init();
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -929,6 +936,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * basalt::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
+              mapped(64, (void**) &h_pend_, (void**) &m_pend_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
               mapped(T * 4 + 16, (void**) &h_q_, (void**) &m_q_) &&
@@ -1054,6 +1062,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         std::fprintf(stderr, "basalt verify: side branches at stream priority %d\n", greatest);
     }
+    if (cudaStreamCreateWithPriority(&cm_, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_commit_go_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaMalloc((void**) &commit_ctl_, sizeof(basalt::kernels::CommitCtl)) != cudaSuccess ||
+        cudaMemset(commit_ctl_, 0, sizeof(basalt::kernels::CommitCtl)) != cudaSuccess) {
+        err = "verify: commit stream create failed";
+        return false;
+    }
+    {
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device_ >= 0 ? device_ : 0);
+        fin_blocks_ = sms;
+    }
+    *(volatile uint32_t*) h_pend_ = 0;
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
@@ -1173,6 +1194,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
     }
+    // ---- the async commit's remainder (a no-op when none is pending): nothing below reads or writes what it works on until
+    // this node returns - the GDN state, conv history, indexer buffers and PLE history, nor the rows it reads (h_L_,
+    // qkv_L_, gate_L_, beta_L_, idx_raw_L_, tail_snap_, hist_snap_), which the first kernels' launches order after it
+    if (finisher_on() && !batch_rec_ && cs == cs_) {
+        const GdnCommitLayers fa = commit_gdn_args();
+        if (fa.n_layers > 0) gdn_commit_finish(fa, commit_ctl_, cs, fin_blocks_);
+    }
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     if (batch_rec_) {   // the segment tables: which slot each row is
@@ -1225,6 +1253,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     bool ring_fork[2] = {false, false};   // the group's ring stream is joined in post
+    int mid_ord = 0;   // the mid chain's launches so far in this graph
     bool glue_on[2] = {false, false};   // post's gate/up launch plans the group's VRAM share
     DmRouteArgs glue_ring[2];   // the ring's work for post's gate/up launch
     auto pre = [&](int64_t l, int grp) -> bool {
@@ -1343,6 +1372,39 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return h;
         };
         const bool read_q8 = dec_hc && hc_fused_q8_rows_ok();
+        const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+        const bool router_multi = w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
+        // a GDN layer's middle as one persistent kernel (mid_chain.hpp) between the layer's two hc reads: the qkv + z pair,
+        // the recurrence and the output projection, bitwise the kernels it replaces
+        bool mid_ok = false;
+        MidChainArgs ma;
+        if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !prof_on_ && !batch_rec_ && tb == 0 && G == 1 &&
+            n <= kMidChainMaxT && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
+            const WeightRef *wqkv = v.get("attn_qkv.weight"), *wg = v.get("attn_gate.weight"),
+                            *wout = v.get("ssm_out.weight"), *wa = v.get("ssm_alpha.weight"),
+                            *wb = v.get("ssm_beta.weight"), *wc = v.get("ssm_conv1d.weight"),
+                            *wnm = v.get("ssm_norm.weight"), *wdt = v.get("ssm_dt.bias"), *wsa = v.get("ssm_a");
+            if (wqkv && wg && wout && wa && wb && wc && wnm && wdt && wsa && wqkv->native_data && wg->native_data &&
+                wout->native_data && dense_tc_pair_supported(wqkv->native_type, wg->native_type, (int) N) &&
+                dense_tc_supported(wout->native_type, (int) ZV, (int) N, wout->native_data) &&
+                dense_tc_type_on(wout->native_type)) {
+                const int64_t gi = gdn_idx[(size_t) l];
+                ma.T = n;
+                ma.xq = xq_;
+                ma.wq = wqkv->native_data; ma.wz = wg->native_data; ma.wo = wout->native_data;
+                ma.type_q = wqkv->native_type; ma.type_z = wg->native_type; ma.type_o = wout->native_type;
+                DecRecArgs& ra = ma.rec;
+                ra.state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
+                ra.qkv = qkv_L_ + (size_t) gi * MT * C; ra.conv_w = (const float*) wc->data; ra.x = mixed_ + tb * N;
+                ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
+                ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = z_;
+                ra.gamma = (const float*) wnm->data; ra.h = h_L_ + (size_t) gi * MT * C;
+                ra.gate = gate_L_ + (size_t) gi * MT * HV; ra.beta = beta_L_ + (size_t) gi * MT * HV; ra.yq = xq_;
+                ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+                ma.bo = bo_ + tb * N;
+                mid_ok = mid_chain_supported(ma);
+            }
+        }
         {
             // the read's first kernel follows a combine, copy or wait: a plain launch, except after the device-planned
             // tail's combine kernel (PDL2)
@@ -1352,9 +1414,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 HcFusedArgs h = hc_args(0, pending, inj2_, inj_);
                 if (read_q8) h.xq = xq_;
                 // the GDN qkv+z pair kernel follows (dense_tc_pair_mask & 16): its blocks start on the SMs the read leaves
-                h.next_early = read_q8 && (kernels::dense_tc_pair_mask() & 16) &&
+                h.next_early = mid_ok || (read_q8 && (kernels::dense_tc_pair_mask() & 16) &&
                                !is_qsa_layer(g, l) && tb == 0 && N == 2560 && n <= kDecMaxT &&
-                               dec_gdnf_mode() != 0;
+                               dec_gdnf_mode() != 0);
                 // a QSA layer's query projection follows (qsaf_wide path): its blocks start with the read
                 if (read_q8 && is_qsa_layer(g, l) && tb == 0 && N == 2560 && n <= kDecMaxT) {
                     const QsaState& st0 = ss.qsa_states[qsa_idx[(size_t) l]];
@@ -1369,9 +1431,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         stamp(l, 1, grp);
+        if (mid_ok) {
+            // the first read's dependent: its first pair tiles are already issued by the time the read ends (PDL)
+            PdlScope ps(pdl, mid_ord == 0);
+            ma.ord = mid_ord++;
+            mid_chain(ma, cs);
+        }
         float* xm = mixed_ + tb * N;
         try {
-            if (!is_qsa_layer(g, l)) {
+            if (mid_ok) {
+                // the middle ran in the mid chain
+            } else if (!is_qsa_layer(g, l)) {
                 // ======================= GDN =======================
                 const WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
                                 *wout = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
@@ -1784,8 +1854,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
-        const WeightRef* w_router = v.get("ffn_gate_inp.weight");
-        const bool router_multi = w_router != nullptr && native_router_enabled() && NE == 512 && K == 10;
         bool routed = false;   // the fused read ran the router too
         const bool sh_fork = !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr &&
                              ev_join_ != nullptr;
@@ -2281,38 +2349,70 @@ bool Verifier::capture(int T, std::string& err) {
     return true;
 }
 
+basalt::kernels::GdnCommitLayers Verifier::commit_gdn_args() const {
+    using namespace basalt::kernels;
+    const ModelGeometry& g = *g_;
+    const SessionState& ss = *ss_;
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, MT = max_t_;
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    int64_t gdn_index = 0;
+    for (int64_t l = 0; l < lb_; ++l) gdn_index += is_qsa_layer(g, l) ? 0 : 1;
+    GdnCommitLayers ga;
+    ga.state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
+    ga.h = h_L_ + (size_t) gdn_index * MT * C; ga.qkv = qkv_L_ + (size_t) gdn_index * MT * C;
+    ga.gate = gate_L_ + (size_t) gdn_index * MT * HV; ga.beta = beta_L_ + (size_t) gdn_index * MT * HV;
+    ga.state_stride = gdn_floats; ga.h_stride = (size_t) MT * C; ga.gb_stride = (size_t) MT * HV;
+    ga.C = (int) C; ga.h_k = (int) g.ssm_k_heads; ga.h_v = (int) HV; ga.n_keep = commit_;
+    for (int64_t l = lb_; l < le_; ++l) ga.n_layers += is_qsa_layer(g, l) ? 0 : 1;
+    return ga;
+}
+
+bool Verifier::finisher_on() const {
+    return g_commit_async && next_ == nullptr && lb_ == 0 && le_ >= g_->n_layers && commit_ctl_ != nullptr &&
+           fin_blocks_ > 0;
+}
+
+bool Verifier::commit_begun() const {
+    const Clock::time_point t0 = Clock::now();
+    while (*(volatile uint32_t*) h_pend_ != commit_epoch_) {
+        if (ms_since(t0) > 0.5) return false;
+    }
+    return true;
+}
+
+void Verifier::order_after_commit() {
+    if (commit_pending_) cudaStreamWaitEvent(cs_, commit_done_, 0);
+}
+
+// The commit on its own stream: the epoch's counters, the indexer and PLE commits, then the GDN items from `kCommitBlocks`
+// blocks that claim them one at a time (the next window's finisher claims what is left).
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
     using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     const QsaShapes s = shapes_of(g);
-    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const int64_t ID = g.idx_key_dim, MT = max_t_;
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+    if (cudaStreamBeginCapture(cm_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin commit capture failed";
         return false;
     }
     bool ok = true;
     try {
-        if (prof_on_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 3), cs_);
-        copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
-        int64_t qsa_index = 0, gdn_index = 0;
-        for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        {   // every GDN layer's replay in one launch, every QSA layer's indexer appends in another
-            GdnCommitLayers ga;
-            ga.state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-            ga.h = h_L_ + (size_t) gdn_index * MT * C; ga.qkv = qkv_L_ + (size_t) gdn_index * MT * C;
-            ga.gate = gate_L_ + (size_t) gdn_index * MT * HV; ga.beta = beta_L_ + (size_t) gdn_index * MT * HV;
-            ga.state_stride = gdn_floats; ga.h_stride = (size_t) MT * C; ga.gb_stride = (size_t) MT * HV;
-            ga.C = (int) C; ga.h_k = (int) g.ssm_k_heads; ga.h_v = (int) HV; ga.n_keep = commit_;
+        if (prof_on_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 3), cm_);
+        copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cm_);
+        gdn_commit_begin(commit_ctl_, m_commit_ + 2 + MT, m_pend_, cm_);
+        int64_t qsa_index = 0;
+        for (int64_t l = 0; l < lb_; ++l) qsa_index += is_qsa_layer(g, l) ? 1 : 0;
+        {   // every QSA layer's indexer appends in one launch, every GDN layer's replay in another
+            const GdnCommitLayers ga = commit_gdn_args();
             QsaCommitLayers qa;
             qa.pos = commit_ + 2; qa.epsilon = EPS; qa.n_tok = (int) MT;
             for (int64_t l = lb_; l < le_ && ok; ++l) {
-                if (!is_qsa_layer(g, l)) { ++ga.n_layers; continue; }
+                if (!is_qsa_layer(g, l)) continue;
                 const LayerView v(*wt_, l);
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wikn || qa.n_layers >= kQsaCommitMaxLayers) { ok = false; break; }
@@ -2324,19 +2424,17 @@ bool Verifier::capture_commit(std::string& err) {
                 q.tail = st.idx_tail; q.dead = st.idx_dead; q.pooled = st.idx_pooled; q.block_pos = st.idx_block_pos;
                 q.max_cells = (int) st.max_cells;
             }
-            if (ok) {
-                gdn_commit_layers(ga, cs_, kCommitBlocks);
-                native_qsa_indexer_commit_layers(qa, s, rope_scaling(), cs_);
-            }
+            if (ok) native_qsa_indexer_commit_layers(qa, s, rope_scaling(), cm_);
+            if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cm_);
+            if (ok) gdn_commit_layers_dyn(ga, commit_ctl_, cm_, kCommitBlocks);
         }
-        if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs_);
-        if (prof_on_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 4), cs_);
+        if (prof_on_) gpu_stamp(prof_, (int) (g.n_layers * kProfPer + 4), cm_);
     } catch (const std::exception& e) {
         err = std::string("verify commit: ") + e.what();
         ok = false;
     }
     cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    const cudaError_t ce = cudaStreamEndCapture(cm_, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         return false;
@@ -2684,6 +2782,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     dev.stamp(5);
     if (next_ == nullptr && dev.on) { dev.next_window(); dev.record(DecodeEvents::kVerifyPre, cs_); }
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
+    // an async commit still running: the window's first node waits for it once the commit's begin kernel has run (the
+    // device then knows the epoch); if that does not happen within moments, the window follows the commit on the device
+    if (!finisher_on() || (commit_pending_ && !commit_begun()))
+        order_after_commit();
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
@@ -2849,7 +2951,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         dm_->wstat_windows = 0;
         dm_->wstat_t = 0;
     }
-    commit_pending_ = false;
+    // the window does not retire the commit: whoever reads the session from the host or another stream calls wait_commit(),
+    // and a finished event is noticed here at no cost
+    if (commit_pending_ && cudaEventQuery(commit_done_) == cudaSuccess) commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
@@ -2932,7 +3036,6 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
-namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on; }
 
 bool Verifier::chain_on() { return true; }
@@ -2945,21 +3048,27 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         h_commit_[0] = n_keep;
         h_commit_[1] = n_keep - 1;
         for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+        if (++commit_epoch_ == 0) ++commit_epoch_;
+        h_commit_[2 + max_t_] = (int32_t) commit_epoch_;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        decode_events().record(DecodeEvents::kCommitPre, cs_);
-        const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
-        decode_events().record(DecodeEvents::kCommitPost, cs_);
+        // after the window that produced the rows, on the commit's own stream
+        cudaEventRecord(ev_commit_go_, cs_);
+        cudaStreamWaitEvent(cm_, ev_commit_go_, 0);
+        decode_events().record(DecodeEvents::kCommitPre, cm_);
+        const cudaError_t le = cudaGraphLaunch(commit_exec_, cm_);
+        decode_events().record(DecodeEvents::kCommitPost, cm_);
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-        // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
-        // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
-        // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
+        // set_commit_async: no wait here - the next window's first node waits for the epoch (the host names it in
+        // h_pend_), and the drafter (its own stream) reads only this window's final rows and its own K/V.  h_commit_ is
+        // next written after the next window's results are read, i.e. after this graph has run.  Everything else waits
+        // on commit_done_ (wait_commit).
         if (!g_commit_async || next_ != nullptr) {
-            const cudaError_t se = cudaStreamSynchronize(cs_);
+            const cudaError_t se = cudaStreamSynchronize(cm_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
-            const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+            const cudaError_t re = cudaEventRecord(commit_done_, cm_);
             if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
-            (void) cudaStreamQuery(cs_);
+            (void) cudaStreamQuery(cm_);
             commit_pending_ = true;
         }
         decode_gaps().mark(4);
@@ -3358,6 +3467,7 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
     if (dm && !dm_begin(err, nullptr)) return false;
+    order_after_commit();
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -3454,6 +3564,7 @@ bool Verifier::commit_slots_begin(const int* n_keep, std::string& err) {
         }
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    order_after_commit();
     const cudaError_t le = cudaGraphLaunch(commit_bm_[last_t_], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
     // (the PLE history the commit leaves is known from the tokens: it advances now, the graph runs beside the caller)
@@ -3499,6 +3610,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
     if (!stage_batch(rows, nullptr, S, base, tokens, pos, err)) return false;
+    order_after_commit();
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[S], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
