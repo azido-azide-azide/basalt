@@ -140,6 +140,9 @@ public:
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
+    /// The window capacity in rows given to init.  A batch planner must never build a window with more rows than this;
+    /// kVerifyMaxT only bounds the graphs, not this verifier.
+    int max_t() const { return max_t_; }
 
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
@@ -159,6 +162,10 @@ public:
     /// clears it.  Applies to this verifier's own sampling only: the drafter never sees it.  Call before set_sampling;
     /// copied to the final stage's device only when it changed.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
+    /// Draws row `t` of the window just run again, with `bias` (one float per vocabulary entry, -inf bans) in place of
+    /// the request's logit_bias; the penalties, the filters and the position's draw are the window's own. `pos0` is the
+    /// window's first position. The token is in `token`; the window's other rows are untouched.
+    bool resample_row(int t, int64_t pos0, const std::vector<float>& bias, int32_t& token, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len` int32
     /// slots at that stride (`basalt::kernels::penalty_rows` builds them), most recent token LAST, unused front slots
@@ -297,15 +304,6 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
-    /// Split the window into two token groups and pipeline the CPU experts of one with the GPU work of the other
-    /// (default on).  Set before the first `run`.
-    void set_split(bool on) { split_ = on; }
-    /// How the PCIe share of the misses reaches the GPU: 0 = DMA into staging (the copy engine works beside the CPU;
-    /// best when the CPU is compute-bound, the i-quants), 1 = the grouped kernel reads the mapped arena directly,
-    /// 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when the CPU is
-    /// RAM-bound, Q2_0).  Set before the first `run`.
-    void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
-    /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     double ms_launch = 0;   ///< host time inside the window graph's launch
@@ -391,6 +389,7 @@ private:
     bool draft_probe_ = false;           ///< set_draft_probe
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
+    float* row_bias_device_ = nullptr;   ///< resample_row's bias
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     std::atomic<bool> released_{false};   // release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
@@ -412,7 +411,6 @@ private:
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
-    bool copy_used_ = false;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     double prof_graph0_ = 0;                        // the graph's start to layer 0's first stamp (ns, summed)
@@ -485,19 +483,14 @@ private:
     bool commit_begun() const;                       ///< the begin kernel of the last async commit has run
     void order_after_commit();                       ///< a launch on cs_ outside the solo windows follows the async commit
     basalt::kernels::GdnCommitLayers commit_gdn_args() const;
-    cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
-    struct FlagSet { uint32_t* flag; uint32_t value; };
-    FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
-    static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
+    static void raise_flag_b(void* ctx);
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
-    void set_plan_slot(int grp);
-    bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[9] = {};
+    void set_plan_slot();
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device
@@ -525,7 +518,6 @@ private:
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
-    uint16_t* sh_bf16_ = nullptr;
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM

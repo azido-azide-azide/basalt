@@ -123,8 +123,8 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
 /// `moe_layer` consumes it directly; the doorbell protocol's job is to let it be produced DURING the layer rather
 /// than before it, which is a change to *when* the host runs, not to what this function computes.
 ///
-/// `sync_every_layer` inserts a device synchronisation and an error check after EVERY layer.  That is the
-/// `--sync-every-layer` debug mode, and it is deliberately a parameter rather than a compile-time choice: the errors
+/// `sync_every_layer` inserts a device synchronisation and an error check after EVERY layer.  That is a
+/// debug mode, and it is deliberately a parameter rather than a compile-time choice: the errors
 /// it catches (a kernel reading a buffer that a later layer writes) are invisible otherwise, and the synchronisation
 /// it costs is exactly what the fast path avoids.
 bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
@@ -344,13 +344,12 @@ using PoolFn = void (*)(void* user, const float* x_f, const int32_t* ids, const 
 ///
 /// Per-token scratch that MUST NOT be reallocated per token.
 ///
-/// **`session_loop` IS CALLED ONCE PER TOKEN, SO ANYTHING IT ALLOCATES IS A PER-TOKEN ALLOCATION**, and these three
+/// **`session_loop` IS CALLED ONCE PER TOKEN, SO ANYTHING IT ALLOCATES IS A PER-TOKEN ALLOCATION**, and these two
 /// must not be:
 ///
 ///   * `cudaHostAlloc` for the pool's pinned staging, freed by an RAII destructor at the end of the call - and
 ///     `cudaFreeHost` IMPLICITLY SYNCHRONISES THE DEVICE, so every token would end with a device sync;
-///   * `cudaEventCreate` / `cudaEventDestroy` for the doorbell probe;
-///   * a host-affinity change (`physical_cores` + pin + restore).
+///   * `cudaEventCreate` / `cudaEventDestroy` for the doorbell probe.
 ///
 /// Own one of these at session setup and pass it in.  **Passing `nullptr` makes the loop allocate and free locally**,
 /// so every existing caller and test is unaffected, but the allocation is then visible at the call site instead of
@@ -359,12 +358,10 @@ struct SessionLoopScratch {
     float* y_miss = nullptr;        ///< pinned host staging for the pool's answer, `parts_bytes` long
     size_t parts_bytes = 0;
     cudaEvent_t probe = nullptr;
-    basalt::kernels::cpu::ThreadAffinity pinned_core{};  ///< affinity to restore, or invalid if the host was not pinned
-    bool pinned = false;
 
-    /// Allocates the buffers and pins the host thread.  Call ONCE, at session setup.
+    /// Allocates the buffers.  Call ONCE, at session setup.
     bool init(size_t parts_bytes_in, std::string& err);
-    /// Frees everything and restores the affinity.  Safe to call twice, or on a default-constructed object.
+    /// Frees everything.  Safe to call twice, or on a default-constructed object.
     void free();
 };
 

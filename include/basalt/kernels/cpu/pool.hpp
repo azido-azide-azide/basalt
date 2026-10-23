@@ -77,35 +77,13 @@ using platform::detect_cpu_topology;
 /// `skip_first` drops the first core, which is reserved for the host loop.
 std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
 
-/// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
-///
-/// `physical_cores(true)` keeps the workers off the first physical core so that the host loop can spin on
-/// `cudaEventQuery` without stealing a worker's cycles.  Nothing in the pool can enforce the other half of that, so
-/// this is it: the host loop calls this on entry and restores on exit.  An unpinned spinning host is free to land on a
-/// worker's core or its SMT sibling, which costs the pool bandwidth.
-///
-/// The previous host placement (see platform::ThreadPlacement): the complete, dynamically sized native placement,
-/// including CPU IDs above 63.
-using ThreadAffinity = platform::ThreadPlacement;
-
-/// Selects one encoded processor for the caller.
-/// Restore on the same calling thread. Pool-owned workers use hard group affinity instead.
-ThreadAffinity pin_current_thread(int core);
-void restore_thread_affinity(const ThreadAffinity& previous);
-
 class ExpertPool {
 public:
-    /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores (minus core
-    /// 0 by default) and each owns one `ExpertScratch`, so nothing in the token path allocates.
+    /// `n_workers` is the worker count (at least 1); the caller sizes it (see program/auto_plan).  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
     ///
-    /// **`host_works` PUTS THE HOST THREAD INTO THE DRAIN.**
-    ///
-    /// The pool reserves core 0 for the host loop so the doorbell spin cannot steal a worker's cycles - but during
-    /// `run()` the host does not spin, it waits, so core 0 is idle for the whole drain.  With `host_works`, `run()`
-    /// claims jobs itself instead of spinning on `done_`, and the pool uses every core.  `false` is the A/B arm - the
-    /// counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
-                        PoolAffinity affinity = PoolAffinity::All);
+    /// The host thread joins the drain: `run()` claims jobs itself instead of spinning on `done_`, so the pool uses
+    /// every core.
+    explicit ExpertPool(int n_workers, PoolAffinity affinity = PoolAffinity::All);
     /// The watchdog's view of the pool: the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();
@@ -113,12 +91,12 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
-    /// The cgroup CPU quota, in CPUs, that capped the default worker count; 0 when it did not.
-    double quota_limit() const { return quota_limit_; }
-    /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
-    /// is on" is only true if the engine says which adaptation it took.
-    bool host_works() const { return host_works_; }
-
+    /// How many of the workers take work.  The rest stay parked and never claim.
+    int active_workers() const { return active_.load(std::memory_order_relaxed); }
+    /// Change the active worker count live, clamped to 1..workers(); returns the count in effect.  The threads stay as
+    /// created.  Host thread only, between batches: it waits for every worker to park first.  Work is split by the
+    /// active count, so a given count always cuts the same tasks, and outputs do not depend on the count.
+    int set_active_workers(int k);
     bool is_hybrid() const { return topo_.is_hybrid; }
     int p_cores() const { return topo_.p_cores; }
     int p_threads() const { return topo_.p_threads; }
@@ -194,11 +172,11 @@ private:
     void publish();
 
     int n_ = 0;
-    double quota_limit_ = 0.0;
-    bool host_works_ = true;
+    /// Workers with id < active_ take work; written only while every worker is parked, before the next publish.
+    std::atomic<int> active_{0};
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;
-    /// The host's own scratch when `host_works_`.  A separate object rather than a share of `scratch_[i]`,
+    /// The host's own scratch .  A separate object rather than a share of `scratch_[i]`,
     /// because a worker may own any index and the two must not be able to collide.
     ExpertScratch host_scratch_;
     // `run()`'s three phases, accumulated.  Host-thread only; see `phase_ms`.

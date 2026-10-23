@@ -1,0 +1,151 @@
+{
+  "preset": "basalt-bench --community",
+  "runs": [
+    {
+      "submitter": "jesdga95",
+      "date": "2026-10-23",
+      "commit": "0751113739",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 400
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180
+        }
+      ],
+      "ram_gib": 121,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 7637.6,
+      "prefill_64k_tps": 9117.7,
+      "decode_tps": 422.3
+    },
+    {
+      "submitter": "jesdga95",
+      "date": "2026-10-21",
+      "commit": "942ccf3aac",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5090",
+          "vram_gib": 32,
+          "power_w": 400
+        }
+      ],
+      "ram_gib": 121,
+      "os": "Linux",
+      "quant": "NVFP4",
+      "prefill_16k_tps": 6420.0,
+      "prefill_64k_tps": 8102.0,
+      "decode_tps": 303.8
+    },
+    {
+      "submitter": "jesdga95",
+      "date": "2026-10-21",
+      "commit": "942ccf3aac",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180
+        }
+      ],
+      "ram_gib": 121,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 2093.7,
+      "prefill_64k_tps": 2220.3,
+      "decode_tps": 111.9
+    },
+    {
+      "submitter": "lindworm-hermes2026",
+      "date": "2026-10-22",
+      "commit": "57909606c2",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360
+        }
+      ],
+      "ram_gib": 88,
+      "os": "WSL2",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 3179.8,
+      "prefill_64k_tps": 4351.7,
+      "decode_tps": 137.9,
+      "notes": "single RTX 5080 16GB, WSL2/Docker; 46.8 GiB experts, VRAM 18% + RAM copy, no SSD spill; engine 57909606c2 clean tree"
+    },
+    {
+      "submitter": "lindworm-hermes2026",
+      "date": "2026-10-22",
+      "commit": "57909606c2",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5080",
+          "vram_gib": 16,
+          "power_w": 360
+        }
+      ],
+      "ram_gib": 88,
+      "os": "WSL2",
+      "quant": "Q4_K_XL",
+      "prefill_16k_tps": 2834.8,
+      "prefill_64k_tps": 3608.2,
+      "decode_tps": 77.5,
+      "notes": "single RTX 5080 16GB, WSL2/Docker; 72.3 GiB experts all in an 88 GiB VM (0 SSD spill) - the community gate passes on a 16GB card"
+    },
+    {
+      "submitter": "KimDaeHwan99",
+      "date": "2026-10-22",
+      "commit": "78ca1d6bd6",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180
+        },
+        {
+          "name": "RTX 5060 Ti",
+          "vram_gib": 16,
+          "power_w": 180
+        }
+      ],
+      "ram_gib": 60,
+      "os": "Linux",
+      "quant": "IQ3_S",
+      "prefill_16k_tps": 2369.8,
+      "prefill_64k_tps": 2459.0,
+      "decode_tps": 161.3,
+      "notes": "2x RTX 5060 Ti 16GB (PCIe 5.0 x8/x8, no P2P; 2nd card as the peer tier), Ryzen 5 9600X, 64GB DDR5-6400; 0 SSD spill"
+    },
+    {
+      "submitter": "foolio",
+      "date": "2026-10-23",
+      "commit": "702c08f783",
+      "preset": "community-1",
+      "gpus": [
+        {
+          "name": "RTX PRO 4000 Blackwell",
+          "vram_gib": 24,
+          "power_w": 145
+        }
+      ],
+      "ram_gib": 123,
+      "os": "Linux",
+      "quant": "UD-Q6_K_XL",
+      "prefill_16k_tps": 2674.5,
+      "prefill_64k_tps": 2970.3,
+      "decode_tps": 65.9
+    }
+  ]
+}

@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -173,7 +174,7 @@ class Precedence(unittest.TestCase):
                 split_engine_extras(bad)
 
     def test_former_server_options_are_engine_flags(self):
-        for name in ("spec", "spec-min-p", "mtp-max-t", "max-context", "peer-exclusive"):
+        for name in ("spec", "mtp-max-t", "max-context", "peer-exclusive"):
             self.assertNotIn(name, server_options(build_parser()))
         _, _, _, cli_words = parse(["--spec", "5", "--peer-exclusive", "--max-context=8192"])
         self.assertEqual(cli_words, ["--spec", "5", "--peer-exclusive", "--max-context", "8192"])
@@ -188,11 +189,10 @@ class Precedence(unittest.TestCase):
                                       "--control-vector-layer-range", "4", "44"], ["--spec", "7"]),
                          "[server] engine: --max-context 32768 (config), --resident-experts (config), "
                          "--kv int8 (config), --control-vector-layer-range 4 44 (config), --spec 7 (cli)")
-        self.assertEqual(engine_line([], [], config=False),
-                         "[server] engine: built-in defaults (no --config): spec off, 4096 context")
-        self.assertEqual(engine_line([], ["--spec", "7"], config=False),
-                         "[server] engine: built-in defaults (no --config): spec 7, 4096 context; --spec 7 (cli)")
-        self.assertEqual(engine_line([], []), "[server] engine: config sets nothing, built-in defaults")
+        self.assertEqual(engine_line([], ["--spec", "7"]), "[server] engine: --spec 7 (cli)")
+        self.assertEqual(engine_line([], [], grammar=(False, "cli")),
+                         "[server] engine: using default flags, grammar off (cli)")
+        self.assertEqual(engine_line([], []), "[server] engine: using default flags")
 
 
 class SamplingOptions(unittest.TestCase):
@@ -271,10 +271,10 @@ class SlotContext(unittest.TestCase):
     def test_engine_line_shows_the_division(self):
         ap = build_parser()
         a, _, file_words, cli_words = parse_settings(ap, ["--parallel", "4", "--max-context", "65536"])
-        line = engine_line(file_words, cli_words, False, (a.shared_context, a.parallel))
+        line = engine_line(file_words, cli_words, (a.shared_context, a.parallel))
         self.assertEqual(flag_value(cli_words, "--max-context"), "16384")
         self.assertIn("--max-context 16384 (cli: 65536 / 4 slots)", line)
-        self.assertNotIn("slots", engine_line(file_words, cli_words, False))
+        self.assertNotIn("slots", engine_line(file_words, cli_words))
 
     def test_slot_full_context_keeps_the_whole(self):
         self.assertEqual(self.context(["--parallel", "4", "--max-context", "262144", "--slot-full-context"]), 262144)
@@ -301,7 +301,7 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            if name in ("api-key", "engine-bin"):
+            if name in ("api-key", "engine-bin", "grammar"):   # grammar is on by default: no-grammar differs, see test_grammar
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):
@@ -318,8 +318,10 @@ class EveryOption(unittest.TestCase):
 
     def test_every_engine_flag_by_both_paths(self):
         flags = engine_parser_flags()
-        self.assertGreater(len(flags), 100)
         server = set(server_options(build_parser()))
+        # A parse that came back empty or cut short would make the loop below vacuous.
+        self.assertIn("--help", flags)
+        self.assertTrue(any(f[2:] not in server for f in flags), "no engine-only flags parsed")
         engine_bin = write("\0".join(flags) + "\0", "fake-engine")
         known = engine_flags_of(engine_bin)
         self.assertEqual(known, set(flags))
@@ -368,11 +370,18 @@ class ApiKey(unittest.TestCase):
         self.assertFalse(exposed_without_key("127.0.0.1", ""))
 
 
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 class Startup(unittest.TestCase):
     """The server process itself: the checks of main() apply to values from the file."""
 
     def run_server(self, cfg, *argv):
-        r = subprocess.run([sys.executable, "-m", "serve.server", "--config", conf(cfg), *argv], cwd=ROOT,
+        own_port = [] if "port" in cfg.get("server", {}) or "--port" in argv else ["--port", str(free_port())]
+        r = subprocess.run([sys.executable, "-m", "serve.server", "--config", conf(cfg), *own_port, *argv], cwd=ROOT,
                            capture_output=True, text=True, timeout=60, env=os.environ)
         return r.returncode, r.stderr
 

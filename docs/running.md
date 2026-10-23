@@ -1,6 +1,6 @@
 # Running the server
 
-The long-form notes behind the settings in [configuration](configuration/index.md): concurrent requests, the KV cache, prompt chunks, memory floors and image input.
+The long-form notes behind the settings in [configuration](configuration/index.md): concurrent requests, the KV cache, memory floors and image input. Diagnostic flags: `bin/basalt --help`.
 
 ## Concurrent requests: `--parallel N`
 
@@ -15,6 +15,8 @@ one that does not is refused with a 400 naming that length. `/slots`, `/props` a
 each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's `server` section) gives every slot
 the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
 solo session of the same length, come out of the expert cache.
+
+Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
 With `--max-context` above 32768 the KV cache is elastic (not when the model is split over GPUs with `--layer-split`, a peer
 card is fine, and not with `--kv-resident` or `--vram-elastic`): each session backs its first 32768
@@ -53,23 +55,11 @@ the slots that did fit; if fewer than two fit, `--batch is off` and the server r
   draw would have been another token. Lower P is faster and further from the model's true sampling distribution; the
   measured speed and cost per value are in [precision/features.md](precision/features.md#relaxed-drafting). Off by default:
   without it, speculative decoding returns exactly what plain sampling would. Greedy (temperature 0) requests,
-  `logit_bias`, JSON `response_format`, control tokens and everything inside a tool call stay exact. A request can set
+  `logit_bias`, a request with a grammar (JSON `response_format`, tools), control tokens and everything inside a tool call stay exact. A request can set
   its own value with `"relaxed_drafting": P` (or `false` for exact). Single-stream decoding only; `--parallel` slots
   stay exact.
-- The startup line `[server] engine: ...` lists the settings that came from the file or the command line; without
-  `--config` it says the built-in defaults apply.
-
-## Prompt chunks: `--prefill`
-
-A prompt is read in chunks. `--prefill auto` (the usual setting) takes the largest chunk whose buffers the expert cache
-can lend: the buffers are carved from the cache's last slots for the length of the prompt and the experts in those slots
-are copied back afterwards, so a short prompt lends only what it needs. A bare `auto` reads a prompt in the fewest equal chunks of at most 16384 tokens (32768 for packs whose expert blobs exceed 1.5 MB, such as NVFP4), because
-a chunk's cost per token stops falling past a few thousand tokens; it is still limited to what the lend can fund, which with
-`--resident-experts` is the lent slots whose experts the RAM copy holds plus a fixed amount of file reading (7 GiB), and without
-`--resident-experts` is 8192. `--prefill auto:N` (N = 8192, 16384 or 32768) sets the ceiling yourself; a number sets a
-fixed chunk. A prompt longer than one chunk is split into equal chunks (a short tail chunk costs nearly a whole pass over
-the streamed experts). The startup line `prompt chunk auto: N tokens` says what was
-chosen.
+- The startup line `[server] engine: ...` lists the settings that came from the file or the command line, then the grammar state; with
+  none it says `using default flags` (with or without `--config`), e.g. `using default flags, grammar off (cli)`.
 
 ## Memory floors
 
@@ -84,6 +74,9 @@ Basalt refuses settings that would leave the machine without memory, and never s
 - A server's RAM copy also leaves room for what serving takes after startup: the conversation checkpoints (each the
   model's whole running state, `--prompt-cache` of them per slot plus one), `--conversation-cache-mib`, one image's
   buffers and a request's own buffers. The startup line `RAM ... free, guard ...` gives the figures.
+- With the adaptive tier, the RAM copy also holds free places for the experts that leave the GPU, so a topic change can
+  swap quickly. The startup line `free places for the adaptive swaps` shows the count; if RAM is short, fewer are kept
+  and a round swaps fewer.
 - An explicit `--resident-budget-gib` that would leave less than that floor free is refused at startup; the error
   states the RAM free and the largest safe value ('max').
 - While serving, a request that finds MemAvailable below the margin plus 3.5 GiB (the margin alone when no expert is
@@ -121,3 +114,26 @@ The image encoder is Basalt's own, written for this model's vision tower (no lla
 products and flash attention with fp32 accumulation on the GPU, AVX-512/AVX2 on the CPU. It replaces llama.cpp's
 mtmd encoder as a drop-in, is faster than it at every image size, and stays closer to an fp32 reference: mtmd's fp16
 attention drifts on large images, ours does not.
+
+## `PROBE rates` (engine command)
+
+With `--serve`, the line `PROBE rates` on stdin, between requests, measures the machine's rates inside the loaded
+engine in about half a second and prints one block on stdout: `PROBE begin rates v1`, lines `PROBE <section> key=value ...`,
+`PROBE end ms=<wall>`. It changes no engine state (tiers, caches, KV, RNG, the CPU pool's active worker count) and saves
+nothing. Sections:
+
+| section | measures |
+|---|---|
+| `gpu`, `host`, `pack` | device, link generation and width, power limit, RAM, CPU pool, expert format |
+| `link` | pinned host-to-device and device-to-host GB/s per GPU, best of six 64 MiB bursts |
+| `gpu_mem` | device-to-device copy GB/s per GPU (counts the bytes read and written) |
+| `host_mem` | GB/s the CPU pool reads from RAM-resident experts, by active worker count |
+| `cpu_expert` | cold experts through the pool at 1, 2, 3 and 8 per call, at every measured worker count and the current one |
+| `peer` | peer round trip by entry count (1 to 8) and the linear fit: base and per-entry microseconds |
+| `copy` | one expert-sized copy into each GPU, and the peer round trip while such a copy runs |
+
+A step that cannot run prints `n/a` with a reason (no peer, no RAM-resident experts, a non-native expert format).
+During a batch the command answers `ERR PROBE: ...`.
+
+`PROBE set workers=K share=F` (either key) sets the CPU pool's active worker count and the prompt path's CPU share for the
+requests that follow, and answers `PROBE end workers=<count>`. It is for `basalt-probe`; the settings last until the engine stops.

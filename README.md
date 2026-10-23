@@ -31,6 +31,8 @@ It runs on Linux and Windows with an NVIDIA Blackwell GPU (sm_120); see [platfor
 Experts that do not fit in VRAM live in system RAM, and optionally on a second GPU used as a peer expert tier.
 A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compatible API.
 
+**Help wanted:** have some spare compute to lend for testing? See [Contributing](CONTRIBUTING.md#other-ways-to-help).
+
 <p align="center"><img src="docs/img/frontend.gif" alt="The Basalt web UI while a reply streams" width="720"></p>
 
 ## Requirements
@@ -44,7 +46,7 @@ A large MoE model runs on one workstation, behind an OpenAI- and Anthropic-compa
 ```sh
 git clone https://github.com/jesdga95/basalt && cd basalt
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-vision
+cmake --build build -j                  # bin/basalt, bin/basalt-bench, bin/basalt-probe, bin/basalt-vision
 pip install -r requirements.txt
 hf download jesdga/Qwen3.8-Flash-Next-Basalt Qwen3.8-FN-NVFP4.basalt --local-dir models
 ```
@@ -77,6 +79,7 @@ A model is one file: weights, tokenizer, MTP drafter, expert profile and vision 
 
 - [Configuration](docs/configuration/index.md): every setting.
 - [Running](docs/running.md): parallel requests, prompt chunks, memory floors, image input.
+- [basalt-probe](docs/probe.md): measures the machine, the cold decode speed, and suggests values.
 - [The .basalt model file](docs/model-file.md): the layout, and building a pack yourself (including NVFP4).
 - [Platforms](docs/platforms.md): Linux and Windows requirements, the build steps and the Windows limitations.
 - [Building and testing](docs/building.md), [Precision and quality](docs/precision/index.md), [Contributing](CONTRIBUTING.md).

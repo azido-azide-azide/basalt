@@ -6,13 +6,14 @@
 // hundreds of thousands of such batches - 0-4 jobs, run() and run_split(), with pauses long enough for the workers
 // to sleep - and checks that every batch returns, with every job's output written and equal to a first run's.  Idle
 // work (idle_start) runs between half of the batches, with a barrier across the workers like the warm-up's, and must
-// never be running once a batch or idle_stop has returned.  A watchdog thread turns a hang into a failure instead of a
+// never be running once a batch or idle_stop has returned.  The active worker count changes at random between batches.  A watchdog thread turns a hang into a failure instead of a
 // frozen test.
 //
 //   pool_stress [seconds]        (default 20)
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/cpu/expert.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -45,7 +46,7 @@ int main(int argc, char** argv) {
         jobs[(size_t) e].slot = e;
     }
 
-    cpu::ExpertPool pool;
+    cpu::ExpertPool pool((std::max)(1, (int) cpu::physical_cores(true).size()));
     std::printf("pool_stress: %d workers + host, %.0f s\n", pool.workers(), seconds);
     pool.run(jobs.data(), NJ);
     const std::vector<float> ref = out;
@@ -98,6 +99,8 @@ int main(int argc, char** argv) {
         } else if (rng() % 4 == 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(rng() % 300));
         }
+        // the active count moves between batches, over its whole range
+        if (rng() % 8 == 0) pool.set_active_workers(1 + (int) (rng() % (uint32_t) pool.workers()));
         if (rng() % 2) {
             idle.arrive.store(0);
             pool.idle_start(idle_fn, &idle);
@@ -120,6 +123,7 @@ int main(int argc, char** argv) {
         ++batches;
     }
     pool.idle_stop();
+    pool.set_active_workers(pool.workers());
     if (idle.active.load() != 0) ++overlaps;
     finished.store(true);
     dog.join();

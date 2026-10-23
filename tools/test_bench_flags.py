@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("BASALT_BIN", ROOT / "bin" / "basalt"))
 BENCH = Path(os.environ.get("BASALT_BENCH_BIN", ROOT / "bin" / "basalt-bench"))
 # bench's own options that share an engine flag's name
-BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--spec-min-p", "--set"}
+BENCH_OWNED = {"--help", "--model", "--engine", "--spec", "--set", "--seed"}
 
 
 def engine_flags() -> list[str]:
@@ -41,7 +41,14 @@ class BenchFlags(unittest.TestCase):
         return r.stdout.split()
 
     def test_the_flag_list_is_found(self):
-        self.assertGreater(len(engine_flags()), 100)
+        # Every flag the help lists is one the engine parser accepts; an empty or cut-short list would make the
+        # per-flag test vacuous.
+        flags = engine_flags()
+        parsed = set(re.findall(r'a == "(--[a-z0-9-]+)"', (ROOT / "src/program/generate.cpp").read_text()))
+        self.assertTrue(parsed)
+        self.assertEqual(sorted(set(flags) - parsed), [])
+        for known in ("--spec", "--kv", "--max-context", "--peer-device"):
+            self.assertIn(known, flags)
 
     def test_every_engine_flag_reaches_the_engine(self):
         for flag in engine_flags():
@@ -58,16 +65,43 @@ class BenchFlags(unittest.TestCase):
         self.assertEqual(cmd.count("--max-context"), 1)
 
     def test_a_switch_does_not_take_the_next_option(self):
-        cmd = self.command("--peer-exclusive", "-p", "16384", "-t", "prose", "--seed", "-1")
+        cmd = self.command("--peer-exclusive", "-p", "16384", "-t", "prose", "--vram-reserve-mib", "-1")
         self.assertIn("--peer-exclusive", cmd)
         self.assertNotIn("-p", cmd)
-        self.assertEqual(cmd[cmd.index("--seed") + 1], "-1")
+        self.assertEqual(cmd[cmd.index("--vram-reserve-mib") + 1], "-1")
+
+    def test_seed_is_the_benchs_and_is_not_passed_to_the_engine(self):
+        cmd = self.command("--seed", "7")
+        self.assertNotIn("--seed", cmd)
+        for bad in ("0", "-3", "x"):
+            r = subprocess.run([str(BENCH), "--model", "m.basalt", "--seed", bad], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
 
     def test_built_ins_are_minimal(self):
         cmd = self.command()
         self.assertEqual(cmd[cmd.index("--spec") + 1], "0")
         self.assertNotIn("--kv", cmd)
         self.assertNotIn("--resident-experts", cmd)
+
+    def test_community_keeps_the_engine_defaults(self):
+        cmd = self.command_community()
+        self.assertNotIn("--spec", cmd)
+        self.assertEqual(cmd[cmd.index("--kv") + 1], "int8")
+
+    def command_community(self) -> list[str]:
+        r = subprocess.run([str(BENCH), "--model", "m.basalt", "--fixtures", str(self.fixtures), "--print-command",
+                            "--community"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.split()
+
+    def test_community_refuses_anything_that_changes_the_workload(self):
+        for extra in (["--spec", "0"], ["--kv", "int8"], ["-t", "conv"], ["-p", "16384"], ["-r", "2"], ["--quality"], ["--seed", "7"],
+                      ["--set", "--kv int8"], ["-o", "json"], ["--engine", "x"], ["--", "--spec", "3"]):
+            with self.subTest(extra=extra):
+                r = subprocess.run([str(BENCH), "--model", "m.basalt", "--community", *extra],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("incomparable", r.stderr)
 
     def test_help_lists_the_engine_flags(self):
         r = subprocess.run([str(BENCH), "--help", "--engine", str(ENGINE)], capture_output=True, text=True)

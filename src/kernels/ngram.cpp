@@ -21,14 +21,6 @@
 
 namespace basalt::kernels {
 
-namespace {
-/// The A/B arm.  Host-token-path only, so it needs no atomics; see the note on `ple_prefetch_enable`.
-bool g_ple_prefetch = true;
-}  // namespace
-
-void ple_prefetch_enable(bool on) { g_ple_prefetch = on; }
-bool ple_prefetch_enabled() { return g_ple_prefetch; }
-
 PleConsts ple_artifact_consts() {
     // the GGUF metadata, verbatim.  Written once here rather than derived, because `head_offsets` is
     // ALSO in the metadata as its own array - and deriving one from the other would hide a mismatch between
@@ -235,7 +227,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         delete impl_->file;
         impl_->file = nullptr;
         impl_->data = nullptr;
-        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, io.cache_rows, err, io.io_thread,
+        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, io.cache_rows, err,
                                 impl_->rb)) {
             close();
             return false;
@@ -384,6 +376,16 @@ bool PleTable::gather_rows(const uint32_t* rows, size_t n_tokens, float* out, st
     }
     for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
     return true;
+}
+
+bool PleTable::warm_rows(const uint32_t* rows, size_t n_tokens, std::string& err) {
+    if (impl_->mode != PleIo::Direct) return true;
+    std::vector<uint8_t> raw(n_tokens * (size_t) PLE_N_HEADS * impl_->rb);
+    return impl_->reader.collect(impl_->reader.issue(rows, n_tokens * (size_t) PLE_N_HEADS, raw.data()), err);
+}
+
+uint64_t PleTable::cache_rows() const {
+    return impl_->mode == PleIo::Direct && impl_->reader.is_open() ? impl_->reader.cache_capacity() : 0;
 }
 
 bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {

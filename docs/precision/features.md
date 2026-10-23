@@ -97,22 +97,39 @@ head ignores the bias; it only proposes tokens, so a banned token it proposes is
 accepts fewer drafts. A request without a bias takes the unchanged captured greedy sample.
 
 Checked on IQ3_S with the tiers pinned as in the section below: requests with a bias (greedy and seeded, a ban, a
-boost, a mixed map, with and without a presence penalty) return the same text with `--spec 7 --spec-min-p 0.5` as with
+boost, a mixed map, with and without a presence penalty) return the same text with `--spec 7` as with
 `--spec 0`, and a request with an empty map matches one without the field. A -100 bias never yields the token and
 a +100 bias yields it at every step.
+
+## Request grammar
+
+A request with a `grammar` key (engine started with `--grammar on`) is checked on the host after each verify window.
+The tokens are fed to the grammar in order; at the first one it refuses, that row is drawn again with the grammar's
+mask added to the request's logit bias (same filters, penalties and position draw), and the window ends there, so the
+drafts after it are dropped like a rejection. A window the grammar accepts is untouched: no extra launch or sync.
+Tool-call grammars start at the call opener, JSON grammars at the first token after the thinking block. Relaxed
+drafting is off for a request with a grammar. The prompt is never constrained. Requests without the key, and the engine
+with `--grammar off`, run the unchanged path. The schema grammar is llama.cpp's (integer bounds, string length, patterns,
+array sizes and formats are enforced); what llama.cpp does not express (`uniqueItems`, number bounds, a pattern with no
+grammar form) is not enforced.
 
 ## Speculative decoding does not change output
 
 Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width
 (verify.hpp:3-8). This section tests that end to end.
 
+The default window is 8 tokens (`--spec 8`; an explicit `--spec N` is used as given). Greedy decoding with the drafter
+stays exact at any window. A sampled request is still drawn from the model's own distribution, but the window length
+sets which random draw each position uses, so a seeded sampled request can return different text than under another
+window. The tables below were measured with `--spec 7`; the exactness argument does not depend on the width.
+
 **Method.** 275 prompts: 272 chat-templated prompts with thinking off (152 prose, 60 chat, 60 code) plus the 3
 `data/bench` decode prompts (conv, struct, prose). 256 new tokens each, temperature 0, one engine session per
 configuration, same prompt order. A logit-hash diagnostic prints an FNV-1a hash of the full-vocabulary fp32 head logits
 of every accepted row. Token ids and the hash at each generated position are compared between `--spec 0` and
-`--spec 7 --spec-min-p 0.5`.
+`--spec 7`.
 
-Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0 --pcie-frac 0`, with `--expert-cache` and `--peer-slots`
+Expert tiers are pinned (`--adapt-swaps 0 --peer-adapt-swaps 0`, with `--expert-cache` and `--peer-slots`
 fixed to the sizes auto-sizing picks), so the same experts sit on the same device in both runs.
 
 | Pack | Prompts | Identical tokens | Logit rows compared | Bit-identical rows | First divergence | Accepted drafts | Decode tok/s, spec 0 → spec 7 |
@@ -148,7 +165,7 @@ against the base.
 - Identity is bitwise with the expert tiers pinned. With adaptation on, experts move between the CPU pool and the GPU,
   which round differently: a rounding difference, not a quality difference.
 - The GPU tiers (VRAM and peer card) share one arithmetic; the CPU tier quantizes with ggml's vec_dot_type (Q8_K per 256
-  for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:52-62). In the quality gate about 0.8% of
+  for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:48-49, 76-86). In the quality gate about 0.8% of
   routed experts were computed on the CPU (IQ3_XXS, default placement). The split is fixed per placement, so it is the
   same for spec 0 and spec 7.
 - Prompts are 19 to 395 tokens with 256 new tokens: this tests the decode path, not long context.
@@ -159,7 +176,7 @@ against the base.
 is kept only when it equals the target's own draw at that row (`src/program/generate.cpp`, the acceptance loop after
 `ver.run`). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
 final distribution (top_k, top_p, min_p, temperature and penalties applied). The sampler reports that probability next to
-its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu:1512); the logits and the draws themselves do not change.
+its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu:1375); the logits and the draws themselves do not change.
 
 **What changes.** The drafts are the draft head's argmax, fixed by the context. At a row where the draft d has
 p(d) ≥ P, the output is d every time instead of a draw from p: that row is greedy. Its total-variation distance from the
@@ -196,7 +213,7 @@ threshold: about +1.5% per 0.01 TV/token. Medusa-style typical acceptance (a thr
 was replayed too and lands on the same line; it is not a better trade, so the flag is the plain probability threshold.
 
 **Speed (400 W).** `basalt-bench` (conv and prose at temperature 0.6, struct greedy), with `--spec 7
---spec-min-p 0.5 --kv int8 --vram-reserve-mib 500 --resident-experts --peer-exclusive`, each value in three rounds
+--kv int8 --vram-reserve-mib 500 --resident-experts --peer-exclusive`, each value in three rounds
 interleaved with the others, the cold repetition dropped:
 
 | Model | Fixture | Exact | P = 0.5 | P = 0.3 | P = 0.2 |
@@ -243,3 +260,12 @@ themselves are exact).
 **Choosing P.** `--relaxed-drafting` alone means 0.5: the smallest cost (TV/token 0.03 to 0.04), roughly +5% at
 temperature 0.6 and +6 to 10% at 1.0. 0.3 doubles both the gain and the cost; 0.2 is the aggressive end. Values above
 0.5 keep few drafts (0.7: about +2.5% at TV 0.015).
+
+## Prefill CPU share
+
+The CPU pool and the GPU round a streamed prompt expert differently (see the CPU-share paragraph in [index.md](index.md)), so
+`--prefill-cpu-share` can move numbers. NVFP4 pack, quality gate 20 chunks against the Q8_0 reference, T 3, int8 KV,
+`--spec 0`, 400 W, share 0 (all GPU) against 1 (all CPU): PPL 2.3046 / 2.3142 (standard error 0.06 each), KLD 0.07766 /
+0.07717, top-1 92.86% / 92.82%. The two ends differ by 0.0095 PPL, 0.0005 KLD and 0.04 points of top-1, inside the
+run-to-run size of this gate, so any share between them is bounded by that. `basalt-probe` may print a different share
+as a suggestion ([probe](../probe.md)); it never changes it on its own.

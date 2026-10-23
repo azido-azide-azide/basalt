@@ -60,9 +60,14 @@ struct CgroupMemoryStat {
     uint64_t file_dirty = 0;
     uint64_t file_writeback = 0;
     bool valid = false;
+    uint64_t file = 0;  // page cache, active + inactive; 0 when memory.stat does not report it
 };
 
-/// Calculate additional bytes under a finite cgroup limit after reclaiming only clean inactive file cache.
+/// Parse a cgroup-v2 memory.stat text (inactive_file, file_dirty, file_writeback required; file optional).
+/// False on a malformed or incomplete text.
+bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat);
+
+/// Calculate additional bytes under a finite cgroup limit after reclaiming clean file cache.
 /// Returns false when the required memory.stat counters were unavailable.
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
 
@@ -110,6 +115,14 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 /// `spares_fit` says whether the places fit; when they do not, the slots get the whole budget.
 int64_t choose_resident_room(const std::vector<uint64_t>& slot_bytes, uint64_t base_bytes, uint64_t budget,
                              int64_t lend_from, uint64_t spare_bytes, bool& spares_fit);
+
+/// The RAM a resident copy may take with `physical` bytes available and `headroom` left free.  The arena is ordinary
+/// 4 KiB pages, so their page tables and the driver's per-page records (physical / 256) come on top of its bytes.  The
+/// whole copy's safety check and the keep-what-fits budget are both sized by this one figure.
+inline uint64_t resident_room(uint64_t physical, uint64_t headroom) {
+    const uint64_t reserve = headroom + physical / 256;
+    return physical > reserve ? physical - reserve : 0;
+}
 
 /// The adaptive tier swapped `in` into a GPU slot and `out` out of it: `out` takes `in`'s place in the compact copy
 /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
@@ -211,22 +224,17 @@ struct GpuPlanSink {
     int32_t* dst = nullptr;                ///< cap: the entry's row of parts (token * k + j)
     int32_t* tok = nullptr;                ///< cap: the entry's token
     unsigned long long* ptr = nullptr;     ///< cap: the group's blob, device address
-    /// (DMA): the PCIe share is a second list of groups - `ptr2[q]` is staging slot q, `start2` indexes the same
-    /// dst/tok entries - computed by the GPU after `fetch` has copied their blobs into staging with the copy engine.
+    /// The PCIe share is a second list of groups - `ptr2[q]` is the blob's device alias in the mapped arena, `start2`
+    /// indexes the same dst/tok entries - staged by a copy kernel inside the graph, then computed by the GPU.
     /// counts[0] = VRAM groups, counts[1] = all entries, counts[2] = PCIe groups.
     unsigned long long* ptr2 = nullptr;
     int32_t* start2 = nullptr;
-    unsigned long long staging = 0;
     int64_t staging_cap = 0;
     int64_t cap = 0;
     void (*publish)(void* ctx) = nullptr;
-    /// Starts the DMA copies of `n` host blobs (pinned) into staging slots 0..n-1 and signals the GPU when they land.
-    void (*fetch)(void* ctx, const uint8_t* const* src, int n, size_t bytes) = nullptr;
+    /// Raises flag B: the PCIe groups of this layer are planned and the graph may stage them.
+    void (*staged)(void* ctx) = nullptr;
     void* ctx = nullptr;
-    /// How a PCIe group reaches the GPU.  0 = the copy engine stages it (DMA, `fetch`); 1 = the grouped kernel reads
-    /// the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2` holds the arena's
-    /// device alias.
-    int pcie_mode = 0;
     /// the window planned this layer on the device; ext_kind[i] is entry i's tier (0 CUDA0, 2 the peer, -1 the CPU).
     /// The pool then computes only the CPU entries, publishes no plan and launches no peer.
     const int32_t* ext_kind = nullptr;
@@ -295,8 +303,6 @@ struct ExpertDispatch {
     /// hit path reads.  When set, the pool leaves a resident expert's row at zero (the GPU computes it) without any
     /// `Launch` callback.
     const int32_t* host_res = nullptr;
-    /// Split every expert by rows across the pool's threads (default on; A/B `--no-split-rows`).
-    bool split_rows = true;
 
     // ================================ DID THE GPU ACTUALLY START? ================================
     //
@@ -309,10 +315,6 @@ struct ExpertDispatch {
     void* hit_done = nullptr;      ///< cudaEvent_t, created at session setup
     int64_t hit_ready = 0;         ///< layers where the hit work was DONE by the time the pool returned
     int64_t hit_late = 0;          ///< layers where it was not
-    /// The candidate fix, as an A/B arm: enter the driver once right after the hit launch.  If submission is
-    /// lazy, this starts the GPU work before the pool instead of after it.
-    bool hit_poke = false;
-    bool hit_cpu_order = false;    ///< experimental CPU-order GPU expert arithmetic; opt-in only
     int64_t n_hits = 0;                    ///< this layer's hits
     /// Set by `Launch` and consumed by `Combine`, so a `Combine` with no `Launch` in front of it cannot
     /// add a stale buffer into `parts`.
@@ -342,7 +344,7 @@ struct ExpertDispatch {
     int pcie_num = 0;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
-    /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
+    /// (the PCIe share, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// Decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off), which the driver

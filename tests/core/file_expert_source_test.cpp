@@ -182,6 +182,40 @@ void test_resident_lend_region() {
     require(choose_resident_keep_from({}, 0, 0, 0) == 0, "an empty cache");
 }
 
+void test_resident_room() {
+    using namespace basalt::core::detail;
+    constexpr uint64_t kGiB = 1ull << 30;
+    constexpr uint64_t kBlob = 17407795;   // one expert, bytes
+    // The gate and the keep-what-fits budget share resident_room(); the budget packs whole experts into it, so what it
+    // keeps always passes the gate, and the copy loses the shortfall plus less than one expert.
+    auto kept = [&](uint64_t physical, uint64_t headroom, uint64_t complement) {
+        const uint64_t room = resident_room(physical, headroom);
+        const uint64_t budget = std::min(room, complement);
+        return budget / kBlob * kBlob;
+    };
+    const uint64_t physical = 78 * kGiB + kGiB / 6, headroom = 15 * kGiB;
+    const uint64_t room = resident_room(physical, headroom);
+    require(room == physical - headroom - physical / 256, "the room is the available RAM less the headroom and overhead");
+    require(resident_room(10 * kGiB, 15 * kGiB) == 0, "a headroom above the RAM leaves no room");
+    // the whole complement fits
+    const uint64_t whole = 60 * kGiB;
+    require(whole <= room && kept(physical, headroom, whole) > whole - kBlob, "a complement that fits was cut");
+    // a small shortfall (about 1.8 GiB): the hottest experts that fit are kept, and the gate accepts them
+    const uint64_t small = 64 * kGiB + 700 * (1ull << 20);
+    uint64_t k = kept(physical, headroom, small);
+    require(small > room && k > 0 && k <= room, "a small shortfall must keep what fits");
+    require(small - k < (small - room) + kBlob, "a small shortfall lost more than the shortfall");
+    // a big shortfall keeps the room, not nothing
+    const uint64_t big = 120 * kGiB;
+    k = kept(physical, headroom, big);
+    require(k <= room && room - k < kBlob, "a big shortfall must keep the whole room");
+    // across readings: the kept bytes never exceed the gate's room
+    for (uint64_t gb = 20; gb <= 120; ++gb)
+        for (uint64_t h = 4; h <= 16; h += 3)
+            require(kept(gb * kGiB + 12345, h * kGiB, 200 * kGiB) <= resident_room(gb * kGiB + 12345, h * kGiB),
+                    "kept bytes failed the gate");
+}
+
 void test_resident_exchange() {
     using namespace basalt::core;
     using namespace basalt::core::detail;
@@ -220,16 +254,16 @@ void test_cgroup_memory_budget() {
 
     CgroupMemoryStat clean_cache{40 * GiB, 32 * GiB, 0, 0, true};
     require(cgroup_available_bytes(56 * GiB, clean_cache, bytes), "valid cgroup memory.stat was rejected");
-    require(bytes == 48 * GiB, "clean inactive file cache was not credited against the cgroup cap");
+    require(bytes == 48 * GiB - 56 * GiB / 64, "clean inactive file cache was not credited against the cgroup cap");
 
     CgroupMemoryStat dirty_cache{40 * GiB, 32 * GiB, 4 * GiB, 2 * GiB, true};
     require(cgroup_available_bytes(56 * GiB, dirty_cache, bytes), "valid dirty-cache counters were rejected");
-    require(bytes == 42 * GiB, "dirty/writeback pages were incorrectly counted as reclaimable");
+    require(bytes == 42 * GiB - 56 * GiB / 64, "dirty/writeback pages were incorrectly counted as reclaimable");
 
     CgroupMemoryStat oversized_inactive{10 * GiB, 20 * GiB, 0, 0, true};
     require(cgroup_available_bytes(12 * GiB, oversized_inactive, bytes),
             "valid oversized inactive-file counter was rejected");
-    require(bytes == 12 * GiB, "inactive-file accounting exceeded charged current usage");
+    require(bytes == 12 * GiB - 12 * GiB / 64, "inactive-file accounting exceeded charged current usage");
 
     const uint64_t max = std::numeric_limits<uint64_t>::max();
     CgroupMemoryStat large_counters{max, max, max - 1, max, true};
@@ -246,6 +280,47 @@ void test_cgroup_memory_budget() {
     bytes = 123;
     require(!cgroup_available_bytes(56 * GiB, missing_stat, bytes) && bytes == 0,
             "missing memory.stat counters did not fail closed");
+}
+
+// memory.stat text -> available bytes, with no /sys read.  A container's own reads sit on the active list, so the
+// file total (active + inactive) is what counts as reclaimable.
+void test_cgroup_memory_stat_text() {
+    using namespace basalt::core::detail;
+    constexpr uint64_t GiB = 1ull << 30;
+    auto gib = [](uint64_t n) { return std::to_string(n * GiB); };
+    CgroupMemoryStat stat;
+    uint64_t bytes = 0;
+    const uint64_t limit = 64 * GiB, current = 48 * GiB;
+
+    // file present: mostly active pages (inactive alone would credit 2 GiB)
+    require(parse_cgroup_memory_stat("anon 1\nfile " + gib(40) + "\ninactive_file " + gib(2) +
+                                         "\nactive_file " + gib(38) + "\nfile_dirty 0\nfile_writeback 0\n",
+                                     current, stat) && stat.file == 40 * GiB, "memory.stat with file was rejected");
+    require(cgroup_available_bytes(limit, stat, bytes), "file present: available refused");
+    require(bytes == (limit - (current - 40 * GiB)) - limit / 64, "active file pages were not counted reclaimable");
+
+    // file missing: the inactive list alone
+    require(parse_cgroup_memory_stat("inactive_file " + gib(2) + "\nfile_dirty 0\nfile_writeback 0\n", current, stat) &&
+                stat.file == 0, "memory.stat without file was rejected");
+    require(cgroup_available_bytes(limit, stat, bytes), "file missing: available refused");
+    require(bytes == 17 * GiB, "file missing: wrong fallback to inactive_file");
+
+    // dirty and writeback pages are not reclaimable
+    require(parse_cgroup_memory_stat("file " + gib(40) + "\ninactive_file " + gib(10) + "\nfile_dirty " + gib(6) +
+                                         "\nfile_writeback " + gib(2) + "\n", current, stat), "dirty text rejected");
+    require(cgroup_available_bytes(limit, stat, bytes), "dirty: available refused");
+    require(bytes == (limit - (current - 32 * GiB)) - limit / 64, "dirty/writeback pages counted reclaimable");
+
+    // the margin never exceeds half of what is reclaimable
+    require(parse_cgroup_memory_stat("file 640\ninactive_file 0\nfile_dirty 0\nfile_writeback 0\n", 1000, stat),
+            "small text rejected");
+    require(cgroup_available_bytes(64000, stat, bytes) && bytes == 64000 - 680, "margin exceeded half the reclaimable");
+
+    // malformed text fails closed
+    require(!parse_cgroup_memory_stat("inactive_file 1\nfile_dirty 0\n", current, stat), "missing writeback accepted");
+    require(!parse_cgroup_memory_stat("file 1\nfile 2\ninactive_file 1\nfile_dirty 0\nfile_writeback 0\n", current, stat),
+            "duplicate file accepted");
+    require(!parse_cgroup_memory_stat("inactive_file x\n", current, stat), "non-numeric value accepted");
 }
 
 // The host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
@@ -273,7 +348,7 @@ void test_host_memory() {
     put("fs/box/memory.max", std::to_string(48 * GiB) + "\n");
     put("fs/box/memory.current", std::to_string(16 * GiB) + "\n");
     put("fs/box/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
-    require(probe("0::/box\n") && m.available == 36 * GiB && m.cgroup_limit == 48 * GiB, "v2 limit");
+    require(probe("0::/box\n") && m.available == 36 * GiB - 48 * GiB / 64 && m.cgroup_limit == 48 * GiB, "v2 limit");
     put("fs/box/memory.max", "max\n");
     require(probe("0::/box\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2 max");
     put("fs/box/memory.max", "48G\n");
@@ -295,7 +370,7 @@ void test_host_memory() {
     put("fs/memory/docker/abc/memory.stat", "cache 1\ntotal_inactive_file " + std::to_string(6 * GiB) +
                                             "\ntotal_dirty " + std::to_string(1 * GiB) + "\ntotal_writeback " +
                                             std::to_string(1 * GiB) + "\n");
-    require(probe("4:memory:/docker/abc\n") && m.available == 26 * GiB && m.cgroup_limit == 32 * GiB,
+    require(probe("4:memory:/docker/abc\n") && m.available == 26 * GiB - 32 * GiB / 64 && m.cgroup_limit == 32 * GiB,
             "v1 page cache counted as used");
     // a v1 group not visible here, and no limit at the mount's root: MemAvailable alone
     require(probe("4:memory:/elsewhere\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull,
@@ -341,7 +416,7 @@ void test_host_memory_namespaced() {
         h.put("fs/unified/cgroup.controllers", "\n");
         const std::string self = "12:pids:" + id + "\n11:cpu,cpuacct:" + id + "\n4:memory:" + id +
                                  "\n1:name=systemd:" + id + "\n0::" + id + "\n";
-        require(h.probe(m, self) && m.available == 52 * GiB && m.cgroup_limit == 64 * GiB, "hybrid layout");
+        require(h.probe(m, self) && m.available == 52 * GiB - 64 * GiB / 64 && m.cgroup_limit == 64 * GiB, "hybrid layout");
         // the same without a limit on the container: MemAvailable alone
         h.put("fs/memory/memory.limit_in_bytes", "9223372036854771712\n");
         require(h.probe(m, self) && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "hybrid, unlimited");
@@ -362,7 +437,7 @@ void test_host_memory_namespaced() {
         v2.put("fs/memory.max", std::to_string(48 * GiB) + "\n");
         v2.put("fs/memory.current", std::to_string(16 * GiB) + "\n");
         v2.put("fs/memory.stat", "inactive_file " + std::to_string(4 * GiB) + "\nfile_dirty 0\nfile_writeback 0\n");
-        require(v2.probe(m, "0::" + id + "\n") && m.available == 36 * GiB && m.cgroup_limit == 48 * GiB,
+        require(v2.probe(m, "0::" + id + "\n") && m.available == 36 * GiB - 48 * GiB / 64 && m.cgroup_limit == 48 * GiB,
                 "v2, hidden path");
         // the host's own root (no memory.max): MemAvailable alone
         fs::remove(v2.t.path / "fs/memory.max");
@@ -381,7 +456,9 @@ int main() {
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();
+        test_resident_room();
         test_cgroup_memory_budget();
+        test_cgroup_memory_stat_text();
         test_host_memory();
         test_host_memory_namespaced();
         test_native_variable_layout();

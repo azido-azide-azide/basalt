@@ -4,6 +4,7 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/process.hpp"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,6 +75,8 @@ std::optional<std::string> capture_output(const std::vector<std::string>& argv, 
 
 int64_t process_id() { return (int64_t) GetCurrentProcessId(); }
 
+std::string host_os_name() { return "Windows"; }
+
 std::string python_interpreter(const std::string& src_dir) {
     const std::string venv = src_dir + "/.venv/Scripts/python.exe";
     return path_executable(venv) ? venv : "python";
@@ -82,6 +85,14 @@ std::string python_interpreter(const std::string& src_dir) {
 void prefer_oom_victim() {}
 
 bool gpu_peer_access() { return false; }
+
+bool stderr_is_terminal() {
+    if (!_isatty(_fileno(stderr))) return false;
+    const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    DWORD mode = 0;
+    if (h == INVALID_HANDLE_VALUE || !GetConsoleMode(h, &mode)) return false;
+    return (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0 || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+}
 
 void set_stdio_binary() {
     _setmode(_fileno(stdin), _O_BINARY);
@@ -108,6 +119,14 @@ ThreadWaits threads_in_disk_wait() {
 
 int64_t process_id() { return (int64_t) getpid(); }
 
+std::string host_os_name() {
+    std::ifstream in("/proc/sys/kernel/osrelease");
+    std::string rel;
+    std::getline(in, rel);
+    for (char& c : rel) c = (char) std::tolower((unsigned char) c);
+    return rel.find("microsoft") != std::string::npos || rel.find("wsl") != std::string::npos ? "WSL2" : "Linux";
+}
+
 std::string python_interpreter(const std::string& src_dir) {
     const std::string venv = src_dir + "/.venv/bin/python";
     return path_executable(venv) ? venv : "python3";
@@ -118,6 +137,8 @@ void prefer_oom_victim() {
 }
 
 bool gpu_peer_access() { return true; }
+
+bool stderr_is_terminal() { return isatty(STDERR_FILENO) != 0; }
 
 void set_stdio_binary() {}
 
