@@ -64,6 +64,15 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   # nvcc takes host-compiler options through -Xcompiler, and this reaches every CUDA target.
   string(APPEND CMAKE_CUDA_FLAGS " -Xcompiler=/Zc:__cplusplus")
 endif()
+# CCCL in CUDA 13.2 and later rejects cl.exe's traditional preprocessor (C1189); nvcc's default Windows host is cl.exe.
+if(WIN32)
+  file(TO_CMAKE_PATH "${CMAKE_CUDA_HOST_COMPILER}" _cuda_host)
+  get_filename_component(_cuda_host "${_cuda_host}" NAME)
+  string(TOLOWER "${_cuda_host}" _cuda_host)
+  if(_cuda_host STREQUAL "" OR _cuda_host MATCHES "^cl(\\.exe)?$")
+    string(APPEND CMAKE_CUDA_FLAGS " -Xcompiler=/Zc:preprocessor")
+  endif()
+endif()
 
 # Warnings live on an INTERFACE target the project's own C++ code links, NOT in add_compile_options: applied
 # globally they would also hit the extracted ggml C and CUDA sources, whose warnings are not this project's to fix.
@@ -222,7 +231,6 @@ add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_ge
                         src/kernels/cuda/native_qsa.cu
                         src/kernels/cuda/native_rope.cu
                         src/kernels/cuda/native_ple_postops.cu
-                        src/kernels/cuda/native_flash_attn.cu
                         src/kernels/cuda/native_qsa_indexer.cu
                         src/kernels/cuda/native_qsa_score.cu
                         src/kernels/cuda/ple.cu
@@ -277,7 +285,6 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     src/kernels/cuda/native_qsa.cu
     src/kernels/cuda/native_rope.cu
     src/kernels/cuda/native_ple_postops.cu
-    src/kernels/cuda/native_flash_attn.cu
     src/kernels/cuda/native_qsa_indexer.cu
     src/kernels/cuda/native_qsa_score.cu
     src/kernels/cuda/qsa_dec_fused.cu
@@ -394,10 +401,10 @@ add_library(prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefil
 target_include_directories(prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_gpu_include_directories})
 target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_target})
 
-add_executable(basalt src/program/generate.cpp)
+add_executable(basalt src/program/generate.cpp src/program/probe_rates.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt PRIVATE engine prefill spec ${_gpu_runtime_target})
+target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -412,6 +419,30 @@ add_custom_target(git_stamp
   COMMENT "Refreshing the commit stamp")
 execute_process(COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${_git_stamp}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/git_stamp.cmake)
+# the engine driven as a child process and the report logic, shared by basalt-bench and basalt-probe
+add_library(engine_session STATIC src/program/engine_session.cpp src/program/load_summary.cpp src/program/probe_report.cpp src/program/probe_derive.cpp src/program/auto_plan.cpp)
+target_include_directories(engine_session PUBLIC include)
+find_package(Threads REQUIRED)
+target_link_libraries(engine_session PUBLIC platform Threads::Threads)
+# the GBNF grammar engine and the JSON-schema and tool-call grammar builders (CPU only, no engine dependency)
+add_library(grammar STATIC src/program/grammar/grammar.cpp src/program/grammar/schema.cpp src/program/grammar/json_schema.cpp
+            src/program/grammar/schema_convert.cpp src/program/grammar/guard.cpp)
+target_include_directories(grammar PUBLIC include)
+target_link_libraries(grammar PRIVATE warnings)
+
+# the C++ byte-level BPE tokenizer the engine runs on request text (CPU only)
+add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp src/program/tokenizer/pretok_qwen35.cpp
+            src/program/tokenizer/unicode_flags.cpp)
+target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
+target_link_libraries(tokenizer PRIVATE warnings)
+add_executable(tokenizer_test tests/program/tokenizer_test.cpp)
+target_link_libraries(tokenizer_test PRIVATE tokenizer warnings)
+basalt_embed_manifest(tokenizer_test)
+add_executable(tokenizer_bench src/program/tokenizer/tokenizer_bench.cpp)
+target_link_libraries(tokenizer_bench PRIVATE tokenizer warnings)
+basalt_embed_manifest(tokenizer_bench)
+basalt_cpu_test(NAME tokenizer_test COMMAND tokenizer_test)
+set_tests_properties(tokenizer_test PROPERTIES TIMEOUT 60)
 add_executable(basalt-bench src/program/bench_main.cpp)
 set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
@@ -419,13 +450,44 @@ add_subdirectory(tools/vision)
 target_link_libraries(basalt PRIVATE vision_cuda)
 add_dependencies(basalt-bench basalt git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
-target_link_libraries(basalt-bench PRIVATE platform warnings ${CMAKE_DL_LIBS})
+target_link_libraries(basalt-bench PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-bench)
 target_compile_definitions(basalt-bench PRIVATE
   BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
   BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench"
   BASALT_BENCH_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   BASALT_BENCH_CUDA="${CMAKE_CUDA_COMPILER_VERSION}")
+
+# basalt-probe: starts the engine, measures its rates and cold decode speed, prints a report
+add_executable(basalt-probe src/program/probe_main.cpp)
+set_target_properties(basalt-probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+add_dependencies(basalt-probe basalt)
+target_link_libraries(basalt-probe PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
+basalt_embed_manifest(basalt-probe)
+target_compile_definitions(basalt-probe PRIVATE
+  BASALT_BENCH_ENGINE="$<TARGET_FILE:basalt>"
+  BASALT_BENCH_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/data/bench")
+
+# closing the engine's stdin mid-request stops it (runs the real engine on a model pack:
+# -DBASALT_STDIN_STOP_MODEL=<pack>, with python3)
+if(BASALT_STDIN_STOP_MODEL AND Python3_Interpreter_FOUND)
+  add_test(NAME stdin_stop_test
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/stdin_stop_test.py
+                   $<TARGET_FILE:basalt> ${BASALT_STDIN_STOP_MODEL} ${CMAKE_CURRENT_SOURCE_DIR}/data/bench/conv.ids
+                   ${BASALT_STDIN_STOP_ARGS})
+  set_property(TEST stdin_stop_test APPEND PROPERTY LABELS gpu)
+  set_tests_properties(stdin_stop_test PROPERTIES TIMEOUT 600)
+endif()
+
+# the engine enforces a request grammar on what it samples (runs the real engine on a model pack:
+# -DBASALT_GRAMMAR_MODEL=<pack>, with python3)
+if(BASALT_GRAMMAR_MODEL AND Python3_Interpreter_FOUND)
+  add_test(NAME grammar_engine_test
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/grammar_engine_test.py
+                   $<TARGET_FILE:basalt> ${BASALT_GRAMMAR_MODEL} ${BASALT_GRAMMAR_ARGS})
+  set_property(TEST grammar_engine_test APPEND PROPERTY LABELS gpu)
+  set_tests_properties(grammar_engine_test PROPERTIES TIMEOUT 900)
+endif()
 
 add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
 # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
@@ -449,6 +511,15 @@ basalt_embed_manifest(iq_parity)
 # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
 # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
 find_package(Python3 COMPONENTS Interpreter QUIET)
+
+# the C++ tokenizer's ids against tools/tokenizer.py over a corpus
+# (-DBASALT_TOKENIZER_DIR=<a pack's extracted tokenizer/ directory>, with python3 and the regex package)
+if(BASALT_TOKENIZER_DIR AND Python3_Interpreter_FOUND)
+  basalt_cpu_test(NAME tokenizer_parity
+                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/program/tokenizer_parity.py
+                          $<TARGET_FILE:tokenizer_test> ${BASALT_TOKENIZER_DIR} ${BASALT_TOKENIZER_BIG})
+  set_tests_properties(tokenizer_parity PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+endif()
 # the generator needs an interpreter WITH numpy: probe the configured one, a .venv, and the
 # system python3; -DIQ_FIXTURE_PYTHON=... overrides the search outright.
 set(_iq_python "")
@@ -554,6 +625,7 @@ target_link_libraries(pk_moe_bench PRIVATE kernels ${_gpu_runtime_target})
 add_executable(hc_fused_parity src/kernels/hc_fused_parity.cpp)
 target_include_directories(hc_fused_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(hc_fused_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME hc_fused_parity COMMAND hc_fused_parity 20 1 8 --check-only --stress 200)
 add_executable(mid_chain_parity src/kernels/mid_chain_parity.cpp)
 target_include_directories(mid_chain_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(mid_chain_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -767,6 +839,65 @@ foreach(_t cpu_test compiler_test region_test process_pipe_test system_test)
   set_tests_properties(platform_${_t} PROPERTIES TIMEOUT 120)
 endforeach()
 
+# the engine's load lines condensed for basalt-bench: lines, throttling, terminal mode (CPU only)
+add_executable(load_summary_test tests/program/load_summary_test.cpp)
+target_link_libraries(load_summary_test PRIVATE engine_session warnings)
+basalt_embed_manifest(load_summary_test)
+basalt_cpu_test(NAME load_summary_test COMMAND load_summary_test)
+set_tests_properties(load_summary_test PROPERTIES TIMEOUT 60)
+
+# basalt-probe's report: rates block and layout (CPU only)
+add_executable(probe_report_test tests/program/probe_report_test.cpp)
+target_link_libraries(probe_report_test PRIVATE engine_session warnings)
+basalt_embed_manifest(probe_report_test)
+basalt_cpu_test(NAME probe_report_test COMMAND probe_report_test)
+set_tests_properties(probe_report_test PROPERTIES TIMEOUT 60)
+
+# basalt-probe's suggested values: the worker pick, the balance share and the suggestion lines (CPU only)
+add_executable(probe_derive_test tests/program/probe_derive_test.cpp)
+target_link_libraries(probe_derive_test PRIVATE engine_session warnings)
+basalt_embed_manifest(probe_derive_test)
+basalt_cpu_test(NAME probe_derive_test COMMAND probe_derive_test)
+set_tests_properties(probe_derive_test PROPERTIES TIMEOUT 60)
+
+# the start-up picks for settings left out: the rules and the printed line (CPU only)
+add_executable(auto_plan_test tests/program/auto_plan_test.cpp)
+target_link_libraries(auto_plan_test PRIVATE engine_session warnings)
+basalt_embed_manifest(auto_plan_test)
+basalt_cpu_test(NAME auto_plan_test COMMAND auto_plan_test)
+set_tests_properties(auto_plan_test PROPERTIES TIMEOUT 60)
+
+# the grammar engine: parse, accept/reject, UTF-8 across tokens, clone, lazy triggers and the vocabulary mask (CPU only)
+add_executable(grammar_test tests/program/grammar_test.cpp)
+target_link_libraries(grammar_test PRIVATE grammar warnings)
+basalt_embed_manifest(grammar_test)
+basalt_cpu_test(NAME grammar_test COMMAND grammar_test)
+set_tests_properties(grammar_test PROPERTIES TIMEOUT 120)
+
+# the pack vocabulary reader and the per-request window check (CPU only)
+add_executable(grammar_guard_test tests/program/grammar_guard_test.cpp)
+target_link_libraries(grammar_guard_test PRIVATE grammar warnings)
+basalt_embed_manifest(grammar_guard_test)
+basalt_cpu_test(NAME grammar_guard_test COMMAND grammar_guard_test)
+set_tests_properties(grammar_guard_test PROPERTIES TIMEOUT 120)
+
+# schema-to-grammar and the tool-call grammar (CPU only)
+add_executable(grammar_schema_test tests/program/grammar_schema_test.cpp)
+target_link_libraries(grammar_schema_test PRIVATE grammar warnings)
+basalt_embed_manifest(grammar_schema_test)
+basalt_cpu_test(NAME grammar_schema_test COMMAND grammar_schema_test)
+set_tests_properties(grammar_schema_test PROPERTIES TIMEOUT 120)
+
+# llama.cpp's own grammar tests (parser, accept/reject, state, schema-to-grammar) run against the grammar library (CPU only)
+foreach(_t grammar_llama_parser_test grammar_llama_state_test grammar_llama_accept_test grammar_llama_schema_test)
+  add_executable(${_t} tests/program/${_t}.cpp)
+  target_link_libraries(${_t} PRIVATE grammar warnings)
+  basalt_embed_manifest(${_t})
+  basalt_cpu_test(NAME ${_t} COMMAND ${_t})
+  set_tests_properties(${_t} PROPERTIES TIMEOUT 300)
+endforeach()
+target_include_directories(grammar_llama_schema_test PRIVATE src/program/grammar)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
   target_link_libraries(pinned_shared_test PRIVATE core ${_gpu_runtime_target})
@@ -815,10 +946,6 @@ if(BUILD_TESTING)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   basalt_cpu_test(NAME conv_cache_test COMMAND conv_cache_test)
-  # coupled draft sampling's counter and penalty-ring arithmetic (header-only, CPU)
-  add_executable(coupled_draft_test src/core/coupled_draft_test.cpp)
-  target_include_directories(coupled_draft_test PRIVATE include)
-  basalt_cpu_test(NAME coupled_draft_test COMMAND coupled_draft_test)
   # the f32 -> bf16 rounding against ggml's, NaN included, over every f32 bit pattern (header-only, CPU)
   add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)
@@ -965,6 +1092,11 @@ if(BUILD_TESTING)
   set_tests_properties(nvfp4_format_test PROPERTIES TIMEOUT 60)
 endif()
 if(BUILD_TESTING)
+  # the hc up product fused with the mix against cuBLAS + gr_mix_r (bitwise) and a double-precision reference
+  add_executable(prefill_hc_up_mix_test tests/cuda/prefill_hc_up_mix_test.cpp)
+  target_link_libraries(prefill_hc_up_mix_test PRIVATE prefill kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME prefill_hc_up_mix_test COMMAND prefill_hc_up_mix_test --no-bench)
+  set_tests_properties(prefill_hc_up_mix_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   add_executable(prefill_fp4_test tests/cuda/prefill_fp4_test.cpp)
   target_link_libraries(prefill_fp4_test PRIVATE fp4 mmq ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_fp4_test COMMAND prefill_fp4_test --no-bench)

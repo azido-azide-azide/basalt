@@ -15,8 +15,11 @@ from serve.engine.mock import Engine
 from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
+from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
 from serve.engine.vision import Vision
+from serve.api.grammar import grammar_spec, unenforced
+from serve.config import GRAMMAR_DEFAULT
 
 
 IMAGE_PAD = "<|image_pad|>"
@@ -35,7 +38,6 @@ REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my 
 REASONING_CLOSE = "\n</think>\n\n"
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often
 KEEPALIVE_S = 10.0          # a stream quiet this long (a held-back tool argument) gets a keep-alive
-CTX_SLACK = 8               # the engine rejects prompt + max_new + 8 > context
 # live tok/s is a windowed rate: a mean since the first token spikes at the start of an answer
 RATE_WINDOW_S = 2.0
 LOG_FIRST_LINES = 300        # lines /api/logs returns to a client with none
@@ -47,12 +49,22 @@ DEBUG = False            # --debug: one line per request plus the raw model text
 
 
 class Service:
+    def served_names(self) -> list[str]:
+        """The model names a request may use: the one /v1/models lists, and the model file's own name."""
+        names = [self.model]
+        path = getattr(self.engine, "model_path", None)
+        if isinstance(path, str) and path:
+            names.append(path.replace("\\", "/").rsplit("/", 1)[-1])
+        return names
+
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
+        self.grammar = grammar                        # the `grammar` option: every tool or JSON request gets one
+        self.grammar_engine = grammar_engine          # the engine understands the request key
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
@@ -96,7 +108,10 @@ class Service:
 
     def reasoning_budget(self, req) -> int | None:
         """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer."""
-        value = (req or {}).get("reasoning_budget_tokens") if isinstance(req, dict) else None
+        req = req if isinstance(req, dict) else {}
+        value = req.get("reasoning_budget_tokens")
+        if value is None:                               # llama.cpp's name for the same budget
+            value = req.get("thinking_budget_tokens")
         if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():
@@ -209,6 +224,18 @@ class Service:
         log = getattr(self.engine, "log_path", None)
         why = f"{e}: {note}" if note else str(e)
         print(f"[server] warning: {why} (the next request restarts it{', log ' + log if log else ''})", flush=True)
+
+    def require_grammar(self, response_format) -> None:
+        """A JSON response format the engine would not enforce is refused rather than silently served as free text."""
+        if unenforced(self.grammar, response_format):
+            raise ValueError("response_format json_schema and json_object (structured output) need grammar enabled "
+                             "on this server; start it without --no-grammar, or send strict: true")
+
+    def grammar_for(self, tools, tool_choice, raw_tools, response_format) -> dict | None:
+        """The engine request's `grammar` value (api.grammar.grammar_spec); None when the engine cannot take it."""
+        if not self.grammar_engine:
+            return None
+        return grammar_spec(self.grammar, tools, tool_choice, raw_tools, response_format)
 
     def load(self):
         """Start the engine if unloaded (POST /load and every generation request); may raise GpuBusy."""
@@ -404,8 +431,8 @@ class Service:
         return {
             "service": "basalt", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
-            "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+            "structured_output": {"formats": ["json_object", "json_schema"], "method": "grammar",
+                                  "constrained_decoding": bool(self.grammar_engine), "stream_buffered": False},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -443,14 +470,20 @@ class Service:
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
-    def encode_prompt(self, messages, tools, kwargs) -> list[int]:
-        """The rendered, tokenized prompt. Think tags and control-token text inside messages stay plain text; only
-        the template's own are special."""
+    def render_text(self, messages, tools, kwargs) -> tuple[str, list]:
+        """The rendered prompt and the character spans in it where special-token text stays plain text: think tags
+        and control-token text inside messages are text; only the template's own are special."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
+            return prompt, []
+        return unmark_think_literals(prompt, self.literals)
+
+    def encode_prompt(self, messages, tools, kwargs) -> list[int]:
+        """The rendered, tokenized prompt (see render_text)."""
+        prompt, plain = self.render_text(messages, tools, kwargs)
+        if not plain:
             return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None):
@@ -466,7 +499,28 @@ class Service:
                 self.embeddings.path = None
             raise
 
+    def _prepare_text(self, messages, tools, kwargs, max_new, force):
+        """The text path: the engine tokenizes, so the server sends the rendered prompt as it is and settles the
+        answer cap with the engine (clip: cut to the room the context leaves)."""
+        text, plain = self.render_text(messages, tools, kwargs)
+        tail = force if force and kwargs.get("enable_thinking", True) is False else ""
+        ctx = self.engine.max_context
+        if ctx <= 0:
+            if getattr(self.engine, "starting", False):
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+            ctx = getattr(self.engine, "known_ctx", 0)
+            if ctx <= 0:
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        unset = max_new is None or max_new <= 0
+        if unset:
+            max_new = ctx - CTX_SLACK
+        prompt = PromptText(self.tok, text + tail, plain, tail, clip=unset or self.fit_max_tokens)
+        prompt.max_new = max_new
+        return prompt, kwargs.get("enable_thinking", True) is not False, max_new
+
     def _prepare(self, messages, tools, kwargs, max_new, force):
+        if getattr(self.engine, "takes_text", False) and not images_of(messages) and not getattr(self.engine, "batch", 0):
+            return self._prepare_text(messages, tools, kwargs, max_new, force)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -510,17 +564,11 @@ class Service:
         room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({ctx}); requests are never truncated")
+                raise room_error(len(ids), ctx)
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({ctx}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's <model>.json to shorten it to the room left")
+                raise overflow_error(len(ids), max_new, ctx)
             max_new = max(1, room)          # fit_max_tokens: shorten rather than 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -545,15 +593,18 @@ class Service:
     def _progress(self, last_print, every=1.0, st=None):
         """Print a progress line at most every `every` seconds while a request runs."""
         now = time.time()
-        if now - last_print < every:
-            return last_print
         with self.status_lock:
             s = dict(self.status if st is None else st)
+        if now - last_print < (READ_PRINT_EVERY if s.get("first_token") is None else every):
+            return last_print
         el = now - s.get("started", now)
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position, prompt tokens); a reused prefix counts as read
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read
-            print(f"[server] reading the prompt: {done} tokens, {el:.0f} s", flush=True)
+            # the engine's average over the tokens it read for this request (a reused prefix is not in it)
+            pp = getattr(self.engine, "prefill_tok_s_mean", None) if pr and pr[1] else None
+            speed = f", {pp:,.0f} tok/s" if pp and pp > 0 else ""
+            print(f"[server] reading the prompt: {done} tokens{speed}, {el:.0f} s", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
             print(f"[server] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
@@ -660,6 +711,8 @@ class Service:
                     for ev in opening:
                         yield "event", ev
                     while True:
+                        if isinstance(ids, PromptText) and ids.max_new:
+                            max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
@@ -670,6 +723,9 @@ class Service:
                             last_out = time.monotonic()
                             for t in gen:
                                 if t is None:               # heartbeat
+                                    if isinstance(ids, PromptText) and ids.n is not None and st.get("prompt_tokens") != ids.n:
+                                        with self.status_lock:  # the engine has counted the prompt
+                                            st.update(prompt_tokens=ids.n, max_tokens=ids.max_new or max_new)
                                     last_print = self._progress(last_print, st=st)
                                     last_out = time.monotonic()
                                     yield "ping", None
@@ -832,8 +888,9 @@ class Service:
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
-                            print(f"[server] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                            ttft = ft - st["started"] if ft and st.get("started") else None
+                            print(done_line(seen, n, finish, cancel.is_set(), timings, ttft, rate) + hit_msg,
+                                  flush=True)
                             if finish == "length" and parser.state == "reasoning":
                                 print("[server] warning: max tokens reached while thinking, no answer "
                                       "(set reasoning_budget_tokens)", flush=True)
@@ -870,6 +927,30 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
     if read is None or last.get("finish") != "cancel":
         return prompt_tokens
     return min(prompt_tokens, int(last.get("reused") or 0) + int(read))
+
+
+READ_PRINT_EVERY = 5.0      # seconds between the prompt-reading lines
+MIN_RATE_TOKENS = 16     # a prompt read of fewer tokens shows its time, not a rate
+
+
+def done_line(prompt_total: int, generated: int, finish: str, cancelled: bool, timings: dict | None,
+              ttft: float | None, wall_rate: float) -> str:
+    """The request's closing log line: the prompt (read, reused, time, speed), the reply (count, speed) and the
+    time to the first token.  `timings` is request_timings(); None when the engine gave no clock."""
+    t = timings or {}
+    prompt = f"prompt {prompt_total:,} tokens"
+    if t.get("cache_n"):
+        prompt += f" ({t['cache_n']:,} reused)"
+    if t.get("prompt_ms") is not None:
+        prompt += f" in {t['prompt_ms'] / 1000:.1f} s"
+        if (t.get("prompt_n") or 0) >= MIN_RATE_TOKENS and t.get("prompt_per_second"):
+            prompt += f", {t['prompt_per_second']:,.0f} tok/s"
+    rate = t.get("predicted_per_second") or (wall_rate if generated >= MIN_RATE_TOKENS else 0.0)
+    reply = f"{generated} tokens" + (f" at {rate:.1f} tok/s" if generated and rate else "")
+    parts = [prompt, reply]
+    if ttft is not None:
+        parts.append(f"first token after {ttft:.1f} s")
+    return f"[server] done: {'; '.join(parts)} ({finish}{', cancel=True' if cancelled else ''})"
 
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:

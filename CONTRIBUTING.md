@@ -38,6 +38,18 @@ Basalt is a single-purpose engine: Qwen3.8-Flash-Next on Linux with NVIDIA Black
 - Docs: no file over 300 lines; split a longer topic into a folder of files; keep docs short, stateless and free of duplication.
 - A PR description lists: what changed, the parity results, the microbench and `basalt-bench` before/after (with the power limit), and the quality-check result.
 
+## Other ways to help
+
+- Cannot contribute code? Add a benchmark run from your hardware to the community table (details in [community runs](docs/community.md)):
+  1. Run `basalt-bench --community --model PACK --submitter YOUR_NAME`. It prints one JSON row ([building](docs/building.md)).
+  2. Add the row to the `runs` list in `docs/community/benchmarks.json`.
+  3. Check it with `python3 tools/check_benchmarks.py docs/community/benchmarks.json`.
+  4. Open a pull request; the `pages` workflow runs the same check.
+  5. Once merged, the row appears on the runs page.
+- Any Blackwell (sm_120) machine with spare hours helps; bigger setups help most: 96 GB+ VRAM (single large cards or multi-GPU), quad- or octa-channel DDR5.
+- A few hours of remote access to a machine speeds up development.
+- Or sponsor the project through GitHub Sponsors (the repository's Sponsor button): it pays for tokens for agentic development and for time on different hardware to test on.
+
 ## License
 
 Basalt is MIT licensed and is based on Strata (MIT, Copyright (c) 2026 Niko1221 and the Strata contributors). By contributing you agree your contribution is licensed under the same terms. See `LICENSE` and `THIRD_PARTY_LICENSES`.

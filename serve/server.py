@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # also runnable as a script
 from serve import ROOT, service  # noqa: E402
 from serve.config import (build_parser, check_engine_flags, engine_flags_of, engine_line,  # noqa: E402
-                          parse_settings, sampling_defaults_from_config, sampling_line)
+                          grammar_words, parse_settings, sampling_defaults_from_config, sampling_line)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.flags import flag_index  # noqa: E402
@@ -58,6 +58,13 @@ def warn_tight_ram(arena_mib) -> None:
     left = total / 2**30 - arena_mib / 1024
     if left < 6:
         print(f"[server] warning: low RAM: {left:.1f} of {total / 2**30:.0f} GB left after experts", flush=True)
+
+
+def grammar_entry(on: bool, cli: list[str], used: list[str]) -> tuple[bool, str] | None:
+    """(on, origin) for the startup line when the command line or the config file set grammar; None for the default."""
+    names = ("--grammar", "--no-grammar")
+    origin = "cli" if any(w in names for w in cli) else "config" if any(w in names for w in used) else ""
+    return (on, origin) if origin else None
 
 
 def main() -> int:
@@ -102,8 +109,9 @@ def main() -> int:
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")
         if not a.mock_engine:
-            print(engine_line(file_engine, cli_engine, bool(a.config),
-                                    (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None), flush=True)
+            print(engine_line(file_engine, cli_engine,
+                                    (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
+                                    grammar_entry(a.grammar, sys.argv[1:], used_argv)), flush=True)
     if a.alias:
         cfg["model_name"] = a.alias
     try:                                                # fail fast if the port is taken
@@ -154,8 +162,13 @@ def main() -> int:
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
         else:
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
+        known_flags = engine_flags_of(cfg["engine_bin"])
+        has_grammar = known_flags is not None and "--grammar" in known_flags
+        if a.grammar and not has_grammar:
+            print("[server] warning: grammar is on but this engine has no --grammar; requests go without one", flush=True)
+        gwords = grammar_words(known_flags)
         try:
-            engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg), log=cfg.get("log"), env=env, lazy=lazy)
+            engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=lazy)
         except EngineStartError as e:
             print(f"[server] error: {e}", file=sys.stderr, flush=True)
             if e.log:
@@ -171,7 +184,8 @@ def main() -> int:
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
-                  sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens)
+                  sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
+                  grammar_engine=bool(a.mock_engine or has_grammar))
     svc.logs = logs
     if any(x == "--api-key" and i + 1 < len(used_argv) and not used_argv[i + 1].strip() or x.strip() == "--api-key="
            for i, x in enumerate(used_argv)):

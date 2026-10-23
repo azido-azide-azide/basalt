@@ -120,14 +120,6 @@ static bool expect_affinity(const std::vector<int>& expected, const char* label)
     return true;
 }
 
-static bool round_trip_full_mask(const std::vector<int>& allowed) {
-    const int target = allowed.front();
-    const auto previous = cpu::pin_current_thread(target);
-    const bool pinned = previous.valid && expect_affinity({target}, "pin from full allowed mask");
-    cpu::restore_thread_affinity(previous);
-    return pinned && expect_affinity(allowed, "restore full allowed mask");
-}
-
 static bool topology_respects_current_mask() {
     std::vector<int> allowed;
     if (!get_affinity(allowed)) return false;
@@ -142,111 +134,83 @@ static bool topology_respects_current_mask() {
     return true;
 }
 
-static bool round_trip_sparse_nested(const std::vector<int>& allowed) {
-    if (allowed.size() < 2) {
-        std::puts("SKIP sparse/nested affinity: fewer than two allowed CPUs");
+// The fast-class count against the OS's own numbers: one capacity per PHYSICAL core (a sibling shares its core's), the
+// fast class being the cores above the midpoint between the extremes.  Reading the capacities here rather than trusting
+// the topology is the point - a class whose cores do not all sit at the maximum must still be one class.
+static bool topology_core_classes() {
+    auto read = [](const std::string& path) -> long {
+        long v = -1;
+        if (std::FILE* f = std::fopen(path.c_str(), "r")) {
+            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+            std::fclose(f);
+        }
+        return v;
+    };
+    std::vector<int> allowed;
+    if (!get_affinity(allowed)) return false;
+    std::vector<std::pair<long, long>> seen;
+    std::vector<long> caps;
+    for (int id : allowed) {
+        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(id);
+        const long capacity = read(base + "/cpu_capacity");
+        if (capacity <= 0) continue;   // this CPU publishes no capacity: nothing to compare against
+        const long pkg = read(base + "/topology/physical_package_id");
+        const long core = read(base + "/topology/core_id");
+        if (pkg >= 0 && core >= 0) {
+            const std::pair<long, long> key{pkg, core};
+            if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+            seen.push_back(key);
+        }
+        caps.push_back(capacity);
+    }
+    if (caps.size() < 2) {
+        std::puts("SKIP core classes: fewer than two cores publish a capacity");
         return true;
     }
-    const std::vector<int> sparse{allowed.front(), allowed.back()};
-    if (!set_affinity(sparse) || !expect_affinity(sparse, "establish sparse mask") ||
-        !topology_respects_current_mask()) return false;
-
-    const auto outer = cpu::pin_current_thread(sparse.front());
-    const bool outer_pinned = outer.valid && expect_affinity({sparse.front()}, "outer pin");
-    if (!outer_pinned) {
-        cpu::restore_thread_affinity(outer);
+    const long lo = *std::min_element(caps.begin(), caps.end());
+    const long hi = *std::max_element(caps.begin(), caps.end());
+    const long mid = (lo + hi) / 2;
+    const size_t fast = (size_t) std::count_if(caps.begin(), caps.end(), [mid](long c) { return c > mid; });
+    const auto topology = cpu::detect_cpu_topology(false, cpu::PoolAffinity::Auto);
+    if (!topology.is_hybrid) {
+        std::printf("core classes: one class (%zu cores, capacity %ld..%ld)\n", caps.size(), lo, hi);
+        return true;
+    }
+    if ((size_t) topology.p_cores != fast || (size_t) topology.e_cores + (size_t) topology.p_cores != caps.size()) {
+        std::fprintf(stderr,
+                     "affinity test: %zu cores above the capacity midpoint %ld (%ld..%ld) but the topology counted %d "
+                     "fast / %d slow of %zu\n",
+                     fast, mid, lo, hi, topology.p_cores, topology.e_cores, caps.size());
         return false;
     }
-
-    const auto inner = cpu::pin_current_thread(sparse.back());
-    const bool inner_pinned = inner.valid && expect_affinity({sparse.back()}, "inner pin");
-    cpu::restore_thread_affinity(inner);
-    const bool outer_restored = expect_affinity({sparse.front()}, "restore inner pin to outer pin");
-    cpu::restore_thread_affinity(outer);
-    const bool sparse_restored = expect_affinity(sparse, "restore outer pin to sparse mask");
-    const bool full_restored = set_affinity(allowed) && expect_affinity(allowed, "restore full mask after sparse test");
-    return inner_pinned && outer_restored && sparse_restored && full_restored;
+    std::printf("core classes: %d fast / %d slow, matching the capacities (%ld..%ld, midpoint %ld)\n", topology.p_cores,
+                topology.e_cores, lo, hi, mid);
+    return true;
 }
 
-static bool round_trip_high_cpu(const std::vector<int>& allowed, bool require_high) {
+static bool topology_under_masks(const std::vector<int>& allowed, bool require_high) {
+    if (!topology_respects_current_mask()) return false;
+    if (allowed.size() >= 2) {
+        const std::vector<int> sparse{allowed.front(), allowed.back()};
+        if (!set_affinity(sparse) || !expect_affinity(sparse, "establish sparse mask") ||
+            !topology_respects_current_mask()) return false;
+        if (!set_affinity(allowed) || !expect_affinity(allowed, "restore full mask")) return false;
+    } else {
+        std::puts("SKIP sparse mask: fewer than two allowed CPUs");
+    }
     const auto it = std::find_if(allowed.begin(), allowed.end(), [](int id) { return id >= 64; });
     if (it == allowed.end()) {
         if (require_high) {
             std::fprintf(stderr, "affinity test: --require-high-cpu requested, but no allowed CPU ID is >= 64\n");
             return false;
         }
-        std::puts("SKIP high-CPU affinity path: no allowed CPU ID is >= 64 (use --require-high-cpu to require it)");
+        std::puts("SKIP high-CPU mask: no allowed CPU ID is >= 64 (use --require-high-cpu to require it)");
         return true;
     }
-    const int target = allowed.front() == *it ? (allowed.size() > 1 ? allowed.back() : *it) : allowed.front();
-    if (target == *it) {
-        if (require_high) {
-            std::fprintf(stderr, "affinity test: --require-high-cpu needs at least two allowed CPUs to test restoration\n");
-            return false;
-        }
-        std::puts("SKIP high-CPU affinity round trip: only one CPU is allowed, so no meaningful pin transition is possible");
-        return true;
-    }
-
-    // Restrict the caller to one high-numbered CPU, then pin to a different originally allowed CPU.
-    // Restoring the high-only mask catches truncation even when the original process mask is sparse.
     const std::vector<int> high_only{*it};
     if (!set_affinity(high_only) || !expect_affinity(high_only, "establish high-only mask") ||
         !topology_respects_current_mask()) return false;
-    const auto previous = cpu::pin_current_thread(target);
-    const bool pinned = previous.valid && expect_affinity({target}, "pin away from high-only mask");
-    cpu::restore_thread_affinity(previous);
-    const bool restored = pinned && expect_affinity(high_only, "restore high-only mask");
-    if (restored) std::printf("High-CPU affinity round trip: saved CPU %d, pin target %d\n", *it, target);
-    return restored;
-}
-
-static bool negative_cpu_is_noop() {
-    std::vector<int> before;
-    if (!get_affinity(before)) return false;
-    const auto invalid = cpu::pin_current_thread(-1);
-    std::vector<int> after;
-    const bool unchanged = get_affinity(after) && before == after;
-    cpu::restore_thread_affinity(invalid);
-    return !invalid.valid && unchanged && expect_affinity(before, "negative CPU no-op");
-}
-
-static bool worker_thread_can_pin(int target) {
-    bool ok = false;
-    std::thread worker([&] {
-        std::vector<int> before;
-        if (!get_affinity(before)) return;
-        std::vector<unsigned long> saved;
-        if (basalt::platform::detail::get_thread_affinity(saved) != 0) return;
-        const int pin_error = basalt::platform::detail::pin_thread_to_cpu(target);
-        const bool pinned = pin_error == 0 && expect_affinity({target}, "worker thread helper pin") &&
-                            sched_getcpu() == target;
-        const int restore_error = basalt::platform::detail::set_thread_affinity(saved);
-        ok = pinned && restore_error == 0 && expect_affinity(before, "worker thread helper restore");
-    });
-    worker.join();
-    return ok;
-}
-
-static bool failed_pin_preserves_affinity() {
-    std::vector<int> before;
-    if (!get_affinity(before)) return false;
-    // An ID outside the caller's current mask may still be online and legal, so it is not a
-    // reliable failure case. INT_MAX is rejected before allocating or changing any CPU set.
-    const int error = basalt::platform::detail::pin_thread_to_cpu(INT_MAX);
-    std::vector<int> after;
-    const bool helper_unchanged = get_affinity(after) && before == after;
-    if (error == 0) {
-        std::fprintf(stderr, "affinity test: pin_thread_to_cpu(INT_MAX) unexpectedly succeeded\n");
-        return false;
-    }
-    const auto invalid = cpu::pin_current_thread(INT_MAX);
-    cpu::restore_thread_affinity(invalid);
-    std::vector<int> after_public;
-    const bool public_unchanged = get_affinity(after_public) && before == after_public;
-    if (!helper_unchanged || invalid.valid || !public_unchanged)
-        std::fprintf(stderr, "affinity test: failed pin changed the observed affinity or returned a valid snapshot\n");
-    return helper_unchanged && !invalid.valid && public_unchanged;
+    return set_affinity(allowed) && expect_affinity(allowed, "restore full mask after high-only");
 }
 
 int main(int argc, char** argv) {
@@ -266,15 +230,21 @@ int main(int argc, char** argv) {
     }
     const auto allowed = original.ids();
 
-    bool ok = round_trip_full_mask(allowed) && worker_thread_can_pin(allowed.back());
-    if (ok) ok = round_trip_sparse_nested(allowed);
-    if (ok) ok = round_trip_high_cpu(allowed, require_high);
-    if (ok) ok = negative_cpu_is_noop();
-    if (ok) ok = failed_pin_preserves_affinity();
+    // The pool takes its size from the caller as given (the sizing rules live in program/auto_plan).
+    {
+        cpu::ExpertPool three(3, cpu::PoolAffinity::All);
+        cpu::ExpertPool none(0, cpu::PoolAffinity::Auto);
+        if (three.workers() != 3 || none.workers() != 1) {
+            std::fprintf(stderr, "affinity test: pool sizes %d / %d, expected 3 / 1\n", three.workers(), none.workers());
+            return 1;
+        }
+    }
+
+    const bool ok = topology_under_masks(allowed, require_high) && topology_core_classes();
     const bool restored = original.restore() && expect_affinity(allowed, "final original affinity cleanup");
     if (!ok || !restored) return 1;
 
-    std::printf("affinity test: full, sparse/nested, worker helper, invalid-target, failed-pin, and cleanup checks passed (%zu allowed CPUs)\n",
+    std::printf("affinity test: topology under full, sparse and high-CPU masks, and cleanup checks passed (%zu allowed CPUs)\n",
                 allowed.size());
     return 0;
 }

@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 from serve import ROOT
-from serve.engine.flags import flag_index, flag_value
+from serve.engine.flags import flag_index
 from serve.engine.vision import VISION_MODES, VISION_USAGE, vision_mode
 
 
@@ -17,6 +17,7 @@ MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-c
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 PARALLEL_MAX = 8                            # the engine's batch slots
 CONFIG_PATHS = ("model", "tokenizer")       # relative to the config file
+GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
 
 
 def engine_flags_of(engine_bin: str) -> set[str] | None:
@@ -33,6 +34,13 @@ def server_options(ap: argparse.ArgumentParser) -> dict:
     """{name: action} of the server's own options (names without the dashes), apart from --config and --help."""
     return {o[2:]: act for act in ap._actions for o in act.option_strings
             if o.startswith("--") and o[2:] not in ("help", "config")}
+
+
+def grammar_words(known: set[str] | None) -> list[str]:
+    """The engine words that make grammar enforcement available: `--grammar on` whenever the engine binary has the
+    flag (a request's grammar key enforces; the server option only decides which requests carry one), so an engine
+    without it still starts."""
+    return ["--grammar", "on"] if known is not None and "--grammar" in known else []
 
 
 def split_engine_extras(extras: list[str]) -> list[str]:
@@ -110,7 +118,7 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> tuple[list[str],
         if act.nargs == 0:                                 # a switch
             if not isinstance(value, bool):
                 raise ValueError(f"server.{key}: true or false")
-            argv += [flag] if value else []
+            argv += [flag] if value else (["--no-grammar"] if name == "grammar" else [])
             continue
         items = value if isinstance(value, list) else [value]
         if isinstance(value, list) and not isinstance(act, argparse._AppendAction):
@@ -189,23 +197,25 @@ def engine_groups(words: list[str]) -> list[list[str]]:
     return groups
 
 
-def engine_line(file_words: list[str], cli_words: list[str], config: bool = True,
-                shared: tuple[int, int] | None = None) -> str:
+def engine_line(file_words: list[str], cli_words: list[str],
+                shared: tuple[int, int] | None = None, grammar: tuple[bool, str] | None = None) -> str:
     """The startup line listing the engine words from --config and the command line, each flag with its values and
-    origin; without a config file it says the built-in defaults apply. `shared` is (total, slots) when --max-context
-    was divided among the slots."""
+    origin; with none it says the default flags are used. `shared` is (total, slots) when --max-context
+    was divided among the slots. `grammar` is (on, origin) with origin "config" or "cli", None when left at its default (no entry)."""
     groups = [(g, "config") for g in engine_groups(file_words)] + [(g, "cli") for g in engine_groups(cli_words)]
     last_ctx = max((i for i, (g, _) in enumerate(groups) if g[0] == "--max-context"), default=None)
     def one(i, g, src):
         note = f"{src}: {shared[0]} / {shared[1]} slots" if shared and i == last_ctx else src
         return f"{' '.join(g)} ({note})"
     shown = ", ".join(one(i, g, src) for i, (g, src) in enumerate(groups))
-    if config:
-        return f"[server] engine: {shown}" if shown else "[server] engine: config sets nothing, built-in defaults"
-    words = file_words + cli_words
-    spec = flag_value(words, "--spec") or 0
-    state = f"spec {'off' if not int(spec) else spec}, {flag_value(words, '--max-context') or ENGINE_DEFAULT_CONTEXT} context"
-    return f"[server] engine: built-in defaults (no --config): {state}" + (f"; {shown}" if shown else "")
+    if grammar is not None:
+        on, origin = grammar
+        entry = f"grammar {'on' if on else 'off'} ({origin})"
+        shown = f"{shown}, {entry}" if shown else entry
+        base = "using default flags, " + entry if not groups else shown
+    else:
+        base = shown or "using default flags"
+    return f"[server] engine: {base}"
 
 
 def _num(v):
@@ -336,6 +346,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request with 400")
+    ap.add_argument("--grammar", action=argparse.BooleanOptionalAction, default=GRAMMAR_DEFAULT,
+                    help="hold every tool call and JSON response format to a grammar in the engine (on by default; a request "
+                         "with strict: true gets it either way); --no-grammar turns it off")
     ap.add_argument("--api-key", default="",
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); command line only, "
                          "not allowed in a --config file")

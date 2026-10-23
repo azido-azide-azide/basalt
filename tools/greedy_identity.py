@@ -22,8 +22,8 @@ sys.path.insert(0, str(HERE))
 
 PROMPTS = ("conv", "struct", "prose")
 # flags after `--` replace these
-BASE = ["--spec", "7", "--spec-min-p", "0.5", "--max-context", "8192"]
-PINNED = ["--adapt-swaps", "0", "--peer-adapt-swaps", "0", "--pcie-frac", "0"]
+BASE = ["--spec", "7", "--max-context", "8192"]
+PINNED = ["--adapt-swaps", "0", "--peer-adapt-swaps", "0"]
 
 
 def set_args(args: list[str], extra: list[str]) -> list[str]:

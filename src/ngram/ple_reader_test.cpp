@@ -87,12 +87,11 @@ int selftest(const std::string& dir, uint32_t rb) {
     const std::string path = dir + "/ple_reader_selftest_" + std::to_string(rb) + ".bin";
     if (!make_table(path, N, rb)) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return 2; }
     std::mt19937 rng(7);
-    for (bool thr : {false, true})
     for (uint64_t cache : {0ull, 4096ull}) {
         for (uint32_t inflight : {1u, 8u, 64u}) {
             ng::PleReader rd;
             std::string err;
-            CHECK(rd.open(path, HEADER, N, inflight, cache, err, thr, rb), "open: %s", err.c_str());
+            CHECK(rd.open(path, HEADER, N, inflight, cache, err, rb), "open: %s", err.c_str());
             // decode-shaped tickets: 16 random rows
             for (int t = 0; t < 200; ++t) {
                 std::vector<uint32_t> rows(16);
@@ -132,10 +131,10 @@ int selftest(const std::string& dir, uint32_t rb) {
         }
     }
     // fault injection: a 3 ms delay must be observed, and must not change the bytes
-    for (bool thr : {false, true}) {
+    {
         ng::PleReader rd;
         std::string err;
-        CHECK(rd.open(path, HEADER, N, 16, 0, err, thr, rb), "open: %s", err.c_str());
+        CHECK(rd.open(path, HEADER, N, 16, 0, err, rb), "open: %s", err.c_str());
         rd.set_injected_delay_us(3000);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
@@ -150,7 +149,7 @@ int selftest(const std::string& dir, uint32_t rb) {
     {
         ng::PleReader rd;
         std::string err;
-        CHECK(rd.open(path, HEADER, N, 16, 4096, err, true, rb), "open: %s", err.c_str());
+        CHECK(rd.open(path, HEADER, N, 16, 4096, err, rb), "open: %s", err.c_str());
         rd.set_keepalive(20.0, 0.5);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
@@ -182,17 +181,6 @@ int selftest(const std::string& dir, uint32_t rb) {
         CHECK(rd.snapshot().keepalive_reads <= k4 + 1, "keep-alive went on after it was turned off");
         rd.reset_stats();
         CHECK(rd.snapshot().keepalive_reads == 0 && rd.snapshot().keepalive_us_max == 0, "reset_stats kept keep-alive counts");
-    }
-    {   // the caller's thread does the reads: no worker, so no keep-alive
-        ng::PleReader rd;
-        std::string err;
-        CHECK(rd.open(path, HEADER, N, 16, 0, err, false, rb), "open: %s", err.c_str());
-        rd.set_keepalive(20.0, 1.0);
-        std::vector<uint32_t> rows(16);
-        for (auto& r : rows) r = rng() % N;
-        check_rows(rd, rows, N, rb, "keep-alive, caller thread");
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        CHECK(rd.snapshot().keepalive_reads == 0, "keep-alive without the worker thread");
     }
     std::filesystem::remove(path);
     std::printf("ple_reader selftest (row_bytes=%u): %s\n", rb, g_fail ? "FAILED" : "OK");
@@ -249,7 +237,7 @@ void stress(k::PleTable& mm, k::PleTable& direct, double secs) {
 }
 
 int real(const std::string& gguf, int n_random, const std::string& tokens_path, uint32_t inflight, bool direct_first,
-         bool direct_only, bool sync_submit, double stress_secs) {
+         bool direct_only, double stress_secs) {
     k::PleTable mm, direct;
     std::string err;
     basalt::core::ModelFile container;   // a .basalt file serves its source tensors as a GGUF view
@@ -263,7 +251,6 @@ int real(const std::string& gguf, int n_random, const std::string& tokens_path, 
     k::PleIoOptions dopt;
     dopt.cache_rows = 0;                               // measure the SSD, not the cache
     dopt.max_inflight = inflight;
-    dopt.io_thread = !sync_submit;
     // `--direct-only` measures the direct path with NO mapping of the file alive anywhere in the process: a
     // live section on the same file forces the file system to keep cached and non-cached views coherent.
     if (!direct_only && !mm.open(gguf, err, mo)) { std::fprintf(stderr, "mmap open: %s\n", err.c_str()); return 2; }
@@ -378,6 +365,76 @@ int bf16_decode_check() {
     return bad ? 1 : 0;
 }
 
+template <class T> void put(std::vector<uint8_t>& b, T v) {
+    const auto n = b.size();
+    b.resize(n + sizeof(T));
+    std::memcpy(b.data() + n, &v, sizeof(T));
+}
+
+// PleTable::warm_rows on a synthetic one-tensor GGUF (Q8_0 rows): rows read ahead come back byte-identical to the
+// mapped table's, are served from the row cache (a read held back by injected delay is not waited for), and in
+// Mmap mode the call does nothing.
+int warm_rows_check(const std::string& dir) {
+    constexpr uint32_t N = 20000;
+    const std::string path = dir + "/ple_warm_rows_selftest.gguf";
+    std::mt19937 rng(5);
+    {
+        std::vector<uint8_t> b;
+        put<uint32_t>(b, 0x46554747u);   // "GGUF"
+        put<uint32_t>(b, 3);
+        put<uint64_t>(b, 1);             // tensors
+        put<uint64_t>(b, 0);             // metadata
+        const std::string name = "per_layer_token_embd.weight";
+        put<uint64_t>(b, name.size());
+        b.insert(b.end(), name.begin(), name.end());
+        put<uint32_t>(b, 2);
+        put<uint64_t>(b, k::PLE_HEAD_DIM);
+        put<uint64_t>(b, N);
+        put<uint32_t>(b, 8);             // Q8_0
+        put<uint64_t>(b, 0);
+        b.resize((b.size() + 31) / 32 * 32);
+        for (uint32_t r = 0; r < N; ++r)
+            for (int blk = 0; blk < k::PLE_HEAD_DIM / 32; ++blk) {
+                put<uint16_t>(b, (uint16_t) (0x2800 + rng() % 0x800));   // a finite scale
+                for (int i = 0; i < 32; ++i) put<uint8_t>(b, (uint8_t) rng());
+            }
+        std::ofstream(path, std::ios::binary).write((const char*) b.data(), (std::streamsize) b.size());
+    }
+    std::string err;
+    k::PleTable mm, direct;
+    k::PleIoOptions mo, dopt;
+    mo.mode = k::PleIo::Mmap;
+    dopt.cache_rows = 1u << 16;
+    CHECK(mm.open(path, err, mo), "mmap open: %s", err.c_str());
+    CHECK(direct.open(path, err, dopt), "direct open: %s", err.c_str());
+    constexpr size_t T = 64;
+    std::vector<uint32_t> warmed(T * k::PLE_N_HEADS), cold(T * k::PLE_N_HEADS);
+    for (auto& r : warmed) r = rng() % (N / 2);
+    for (auto& r : cold) r = N / 2 + rng() % (N / 2);
+    std::vector<float> want(T * k::NG_N_EMBD), got(T * k::NG_N_EMBD);
+    CHECK(direct.cache_rows() == dopt.cache_rows && mm.cache_rows() == 0, "cache_rows: %llu / %llu",
+          (unsigned long long) direct.cache_rows(), (unsigned long long) mm.cache_rows());
+    CHECK(mm.warm_rows(warmed.data(), T, err), "mmap warm_rows: %s", err.c_str());   // no-op
+    CHECK(mm.gather_rows(warmed.data(), T, want.data(), err), "mmap gather: %s", err.c_str());
+    CHECK(direct.warm_rows(warmed.data(), T, err), "warm_rows: %s", err.c_str());
+    direct.set_injected_delay_us(100000);
+    double t0 = now_us();
+    CHECK(direct.gather_rows(warmed.data(), T, got.data(), err), "warmed gather: %s", err.c_str());
+    const double t_warm = now_us() - t0;
+    CHECK(!std::memcmp(want.data(), got.data(), want.size() * sizeof(float)), "warmed rows differ from the mapped table's");
+    CHECK(t_warm < 50000, "warmed rows were not served from the cache (%.0f us)", t_warm);
+    t0 = now_us();
+    CHECK(direct.gather_rows(cold.data(), T, got.data(), err), "cold gather: %s", err.c_str());
+    CHECK(now_us() - t0 >= 100000, "unwarmed rows were not read (%.0f us)", now_us() - t0);
+    CHECK(mm.gather_rows(cold.data(), T, want.data(), err), "mmap gather: %s", err.c_str());
+    CHECK(!std::memcmp(want.data(), got.data(), want.size() * sizeof(float)), "cold rows differ from the mapped table's");
+    mm.close();
+    direct.close();
+    std::filesystem::remove(path);
+    std::printf("PleTable::warm_rows: %s\n", g_fail ? "FAILED" : "OK");
+    return g_fail ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -386,7 +443,6 @@ int main(int argc, char** argv) {
     uint32_t inflight = 64;
     bool direct_first = false;
     bool direct_only = false;
-    bool sync_submit = false;
     bool self = false;
     double stress_secs = 0;
     for (int i = 1; i < argc; ++i) {
@@ -399,7 +455,6 @@ int main(int argc, char** argv) {
         else if (a == "--inflight" && i + 1 < argc) inflight = (uint32_t) std::atoi(argv[++i]);
         else if (a == "--direct-first") direct_first = true;
         else if (a == "--direct-only") direct_only = true;
-        else if (a == "--sync") sync_submit = true;
         else if (a == "--stress" && i + 1 < argc) stress_secs = std::atof(argv[++i]);
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F] [--stress SECS]\n"); return 2; }
     }
@@ -412,14 +467,11 @@ int main(int argc, char** argv) {
         const int r320 = selftest(dir, k::PLE_ROW_BYTES_BF16);
         const int q8 = q8_decode_check();
         const int bf16 = bf16_decode_check();
-        if (r90) return r90;
-        if (r110) return r110;
-        if (r170) return r170;
-        if (r320) return r320;
-        if (q8) return q8;
-        return bf16;
+        const int warm = warm_rows_check(dir);
+        return r90 != 0 ? r90 : r110 != 0 ? r110 : r170 != 0 ? r170
+              : r320 != 0 ? r320 : q8 != 0 ? q8 : bf16 != 0 ? bf16 : warm;
     }
-    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, sync_submit, stress_secs);
+    if (!gguf.empty()) return real(gguf, rows, tokens, inflight, direct_first, direct_only, stress_secs);
     std::fprintf(stderr, "nothing to do\n");
     return 2;
 }

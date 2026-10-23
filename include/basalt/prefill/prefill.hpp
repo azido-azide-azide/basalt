@@ -7,7 +7,7 @@
 // walk the chunk inside one kernel, and the routed experts are grouped by expert: resident ones are read from the
 // VRAM tier, the others streamed from the host arena through a pinned ring on a copy stream.
 //
-// Requires the native weights (`--native`): every quantized projection must carry its GGUF blocks.
+// Requires the native weights: every quantized projection must carry its GGUF blocks.
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
@@ -75,6 +75,9 @@ public:
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
     int64_t chunk() const;
+    /// The next runs read their first chunk with at most `tokens` tokens (0: every chunk is `chunk()` long), so the
+    /// rows it waits for before layer 1 are few; the chunks after it are `chunk()` long.
+    void set_head_chunk(int64_t tokens) { head_chunk_ = tokens; }
     /// Points the prompt path at another session's state (a view of `ss` with a batch slot's state fields) for the
     /// next runs; the buffers and the layer range stay.
     void set_session(core::SessionState& ss);
@@ -111,6 +114,11 @@ public:
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 
+    /// For the next `run` (which must start at `run_pos0`): once its first chunk's n-gram rows have landed, the rows of
+    /// `tokens[from, to)` (the prompt's later parts) are read into the row cache on a thread, so the runs that read
+    /// them find the rows in memory.  Needs `from >= 2`; `to` is cut to what the cache holds.  Cleared by that run.
+    void set_ple_warm(const int64_t* tokens, int64_t run_pos0, int64_t from, int64_t to);
+
     const PrefillStats& stats() const { return stats_; }
 
     /// Starts counting, per (layer, expert), the routed entries of the prompt rows this stage and the stages after it
@@ -122,7 +130,8 @@ public:
 
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
-    /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
+    /// chunks of up to init's `chunk` tokens.  Without P2P: the routed-only chunks, and the streamed ones up to a fixed
+    /// size on the FP4 experts (the same bits as this GPU's), with the rows crossing through host memory.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
     /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path reads them from its memory
     /// over P2P (into the ring, or in place).  Independent of set_peer.
@@ -141,6 +150,11 @@ public:
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
     /// K/V from them.  The prefill stream is synchronized before the call.
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
+
+    /// Called on the host before each layer of a chunk with the layers done so far, the layer count, the chunk's
+    /// length and first position.  No device work is added; the MoE layers' routing readback keeps the host in step
+    /// with the GPU.  Not called under a layer split.
+    std::function<void(int64_t layers_done, int64_t n_layers, int64_t T, int64_t pos0)> on_layer;
 
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
     /// is still at that chunk's end (its stream synchronized; the last stage calls it just before `on_chunk`).  An
@@ -173,6 +187,7 @@ private:
 
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;
     int64_t stage_lb_ = 0, stage_le_ = -1;
+    int64_t head_chunk_ = 0;
     Prefill* next_ = nullptr;
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)

@@ -37,14 +37,48 @@ namespace basalt::core {
 
 namespace detail {
 
+bool parse_cgroup_memory_stat(const std::string& text, uint64_t current, CgroupMemoryStat& stat) {
+    stat = CgroupMemoryStat{};
+    bool inactive_file = false, file_dirty = false, file_writeback = false, file = false;
+    std::istringstream input(text);
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream fields(line);
+        std::string key;
+        uint64_t value = 0;
+        if (!(fields >> key >> value)) return false;
+        fields >> std::ws;
+        if (!fields.eof()) return false;
+
+        auto take = [&](bool& seen, uint64_t& out) {
+            if (seen) return false;
+            seen = true;
+            out = value;
+            return true;
+        };
+        if (key == "file") { if (!take(file, stat.file)) return false; }
+        else if (key == "inactive_file") { if (!take(inactive_file, stat.inactive_file)) return false; }
+        else if (key == "file_dirty") { if (!take(file_dirty, stat.file_dirty)) return false; }
+        else if (key == "file_writeback") { if (!take(file_writeback, stat.file_writeback)) return false; }
+    }
+    if (!inactive_file || !file_dirty || !file_writeback) return false;
+    stat.current = current;
+    stat.valid = true;
+    return true;
+}
+
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes) {
     bytes = 0;
     if (!stat.valid) return false;
 
-    // memory.stat's inactive_file can race memory.current, so bound it to charged usage first.
-    uint64_t reclaimable = std::min(stat.inactive_file, stat.current);
+    // Clean file pages are reclaimable.  The page cache is the active and inactive lists together (`file`; the
+    // inactive list alone when the file total is not reported), because the container's own reads move pages to
+    // the active list.  The counters can race memory.current, so bound them to charged usage first.
+    uint64_t reclaimable = std::min(std::max(stat.file, stat.inactive_file), stat.current);
     reclaimable = stat.file_dirty >= reclaimable ? 0 : reclaimable - stat.file_dirty;
     reclaimable = stat.file_writeback >= reclaimable ? 0 : reclaimable - stat.file_writeback;
+    // Keep a margin: part of the cache is mapped or locked and does not come back on demand.
+    reclaimable -= std::min(reclaimable / 2, limit / 64);
 
     // Reclaiming clean file pages reduces usage; saturating subtraction also handles a transient over-limit read.
     const uint64_t usage_after_reclaim = stat.current - reclaimable;
@@ -170,35 +204,9 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
                              detail::CgroupMemoryStat& stat) {
     std::ifstream input(path / "memory.stat");
     if (!input) return false;
-
-    bool inactive_file = false, file_dirty = false, file_writeback = false;
-    std::string line;
-    while (std::getline(input, line)) {
-        std::istringstream fields(line);
-        std::string key;
-        uint64_t value = 0;
-        if (!(fields >> key >> value)) return false;
-        fields >> std::ws;
-        if (!fields.eof()) return false;
-
-        if (key == "inactive_file") {
-            if (inactive_file) return false;
-            inactive_file = true;
-            stat.inactive_file = value;
-        } else if (key == "file_dirty") {
-            if (file_dirty) return false;
-            file_dirty = true;
-            stat.file_dirty = value;
-        } else if (key == "file_writeback") {
-            if (file_writeback) return false;
-            file_writeback = true;
-            stat.file_writeback = value;
-        }
-    }
-    if (!input.eof() || !inactive_file || !file_dirty || !file_writeback) return false;
-    stat.current = current;
-    stat.valid = true;
-    return true;
+    std::ostringstream text;
+    text << input.rdbuf();
+    return text.good() && detail::parse_cgroup_memory_stat(text.str(), current, stat);
 }
 
 // cgroup v1's memory.stat: the group's hierarchical counters (total_*), the same allowance as v2's.  False when the
@@ -208,13 +216,15 @@ bool read_cgroup_v1_memory_stat(const std::filesystem::path& path, uint64_t usag
     if (!input) return false;
     bool inactive_file = false;
     std::string key;
-    uint64_t value = 0;
+    uint64_t value = 0, active_file = 0;
     while (input >> key >> value) {
         if (key == "total_inactive_file") { stat.inactive_file = value; inactive_file = true; }
+        else if (key == "total_active_file") active_file = value;
         else if (key == "total_dirty") stat.file_dirty = value;
         else if (key == "total_writeback") stat.file_writeback = value;
     }
     if (!inactive_file) return false;
+    stat.file = stat.inactive_file + active_file;
     stat.current = usage;
     stat.valid = true;
     return true;
@@ -780,24 +790,19 @@ bool FileExpertSource::pin_cache_complement(
             return false;
         }
         budget_physical = physical;
-        const uint64_t room = physical > headroom_bytes ? physical - headroom_bytes : 0;
+        const uint64_t room = detail::resident_room(physical, headroom_bytes);
         if (budget_bytes > room) {
-            // 256 MiB under the room, so the engine's own allocations after this reading still leave the headroom (a
-            // budget clamped to exactly the room could fail the safety check below on a slightly lower reading).  An
-            // unclamped budget is unchanged.
-            const uint64_t margin = 256ull << 20;
-            const uint64_t clamped = room > margin ? room - margin : 0;
             if (what_fits)
                 std::fprintf(stderr, "FileExpertSource: RAM room for the complement: %.2f GiB (%.2f GiB available "
-                                     "minus %.0f GiB headroom and a 0.25 GiB margin)\n",
-                             (double) clamped / 1073741824.0, (double) physical / 1073741824.0,
+                                     "minus %.0f GiB headroom and the page overhead)\n",
+                             (double) room / 1073741824.0, (double) physical / 1073741824.0,
                              (double) headroom_bytes / 1073741824.0);
             else
                 std::fprintf(stderr, "FileExpertSource: --resident-budget-gib %.2f is more than the RAM has room for "
-                                     "(%.2f GiB available minus %.0f GiB headroom and a 0.25 GiB margin): %.2f GiB\n",
+                                     "(%.2f GiB available minus %.0f GiB headroom and the page overhead): %.2f GiB\n",
                              (double) budget_bytes / 1073741824.0, (double) physical / 1073741824.0,
-                             (double) headroom_bytes / 1073741824.0, (double) clamped / 1073741824.0);
-            budget_bytes = clamped;
+                             (double) headroom_bytes / 1073741824.0, (double) room / 1073741824.0);
+            budget_bytes = room;
         }
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
@@ -835,11 +840,7 @@ bool FileExpertSource::pin_cache_complement(
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
         }
-        // The arena is ordinary 4 KiB pages: their page tables and the driver's per-page records come on top of its
-        // bytes, so the copy leaves room for them as well.
-        const uint64_t page_overhead = physical / 256;
-        const uint64_t reserve = headroom_bytes + page_overhead;
-        budget = physical > reserve ? physical - reserve : 0;
+        budget = detail::resident_room(physical, headroom_bytes);
         if (bytes > budget) {
             char message[320];
             std::snprintf(message, sizeof message,
@@ -943,7 +944,7 @@ bool FileExpertSource::pin_cache_complement(
             if (pin) {
                 // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
                 // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
-                // read by the GPU over PCIe (--pcie-frac) and copied by DMA; only the rest is locked in the working
+                // read by the GPU over PCIe (the PCIe share) and copied by DMA; only the rest is locked in the working
                 // set (the registered prefix is page-locked by the driver already - locking it twice made the next
                 // device allocation fail).
                 lock_off = partial_pin;
@@ -1637,8 +1638,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     }
 
     // rows of every expert across all threads (bitwise the same as `run`).
-    if (d.split_rows) d.pool->run_split(d.jobs.data(), (int) njobs);
-    else d.pool->run(d.jobs.data(), (int) njobs);
+    d.pool->run_split(d.jobs.data(), (int) njobs);
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
@@ -1711,7 +1711,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
-        const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
@@ -1731,7 +1730,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;
-                            dma_src[fetches] = src;
                             pcie_i0[fetches] = i0;
                             ++fetches;
                         }
@@ -1753,11 +1751,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++groups;
         }
         P.start[groups] = entries;
-        const uint64_t bb = lay.blob_bytes(d.layers);
-        for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
+        for (int q = 0; q < fetches; ++q) {       // the PCIe groups: the arena alias, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
-            P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
-                                 : P.staging + (unsigned long long) q * (unsigned long long) bb;
+            P.ptr2[q] = (unsigned long long) d.src->device_alias(d.layers, ids[i0]);
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
                 if (first_of[i] == i0) {
@@ -1773,7 +1769,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[2] = fetches;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (P.publish) P.publish(P.ctx);
-        if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        if (P.staged) P.staged(P.ctx);
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -1985,17 +1981,15 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
         }
         basalt::kernels::quantize_q8_0_scaled(d.mixed, d.x_q8_0_hit, d.x_q8_0_hit_scale, basalt::kernels::cpu::H,
                                               cs);
-        if (d.hit_cpu_order)
-            basalt::kernels::moe_hit_grouped_s2_cpu_order(d.cache_base, d.d_slot, d.d_dst, d.n_hits,
-                d.cache_blob, d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
-        else
-            basalt::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
+        basalt::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
                 d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         d.hit_pending = true;
-        if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
-        // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host
-        // to enter the driver, this is what lets it start while the pool runs.
-        if (d.hit_poke && d.hit_done != nullptr) (void) cudaEventQuery((cudaEvent_t) d.hit_done);
+        if (d.hit_done != nullptr) {
+            cudaEventRecord((cudaEvent_t) d.hit_done, cs);
+            // ONE driver entry here: if the work was waiting for the host to enter the driver, this is what lets it
+            // start while the pool runs.
+            (void) cudaEventQuery((cudaEvent_t) d.hit_done);
+        }
         return;
     }
 
@@ -2102,7 +2096,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     // its pages are committed as the load writes them, so a container whose memory limit is below the arena would be
     // killed by the OOM killer part-way through the load, without a message.  A hard cgroup limit below it is certain
     // to end that way: refused, with the numbers.  Less RAM available than the arena (another program, an engine
-    // still exiting) is only a warning - the OS may make room.
+    // still exiting) is refused as well, with the numbers: the arena is locked resident, so the room is needed up front.
     ram_warning_.clear();
     // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
     if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {
