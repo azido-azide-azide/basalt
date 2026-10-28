@@ -22,7 +22,7 @@ Upstream, plus the four patches one deployment runs on top of it - listed in
 
 Nothing else is changed.
 
-Synced to upstream main at `493dcfc` (2026-10-19): the shared-arena patch is re-landed in `src/platform/memory.cpp`, where upstream moved the arena allocation into the platform layer.
+Synced to upstream main at `71116cc` (2026-10-28): the `load-threads` patch's Options field is re-landed in `include/basalt/program/options.hpp`, where upstream moved `struct Options`.
 
 Basalt is a local inference engine for the **Qwen3.8-Flash-Next** mixture-of-experts model.
 It runs on Linux and Windows with an NVIDIA Blackwell GPU (sm_120); see [platforms](docs/platforms.md) for limitations.

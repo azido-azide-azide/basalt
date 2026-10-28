@@ -40,6 +40,7 @@
 #include "basalt/kernels/qsa_dec_fused.hpp"
 #include "basalt/kernels/q5k_head.hpp"
 #include "basalt/kernels/q6k_head.hpp"
+#include "basalt/kernels/q80_head.hpp"
 #include "basalt/kernels/qsa_select.hpp"
 #include "basalt/kernels/quantize_act.hpp"
 #include "basalt/kernels/rope.hpp"
@@ -71,11 +72,13 @@
 namespace basalt::core {
 
 // The CPU tier's cache warm-up.  After layer l's doorbell the parked pool workers score layer l + 1's router on layer
-// l's FFN input (the ring's q8_1 rows; the router in int8 with one scale per 32 values, as the peer's warm-up has it:
-// a prediction only), take every token's top k, rank the predicted experts only the CPU holds by their summed weight,
-// and read the likeliest one into their caches.  The next batch stops the work; the experts are computed as before.
+// l's FFN input (the ring's q8_1 rows; the router in 4-bit with one scale per 32 values, a prediction only: half the
+// bytes of an 8-bit copy, so the scoring leaves more of the gap to the read), take every token's top k, rank the
+// predicted experts only the CPU holds by their summed weight, and read the likeliest one into their caches.  The next
+// batch stops the work; the experts are computed as before.
 struct CpuWarm {
-    std::vector<int8_t> rq;   ///< [n_layers][n_expert][n_embd]
+    std::vector<uint8_t> rq;  ///< [n_layers][n_expert][n_embd / 2]: per 32 values, value i in the low nibble of byte i
+                              ///< and value i + 16 in its high nibble, each the code plus 8
     std::vector<float> rs;    ///< [n_layers][n_expert][n_embd / 32]
     int n_expert = 0, n_embd = 0, k = 0;
     size_t bytes = 0, down_off = 0;   ///< a blob's bytes, where its down rows start
@@ -161,6 +164,17 @@ struct DecMoe {
         bool live = false;
     };
     std::vector<XPeer> xp;
+    // the staged share (a card without peers): every expert's host-RAM address (device alias) or 0, its host copy and
+    // the source's places it was read at, the staged count per count of distinct CPU misses, the copy's own stream
+    unsigned long long* stage_src = nullptr;
+    unsigned long long* stage_host = nullptr;
+    uint64_t stage_gen = 0;
+    int32_t* stage_k = nullptr;
+    cudaStream_t st_s = nullptr;
+    cudaEvent_t st_fork = nullptr, st_join = nullptr;
+    int64_t stage_stride = 0;
+    int stage_blocks = 0;
+    int stage_min = 0;   // the fewest distinct CPU misses a layer stages a share of
     // pinned staging of the residency uploads: the copies take their source from here, so the call does
     // not wait for the stream; a ring of slots, each reused only after the window's stream sync
     uint8_t* pin = nullptr;
@@ -179,17 +193,20 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 // layer `c.layer`'s router rows [e0, e1) on the job's tokens
 BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const std::atomic<bool>& stop) {
     const int NB = c.n_embd / 32, pt = c.n_tok;
-    const int8_t* R = c.rq.data() + (size_t) c.layer * c.n_expert * c.n_embd;
+    const uint8_t* R = c.rq.data() + (size_t) c.layer * c.n_expert * (c.n_embd / 2);
     const float* S = c.rs.data() + (size_t) c.layer * c.n_expert * NB;
+    const __m128i lo4 = _mm_set1_epi8(0x0f), off = _mm_set1_epi8(8);
     for (int e = e0; e < e1; ++e) {
         if (stop.load(std::memory_order_relaxed)) return;
         __m256 acc[basalt::kernels::kVerifyMaxT];
         for (int t = 0; t < pt; ++t) acc[t] = _mm256_setzero_ps();
-        const int8_t* row = R + (size_t) e * c.n_embd;
+        const uint8_t* row = R + (size_t) e * (c.n_embd / 2);
         for (int b = 0; b < NB; ++b) {
-            const __m256i w = _mm256_loadu_si256((const __m256i*) (row + b * 32));
-            const __m256i wl = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
-            const __m256i wh = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1));
+            const __m128i q = _mm_loadu_si128((const __m128i*) (row + b * 16));
+            const __m128i ql = _mm_sub_epi8(_mm_and_si128(q, lo4), off);
+            const __m128i qh = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(q, 4), lo4), off);
+            const __m256i wl = _mm256_cvtepi8_epi16(ql);
+            const __m256i wh = _mm256_cvtepi8_epi16(qh);
             const float sw = S[(size_t) e * NB + b];
             for (int t = 0; t < pt; ++t) {
                 const uint8_t* blk = c.xq + ((size_t) t * NB + b) * 36;   // block_q8_1: half d, half s, 32 x int8
@@ -296,14 +313,22 @@ struct Bump {
 constexpr int kCommitBlocks = 32;
 bool g_commit_async = false;   // see Verifier::set_commit_async
 
-// Every layer's BF16 router [n_expert x n_embd] as int8 with one scale per 32 values (the warm-ups' predictor, a
-// prediction only).  False when a layer's router is not such a table.
-bool router_int8(const WeightTable& wt, const ModelGeometry& g, std::vector<int8_t>& q, std::vector<float>& sc) {
+// Every layer's BF16 router [n_expert x n_embd] with one scale per 32 values, read once: as int8 codes for the peer's
+// warm-up (`q8`, `s8`) and as 4-bit codes in CpuWarm's layout for the CPU pool's (`q4`, `s4`); either may be null.  A
+// prediction only.  False when a layer's router is not such a table.
+bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int8_t>* q8, std::vector<float>* s8,
+                  std::vector<uint8_t>* q4, std::vector<float>* s4) {
     const int64_t N = g.n_embd, NE = g.n_expert, L = g.n_layers, NB = N / 32;
     if (NE > basalt::kernels::kDmPredExperts || N % 32 != 0) return false;
     std::vector<uint16_t> src((size_t) (NE * N));
-    q.assign((size_t) (L * NE * N), 0);
-    sc.assign((size_t) (L * NE * NB), 0.0f);
+    if (q8 != nullptr) {
+        q8->assign((size_t) (L * NE * N), 0);
+        s8->assign((size_t) (L * NE * NB), 0.0f);
+    }
+    if (q4 != nullptr) {
+        q4->assign((size_t) (L * NE * N / 2), 0);
+        s4->assign((size_t) (L * NE * NB), 0.0f);
+    }
     for (int64_t l = 0; l < L; ++l) {
         const WeightRef* w = LayerView(wt, l).get("ffn_gate_inp.weight");
         if (w == nullptr || w->bytes != (uint64_t) (NE * N * 2)) return false;
@@ -319,16 +344,28 @@ bool router_int8(const WeightTable& wt, const ModelGeometry& g, std::vector<int8
                     std::memcpy(&v[i], &u, 4);
                     amax = std::max(amax, std::fabs(v[i]));
                 }
-                const float d = amax / 127.0f;
-                sc[(size_t) ((l * NE + r) * NB + b)] = d;
-                for (int i = 0; i < 32; ++i)
-                    q[(size_t) ((l * NE + r) * N + b * 32 + i)] = (int8_t) (d > 0.0f ? std::lrintf(v[i] / d) : 0);
+                const size_t blk = (size_t) ((l * NE + r) * NB + b);
+                if (q8 != nullptr) {
+                    const float d = amax / 127.0f;
+                    (*s8)[blk] = d;
+                    for (int i = 0; i < 32; ++i)
+                        (*q8)[blk * 32 + (size_t) i] = (int8_t) (d > 0.0f ? std::lrintf(v[i] / d) : 0);
+                }
+                if (q4 != nullptr) {   // value i in the low nibble of byte i, value i + 16 in its high nibble, code + 8
+                    const float d = amax / 7.0f;
+                    (*s4)[blk] = d;
+                    uint8_t* out = q4->data() + blk * 16;
+                    for (int i = 0; i < 16; ++i) {
+                        const long c0 = d > 0.0f ? std::lrintf(v[i] / d) : 0, c1 = d > 0.0f ? std::lrintf(v[i + 16] / d) : 0;
+                        out[i] = (uint8_t) ((std::clamp<long>(c0, -7, 7) + 8) | ((std::clamp<long>(c1, -7, 7) + 8) << 4));
+                    }
+                }
             }
     }
     return true;
 }
 
-// The peer warm-up's predictor rows (router_int8's) on the current device.
+// The peer warm-up's predictor rows (router_codes' int8 ones) on the current device.
 bool warm_router(const std::vector<int8_t>& q, const std::vector<float>& sc, int8_t** rq, float** rs) {
     if (cudaMalloc((void**) rq, q.size()) != cudaSuccess || cudaMalloc((void**) rs, sc.size() * 4) != cudaSuccess ||
         cudaMemcpy(*rq, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
@@ -607,14 +644,20 @@ bool Verifier::dm_init(std::string& err) {
         cudaGetLastError();
         d->pin = nullptr;
     }
-    // the warm-ups' predictor (the peer's and the CPU pool's): every layer's router in int8, quantized once
+    // the warm-ups' predictors, quantized once: every layer's router in int8 for the peer's, in 4-bit for the CPU pool's
     const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 &&
                           std::all_of(lay.fmt.begin(), lay.fmt.end(), [&](const basalt::kernels::cpu::NativeFmt& f) {
                               return f.bytes == lay.fmt[0].bytes && f.down_off == lay.fmt[0].down_off;
                           });
     std::vector<int8_t> rq_h;
     std::vector<float> rs_h;
-    const bool router_ok = (cpu_warm || (peer_ != nullptr && peer_->valid())) && router_int8(*wt_, g, rq_h, rs_h);
+    std::vector<uint8_t> rq4_h;
+    std::vector<float> rs4_h;
+    const bool peer_on = peer_ != nullptr && peer_->valid();
+    const bool codes_ok = (cpu_warm || peer_on) &&
+                          router_codes(*wt_, g, peer_on ? &rq_h : nullptr, peer_on ? &rs_h : nullptr,
+                                       cpu_warm ? &rq4_h : nullptr, cpu_warm ? &rs4_h : nullptr);
+    const bool router_ok = peer_on && codes_ok;
     if (peer_ != nullptr && peer_->valid()) {
         const OnDevice on(peer_->device());
         d->pdev = peer_->device();
@@ -686,15 +729,57 @@ bool Verifier::dm_init(std::string& err) {
         hs_init();
         gs_init();
     }
-    if (cpu_warm && router_ok) {
+    if (cpu_warm && codes_ok) {
         CpuWarm* w = new CpuWarm;
-        w->rq = std::move(rq_h);
-        w->rs = std::move(rs_h);
+        w->rq = std::move(rq4_h);
+        w->rs = std::move(rs4_h);
         w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->k = (int) K; w->src = warm_src_;
         w->bytes = lay.fmt[0].bytes;
         w->down_off = lay.fmt[0].down_off;
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
+    }
+    // The staged share: on one card, a batch window's layer with enough CPU misses sends some of them to CUDA0, copied
+    // over PCIe from their RAM copies into staging while the pool reads the rest.  An expert without a mapped RAM copy
+    // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
+    // The count staged for m misses balances the pool's time for the rest against the copy's, both reading host
+    // memory at once.
+    bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
+                 warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0) && lay.fmt[0].bytes % 16 == 0;
+    for (int64_t l = 1; stage && l < g.n_layers; ++l) stage = lay.fmt[(size_t) l].bytes == lay.fmt[0].bytes;
+    const int64_t blob = (int64_t) lay.fmt[0].bytes, stride = dec_moe_stage_stride(blob);
+    const int stage_slots =
+        (int) std::min<int64_t>(kDmStageMax, (int64_t) (kStagingBlobs * (int64_t) lay.max_blob) / stride);
+    if (stage && stage_slots >= 1) {
+        // per layer: the pool's experts after its doorbell, the staged ones after the copy, their own launches and
+        // the combine's wait for them
+        constexpr double kPoolBytesPerUs = 45e3, kLinkBytesPerUs = 18e3, kPoolFixUs = 15.0, kStageFixUs = 35.0;
+        const double cpu_us = (double) blob / kPoolBytesPerUs, link_us = (double) blob / kLinkBytesPerUs;
+        std::vector<int32_t> kt((size_t) kDmCap + 1, 0);
+        for (int m = 1; m <= kDmCap; ++m) {
+            double best = kPoolFixUs + m * cpu_us;
+            for (int k = 1; k <= std::min(m, stage_slots); ++k) {
+                const double t = std::max(kPoolFixUs + (m - k) * cpu_us, kStageFixUs + k * link_us);
+                if (t < best) { best = t; kt[(size_t) m] = k; }
+            }
+        }
+        int st_least = 0, st_greatest = 0;   // the copy's blocks go first as the FFN read's leave the SMs
+        bool sok = cudaMalloc((void**) &d->stage_src, (size_t) LE * 8) == cudaSuccess &&
+                   cudaMemset(d->stage_src, 0, (size_t) LE * 8) == cudaSuccess &&
+                   cudaMallocHost((void**) &d->stage_host, (size_t) LE * 8) == cudaSuccess &&
+                   cudaMalloc((void**) &d->stage_k, kt.size() * 4) == cudaSuccess &&
+                   cudaMemcpy(d->stage_k, kt.data(), kt.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+                   cudaDeviceGetStreamPriorityRange(&st_least, &st_greatest) == cudaSuccess &&
+                   cudaStreamCreateWithPriority(&d->st_s, cudaStreamNonBlocking, st_greatest) == cudaSuccess &&
+                   cudaEventCreateWithFlags(&d->st_fork, cudaEventDisableTiming) == cudaSuccess &&
+                   cudaEventCreateWithFlags(&d->st_join, cudaEventDisableTiming) == cudaSuccess;
+        if (!sok) { err = "verify: the staged share's buffers"; return false; }
+        std::memset(d->stage_host, 0, (size_t) LE * 8);
+        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first batch window
+        d->stage_stride = stride;
+        d->stage_blocks = 8;
+        d->stage_min = 1;
+        while (d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
     }
     std::string served;
     if (d->pdev >= 0) {
@@ -1384,10 +1469,15 @@ void Verifier::dm_free() {
         for (void* h : {(void*) x.h_ring, (void*) x.h_w})
             if (h) cudaFreeHost(h);
     }
+    if (d->st_s) { cudaStreamSynchronize(d->st_s); cudaStreamDestroy(d->st_s); }
+    for (cudaEvent_t e : {d->st_fork, d->st_join})
+        if (e) cudaEventDestroy(e);
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
-                    (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed})
+                    (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed,
+                    (void*) d->stage_src, (void*) d->stage_k})
         if (p) cudaFree(p);
+    if (d->stage_host) cudaFreeHost(d->stage_host);
     if (d->pin) cudaFreeHost(d->pin);
     if (d->landed_pin) cudaFreeHost(d->landed_pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})
@@ -1909,14 +1999,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (fa.n_layers > 0) gdn_commit_finish(fa, commit_ctl_, cs, fin_blocks_);
     }
     // ---- the window's inputs, from mapped staging
-    copy_i32_from_mapped(tok_, m_tok_, T, cs);
+    copy_i32x3_from_mapped(tok_, m_tok_, T, step_, m_step_, (int64_t) T * kStepCount, pos_, m_pos_,
+                           (int64_t) MT * (NH + NKV + IQ), cs);
     if (batch_rec_) {   // the segment tables: which slot each row is
         copy_i32_from_mapped((int32_t*) segb_, (const int32_t*) m_segb_, (int64_t) T * 8, cs);
         copy_i32_from_mapped((int32_t*) d_qrows_, (const int32_t*) m_qseg_, (int64_t) (kQsaSegMaxRows + 8) * 4, cs);
         if (ple_on) ple_hist_gather(ple_work_, d_ple_slots_, segb_, HS, T, cs);
     }
-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
@@ -2685,6 +2774,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
             ra.rows = dm_->rq != nullptr || dm_->warm != nullptr;
+            if (dm_->stage_src != nullptr && batch_rec_) {   // batch windows: many rows, many misses
+                ra.stage_src = dm_->stage_src + l * g.n_expert;
+                ra.stage_k = dm_->stage_k;
+            }
             PdlScope pr(false);   // after the router's kernel: a plain launch
             if (glue_on) {   // the ring's work inside post's gate/up launch, released by the read's counts
                 glue_ring = ra;
@@ -2704,6 +2797,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 ra.mode = 1;
             }
             if (!glue_on) dec_moe_route(ra, cs);
+            if (ra.stage_src != nullptr) {   // the staged share's copy, beside the ring and CUDA0's own experts
+                cudaEventRecord(dm_->st_fork, cs);
+                cudaStreamWaitEvent(dm_->st_s, dm_->st_fork, 0);
+                PdlScope pst(false);
+                dec_moe_stage(ra, staging_, dm_->stage_stride,
+                              (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(l), dm_->stage_blocks, dm_->st_s);
+                cudaEventRecord(dm_->st_join, dm_->st_s);
+            }
         } else if (ar_on()) {
             resident_plan(ids_, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -2854,6 +2955,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 landed_glue_ = false;
                 native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                       nat_xq_, hit_scratch_, parts_out, cs);
+            }
+            if (dm_->stage_src != nullptr && batch_rec_) {   // the staged share, once its copy is in staging
+                cudaStreamWaitEvent(cs, dm_->st_join, 0);
+                PdlScope pst(false);
+                native_expert_grouped(L, P->sptr, P->sstart, P->scounts, P->sdst, P->stok, cap, cap, nat_xq_,
+                                      hit_scratch_, parts_out, cs, kPcieGroupRows);
             }
             stamp(l, 20);
             stamp(l, 21);
@@ -3013,6 +3120,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         q5k_head_mmvq(w, x, y, (int) N, n, T, s);
                     else if (head_->type() == 14 && q6k_head_supported((int) N, T))
                         q6k_head_mmvq(w, x, y, (int) N, n, T, s);
+                    else if (head_->type() == 8 && T >= 4 && q80_head_supported((int) N, T))
+                        q80_head_mmvq(w, x, y, (int) N, n, T, s);
                     else
                         native_mmvq(head_->type(), w, x, y, (int) N, n, T, s);
                 };
@@ -3043,6 +3152,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               vhead_scratch_, cs);
                 else if (head_->type() == 14 && q6k_head_supported((int) N, T))
                     q6k_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+                else if (head_->type() == 8 && T >= 4 && q80_head_supported((int) N, T))   // four columns or more: the same bits as one wave
+                    q80_head_mmvq(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
                 else
                     native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
             } catch (const std::exception& e) {
@@ -4371,6 +4482,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     basalt::log::info("basalt verify", "batch windows of up to %lld sequences (layers [%lld, %lld))", (long long) S,
                  (long long) lb_, (long long) le_);
+    if (dm_ != nullptr && dm_->stage_src != nullptr)
+        basalt::log::info("basalt verify", "batch windows: a layer with %d+ CPU misses sends a share of them over PCIe to "
+                          "CUDA0", dm_->stage_min);
     return true;
 }
 
@@ -4636,6 +4750,31 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     return run_slot_segs(rows, nullptr, S, tokens, pos, pool, user, out, err);
 }
 
+// The staged share's RAM addresses (a mapped, 16-byte aligned copy or 0), read again when the source's places moved
+// since: between windows, on the window's stream ahead of it.  The last window synchronized its stream, so the host
+// copy is free to rewrite.
+bool Verifier::dm_stage_places(std::string& err) {
+    DecMoe* d = dm_;
+    if (d == nullptr || d->stage_src == nullptr) return true;
+    const uint64_t gen = warm_src_->places_generation();
+    if (gen == d->stage_gen) return true;
+    const ModelGeometry& g = *g_;
+    const int64_t LE = g.n_layers * g.n_expert;
+    bool changed = false;
+    for (int64_t i = 0; i < LE; ++i) {
+        const unsigned long long p = (unsigned long long) warm_src_->device_alias(i / g.n_expert, i % g.n_expert);
+        const unsigned long long v = (p & 15ull) == 0 ? p : 0ull;
+        changed = changed || d->stage_host[i] != v;
+        d->stage_host[i] = v;
+    }
+    d->stage_gen = gen;
+    if (changed && cudaMemcpyAsync(d->stage_src, d->stage_host, (size_t) LE * 8, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        err = std::string("verify: the staged share's addresses: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
 bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int32_t* tokens, const int64_t* pos,
                              PoolMultiFn pool, void* user, int32_t* out, std::string& err) {
     using namespace basalt::kernels;
@@ -4647,6 +4786,7 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
     if (dm && !dm_begin(err, nullptr)) return false;
+    if (dm && !dm_stage_places(err)) return false;
     order_after_commit();
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }

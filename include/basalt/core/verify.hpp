@@ -381,6 +381,7 @@ private:
     bool gs_move(bool to_peer, std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
+    bool dm_stage_places(std::string& err);            ///< the staged share's RAM addresses, read again when they moved
     bool dm_end(std::string& err);         ///< the peer window's end
     void dm_free();
     std::string peer_released();           ///< after a release: whether the peer window ended (see dm_note)
@@ -574,7 +575,7 @@ private:
     // committed inside the next solo window, on lz_s_ from the previous layer's FFN read (that layer's own items and,
     // until the previous layer's combine has its CPU rows, later ones), joined before the layer's GDN kernels.  The
     // same launches (and one before each QSA layer) read the next layer's projection weights into L2 while the
-    // previous layer's combine waits for the CPU pool.
+    // previous layer's combine waits for the CPU pool or the peer's rows.
     cudaStream_t lz_s_ = nullptr;
     cudaEvent_t lz_fork_ = nullptr, lz_join_ = nullptr;
     bool lz_pending_ = false;                       ///< a commit whose lazy layers no window has applied yet
