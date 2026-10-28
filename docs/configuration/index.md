@@ -57,7 +57,7 @@ A config file is one JSON object with two optional blocks:
 - `api-key` cannot be set in a config file; a file that sets it is refused.
 - The built-in defaults pick the fastest settings that need no knowledge of the machine (speculation 8 with a drafter,
   expert cache auto, prefill auto, resident experts when the RAM holds them, adaptive rounds every window), and keep
-  the settings that change output or memory use (4096 context, fp16 KV). A config file sets those. The startup line `[server] engine: ...` lists what came from the file or the command line.
+  the settings that change output or memory use (4096 context, fp16 KV). A config file sets those. The startup line `[server] engine ...` lists what came from the file or the command line.
 
 In the tables, "default" is what applies when the setting is absent everywhere.
 
@@ -77,7 +77,7 @@ wins and is never changed.
 The engine prints one line naming only the picked settings, in the order above, and the server relays it once per start:
 
 ```
-[server] auto flags: peer-exclusive off, resident 51.2 GB, pool-affinity all, pool-workers 15
+[server] auto     peer-excl=off resident=51.2GB pool-affinity=all pool=15
 ```
 
 When every setting is given, no line is printed.
@@ -104,7 +104,8 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `debug` | switch | off | One log line per request and the raw model text after each reply. |
 | `request-lines` | switch | off | Echo the engine's per-request summary on stdout, for a supervisor that sees only that output. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling` value, else the engine's | The sampling default for a request that leaves that field out, over the model file's. Same meaning and allowed values as the [model file's sampling keys](#the-model-files-sampling-defaults). The server applies them to each request; the engine never sees them. |
-| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [Sampling](#sampling)). At the budget the thinking is closed and the answer starts. It only helps when it sits below the request's `max_tokens`: at or above it the request runs to `max_tokens` in thinking and answers nothing. A request's own field wins, and `0` there turns it off. |
+| `reasoning-budget-tokens` | integer | `0` (none) | The thinking budget for a request that names none (see [Sampling](#sampling)). At the budget the thinking is closed and the answer starts. A request's own field wins, and `0` there disables budgeting. Positive budgets are also limited by `answer-room`. |
+| `answer-room` | switch (`--no-answer-room` or `answer-room: false` turns it off) | on | Reserve wrap-up and answer space when the effective output cap is at least 1024 tokens. Applies to missing budgets and clamps positive budgets; an explicit request budget of `0` opts out. |
 | `tokenizer` | path | `pack/full/tokenizer` in the source tree (a byte tokenizer if absent) | Tokenizer directory. Mock engine only. |
 | `mock-engine`, `script` | switch, string (repeatable) | off, a short greeting | Testing: run a scripted engine instead of the model, for clients and tests (no `model` needed); `script` is its answer, and given more than once, requests get them in turn. |
 | `config` | path | none | The config file. Command line only. |
@@ -129,7 +130,8 @@ Server options. Command line `--name`, config `server` block `"name"`.
 | `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (262144), auto, 1, 32, 1 | YaRN's own parameters, as in llama.cpp. |
 
 A server with `max-context` above 32768 has an elastic KV cache: each session backs its first 32768 cells at startup and
-takes more from the expert cache only when a request needs it. It is off with `kv-resident` or `vram-elastic`. See [running](../running.md#concurrent-requests---parallel-n).
+takes more from the expert cache only when a request needs it. With `parallel`, each slot whose share is above 4096
+tokens does the same from 4096 cells, growing by 4096. It is off with `kv-resident` or `vram-elastic`. See [running](../running.md#concurrent-requests---parallel-n).
 
 ## Expert cache and memory
 
@@ -153,7 +155,9 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 ### The adaptive tier
 
 The engine counts how often each expert is routed to. Every few decode windows it runs a round: in each layer it swaps
-the most-used experts that are not in VRAM in for the least-used resident ones, when the gain is clear. The peer card
+the most-used experts that are not in VRAM in for the least-used resident ones, when the gain is clear. On one card
+without a peer tier the round ranks every layer together, so a layer that routes to more experts takes slots from the
+layers that route to fewer. The peer card
 takes the next most-used experts the main card does not hold. After each round every count is decayed, so recent routing
 outweighs old. Copies run on a side stream and land a few windows later. Adaptation moves experts between the CPU and
 the GPUs, so output is not bit-identical from run to run; see [precision](../precision/index.md). The round settings are
@@ -205,7 +209,7 @@ plain decoding would give.
 
 | Setting | Where | Type, values | Default | What it does and when to change it |
 | --- | --- | --- | --- | --- |
-| `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. |
+| `vision` | server | `off`, `dynamic`, `cpu`, a GPU number | `off` | Image input; booleans are refused. A GPU number, as `gpu` numbers them: encoder sidecar always on that card (about 2.2 GiB of its expert cache), whatever the engine's cards are and no engine role needed. `dynamic`: inside the engine, borrowing expert-cache slots only while it reads an image. `cpu`: sidecar on the CPU, no VRAM, slow. Latencies: [running](../running.md#vision---vision). A GPU number needs the `basalt-vision` binary next to `bin/basalt`. Needs a model file with a vision projector. One image is capped at 64 megapixels before it is decoded. |
 
 Diagnostic flags: `bin/basalt --help`
 
@@ -248,6 +252,12 @@ and `reasoning_budget_tokens` (a cap on thinking tokens; `0` is none). Anthropic
 llama.cpp's `thinking_budget_tokens` are the same budget, and `reasoning_budget_tokens` wins when more than one is
 sent. A request that names none of them takes the server's [`reasoning-budget-tokens`](#server).
 
+With `answer-room` on and an effective output cap of at least 1024 tokens, thinking is limited to the cap minus
+`min(max(512, cap // 4), cap // 2)`. An 8192-token cap allows up to 6144 thinking tokens; the remaining 2048
+include the injected wrap-up and answer. Smaller positive budgets stay unchanged. Context fitting uses the reduced
+cap. Explicit request budgets of `0` disable both the server default and automatic budgeting; smaller output caps
+keep their existing behavior. Reserved space reduces empty answers but does not guarantee a complete answer.
+
 ### The model file's sampling defaults
 
 The model file's `meta` section carries a `sampling` object. Its keys are the request fields above, with the same
@@ -266,6 +276,6 @@ meaning:
 | `seed` | positive integer |
 
 A bad value stops the server at startup; an unknown key is named in a warning and ignored. The defaults in effect
-are printed at startup as `[server] sampling defaults: ...`, each marked `(command line)` or `(config)` when a launch
+are printed at startup as `[server] sampling ...`, each marked `(cli)` or `(config)` when a launch
 option set it and unmarked when it comes from the model file. A launch option overrides the model file's value for
 that key; the others stay.

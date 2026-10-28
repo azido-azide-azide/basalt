@@ -90,28 +90,33 @@ inline constexpr uint64_t kPromptFileReadBytes = 3584ull << 20;
 /// The least RAM kept for the OS file cache while any expert is read from the file.
 inline constexpr uint64_t kMinFileCacheBytes = 4ull << 30;
 
-/// The RAM the OS file cache needs beside ram_margin() while `file_bytes` of experts are read from the file through
-/// it (0: every expert is held by a GPU tier or the RAM copy, nothing is read from the file).  A prompt chunk reads
-/// up to kPromptFileReadBytes for its borrowed slots, plus the file-held experts of the layer it computes and of the
-/// next one it reads ahead: at most two whole layers (`largest_layer_bytes`, every expert of the largest layer).
+/// The RAM the OS file cache needs beside ram_margin() while `file_bytes` of the `complement_bytes` experts no GPU
+/// tier holds are read from the file through it (0: nothing is read from the file).  A prompt chunk reads
+/// `prompt_file_bytes` for the lent slots whose experts the RAM copy does not keep (at most kPromptFileReadBytes),
+/// plus the file-held experts of the layer it computes and of the next one it reads ahead: two layers' file-held
+/// share (`largest_layer_bytes`, every expert of the largest layer, scaled by file_bytes / complement_bytes).
 /// Pages evicted before that pass is over are read again, and the reclaim then runs at drive speed.
-inline uint64_t file_cache_floor(uint64_t file_bytes, uint64_t largest_layer_bytes) {
+inline uint64_t file_cache_floor(uint64_t file_bytes, uint64_t complement_bytes, uint64_t largest_layer_bytes,
+                                 uint64_t prompt_file_bytes) {
     if (file_bytes == 0) return 0;
-    const uint64_t pass = kPromptFileReadBytes + 2 * largest_layer_bytes;
+    const double share = complement_bytes > file_bytes ? (double) file_bytes / (double) complement_bytes : 1.0;
+    const uint64_t layer_file = (uint64_t) ((double) largest_layer_bytes * share) + 1;
+    const uint64_t pass = prompt_file_bytes + 2 * layer_file;
     return pass > kMinFileCacheBytes ? pass : kMinFileCacheBytes;
 }
 
 /// The RAM left free once the experts are placed: `margin` (ram_margin()) plus the file cache's floor.
-inline uint64_t ram_floor(uint64_t margin, uint64_t file_bytes, uint64_t largest_layer_bytes) {
-    return margin + file_cache_floor(file_bytes, largest_layer_bytes);
+inline uint64_t ram_floor(uint64_t margin, uint64_t file_bytes, uint64_t complement_bytes, uint64_t largest_layer_bytes,
+                          uint64_t prompt_file_bytes) {
+    return margin + file_cache_floor(file_bytes, complement_bytes, largest_layer_bytes, prompt_file_bytes);
 }
 
 /// Where a running request stops while serving: the margin plus one prompt chunk's file reads when experts are read
 /// from the file (the margin alone when none are).  Below ram_floor() by the two layers' read-ahead, so the engine's
 /// own growth after the load (conversation cache, an image's buffers) does not end requests on a machine still
 /// sized as asked.
-inline uint64_t ram_guard_floor(uint64_t margin, uint64_t file_bytes) {
-    return margin + (file_bytes > 0 ? kPromptFileReadBytes : 0);
+inline uint64_t ram_guard_floor(uint64_t margin, uint64_t file_bytes, uint64_t prompt_file_bytes) {
+    return margin + (file_bytes > 0 ? prompt_file_bytes : 0);
 }
 
 /// The largest RAM copy that leaves `floor` free, with `avail` bytes available and `late` bytes still to be taken by
@@ -138,13 +143,24 @@ void stop_memory_watchdog();
 /// Whether an available-RAM reading of `avail` is below `floor` (a reading of 0, unknown, is not).
 inline bool ram_below_floor(uint64_t avail, uint64_t floor) { return avail > 0 && avail < floor; }
 
+/// Whether the guard gives the mapped view back now.  `avail` is the reading, `after` the reading right after the last
+/// give-back (0 = none yet) and `since_ms` the time since it.  Within `lead` of `floor`, the first give-back is due at
+/// once; later ones need the cooldown over and the reading down by `refill` since `after`, i.e. the view has been
+/// read in again.  A reading that stays low with nothing refilling therefore causes no repeated give-backs.
+inline bool reclaim_due(uint64_t avail, uint64_t floor, uint64_t lead, uint64_t after, uint64_t since_ms,
+                        uint64_t refill = 256ull << 20, uint64_t cooldown_ms = 250) {
+    if (!ram_below_floor(avail, floor + lead)) return false;
+    if (after == 0) return true;
+    return since_ms >= cooldown_ms && avail + refill <= after;
+}
+
 /// While serving: polls available_memory() and keeps whether it is below `floor_bytes`, for ram_guard_low.  The request
 /// that is running then stops with an error instead of the machine swapping; nothing is shrunk or exited.
 void start_ram_guard(uint64_t floor_bytes);
 /// True while the last reading was below the guard's floor; `avail` and `floor` get that reading and the floor.
 bool ram_guard_low(uint64_t* avail = nullptr, uint64_t* floor = nullptr);
 /// A mapped file view the guard gives back (drop_mapped_view) when a reading comes within 1 GiB of its floor, then
-/// reads again, at most once every few seconds and only after the reading has risen above that lead since.
+/// reads again; see reclaim_due for when it gives back again.
 /// Windows keeps a view's pages in the process once read and does not count them as available, where Linux counts
 /// them in MemAvailable; without this the guard would stop a request over pages the OS can reclaim.
 /// A null `base` withdraws the view; once that returns, the guard no longer touches it, so it can be unmapped.
