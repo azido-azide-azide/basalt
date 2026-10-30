@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/basalt/core/mtp.hpp.
 #include "basalt/core/mtp.hpp"
+#include "basalt/core/conversation_snapshot.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/draft_cum.hpp"
@@ -133,6 +134,8 @@ bool read_file(const FileRange& r, std::vector<uint8_t>& out) {
 
 // spare rows the draft head carries after the base rows, for the head rows of tokens the subset lacks
 constexpr int64_t kDraftCtxRows = 512;
+// of them, the rows a prompt's tokens may take: the rest stay free for the reply's own
+constexpr int64_t kDraftCtxPromptRows = 384;
 
 }  // namespace
 
@@ -319,7 +322,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
     int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
-    // K8V4 never applies to the drafter: its own attention paths (below, and verify.cpp) handle whole formats
+    // K8V4 never applies to the drafter: its own attention paths (below, and src/core/verify/) handle whole formats
     // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
     const bool kv_hybrid_was = qsa_kv_hybrid();
     const bool kv_int8_was = qsa_kv_int8();
@@ -364,10 +367,17 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             const int64_t ps0 = shapes_of(g).page_size;
             for (size_t id = 0; id < store_cells_.size() && (int) id < n_stores_; ++id)
                 store_pages_[id] = std::min<int64_t>(st_.n_pages, (store_cells_[id] + ps0 - 1) / ps0);
+            // the drafter reads only its last `window` cells: a store keeps the last pages of its sequence, the window
+            // and the cells a turn may roll back, as a ring (page p at p % ring)
+            const int64_t ring_pages = (window > 0 && window < max_cells)
+                                           ? (window + kStoreRollback + 4 * (int64_t) max_t + 64 + ps0 - 1) / ps0 + 1
+                                           : st_.n_pages;
+            store_ring_.assign((size_t) n_stores_ + 1, 0);
+            for (size_t id = 0; id < stores_.size(); ++id) store_ring_[id] = std::min(store_pages_[id], ring_pages);
             for (size_t id = 0; id < stores_.size(); ++id)
                 for (int i = 0; i < na; ++i) {
                     auto& st = stores_[id];
-                    const uint64_t bytes = (uint64_t) store_pages_[id] * lay[i].page_bytes;
+                    const uint64_t bytes = (uint64_t) store_ring_[id] * lay[i].page_bytes;
                     if (cudaMalloc(&st[(size_t) i], bytes) != cudaSuccess) { err = "mtp: the slots' K/V do not fit"; return false; }
                     cudaMemset(st[(size_t) i], 0, bytes);
                     vram_ += bytes;
@@ -503,9 +513,9 @@ std::vector<std::pair<std::string, const void*>> MtpDrafter::hc8_keys() const {
 }
 
 namespace {
-// a Q5_K draft head keeps context rows after its base rows; a Q6_K head (no context rows) reads the main head's rows
-// through its map instead of a copy
-bool draft_ctx_rows(int head_type) { return head_type == 13; }
+// a Q5_K or Q8_0 draft head keeps context rows after its base rows; a Q6_K head (no context rows) reads the main
+// head's rows through its map instead of a copy
+bool draft_ctx_rows(int head_type) { return head_type == 13 || head_type == GGML_Q8_0; }
 bool draft_rows_mapped(int head_type) { return head_type == 14 && !draft_ctx_rows(head_type); }
 }  // namespace
 
@@ -993,8 +1003,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             native_q8_0_mmvq_stream(sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, cs);
         else
             native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
-        if (sub && n_xcap_ > 0)   // rows without a token never win
-            for (int t = 0; t < T; ++t) q5k_head_mask_unmapped(head_logits_ + (size_t) t * nv, dvocab_, (int) nv, cs);
+        if (sub && n_xcap_ > 0)   // a context row without a token never wins (the other rows always have one)
+            for (int t = 0; t < T; ++t)
+                q5k_head_mask_unmapped(head_logits_ + (size_t) t * (size_t) nv + (size_t) xbase_, dvocab_ + xbase_,
+                                       (int) n_xcap_, cs);
         if (diag_ != nullptr && T == 1)   // the step's logits to the host, for the draft-tree study
             cudaMemcpyAsync(diag_ + (size_t) chain_j_ * (size_t) diag_stride_, head_logits_, (size_t) nv * sizeof(float),
                             cudaMemcpyDeviceToHost, cs);
@@ -1027,7 +1039,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
         return false;
     }
     cudaGraphDestroy(graph);
-    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp)
+    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (src/core/verify/)
     cudaGraphUpload(exec, cs);
     cudaStreamSynchronize(cs);
     return true;
@@ -1404,7 +1416,20 @@ void MtpDrafter::begin_request(const int64_t* prompt, int64_t n) {
     xlist_.clear();
     xpend_.clear();
     n_xused_ = 0;
-    for (int64_t i = 0; i < n; ++i) ctx_note(prompt[i]);
+    // a prompt with more such tokens than its share of the rows keeps its latest ones, which the reply is likelier
+    // to repeat: counted from the end (marked 2), then noted in prompt order from the first of them
+    const int64_t cap = std::min(n_xcap_, kDraftCtxPromptRows);
+    int64_t from = 0, distinct = 0;
+    for (int64_t i = n - 1; i >= 0; --i) {
+        const int64_t t = prompt[i];
+        if (t < 0 || t >= n_vocab_ || in_sub_[(size_t) t] != 0) continue;
+        if (distinct == cap) { from = i + 1; break; }
+        in_sub_[(size_t) t] = 2;
+        ++distinct;
+    }
+    for (int64_t i = from; i < n; ++i)
+        if (prompt[i] >= 0 && prompt[i] < n_vocab_ && in_sub_[(size_t) prompt[i]] == 2) in_sub_[(size_t) prompt[i]] = 0;
+    for (int64_t i = from; i < n; ++i) ctx_note(prompt[i]);
 }
 
 // The queued tokens' head rows into the next free context rows, ahead of the draft graphs on the same stream.
@@ -1611,7 +1636,31 @@ void MtpDrafter::note_cells(int64_t lo, int64_t hi) {
     if (hi <= lo) return;
     if (dirty_hi_ <= dirty_lo_) { dirty_lo_ = lo; dirty_hi_ = hi; }
     else { dirty_lo_ = std::min(dirty_lo_, lo); dirty_hi_ = std::max(dirty_hi_, hi); }
-    if (!store_hi_.empty()) store_hi_[(size_t) cur_] = std::max(store_hi_[(size_t) cur_], hi);
+    if (store_hi_.empty()) return;
+    // the sequence ends where its latest write ends; a write that starts well below the end (another prompt, a
+    // rolled-back turn) starts it again there, past the cells a window writes ahead of its position
+    int64_t& end = store_hi_[(size_t) cur_];
+    end = lo + 4 * (int64_t) max_t_ + 64 < end ? hi : std::max(end, hi);
+}
+
+void MtpDrafter::copy_pages(int to, bool to_work, int from, bool from_work, int64_t a, int64_t b, const KvArr* lay,
+                            int na) {
+    auto at = [&](int id, bool work, int i, int64_t p) {
+        const int64_t ring = work ? 0 : store_ring_[(size_t) id];
+        return (uint8_t*) (work ? lay[i].p : stores_[(size_t) id][(size_t) i]) +
+               (uint64_t) (ring > 0 ? p % ring : p) * lay[i].page_bytes;
+    };
+    auto run = [&](int id, bool work, int64_t p) {   // pages from p before that side's ring wraps
+        const int64_t ring = work ? 0 : store_ring_[(size_t) id];
+        return ring > 0 ? ring - p % ring : b - p;
+    };
+    for (int64_t p = a; p < b;) {
+        const int64_t n = std::min({b - p, run(to, to_work, p), run(from, from_work, p)});
+        for (int i = 0; i < na; ++i)
+            cudaMemcpyAsync(at(to, to_work, i, p), at(from, from_work, i, p), (size_t) ((uint64_t) n * lay[i].page_bytes),
+                            cudaMemcpyDeviceToDevice, cs_);
+        p += n;
+    }
 }
 
 bool MtpDrafter::use_store(int id, std::string& err) {
@@ -1621,17 +1670,14 @@ bool MtpDrafter::use_store(int id, std::string& err) {
     KvArr lay[4];
     const int na = kv_layout(lay);
     const int64_t ps = shapes_of(*g_).page_size;
-    if (dirty_hi_ > dirty_lo_) {   // the written pages go back to the sequence that held them
-        const int64_t pg0 = dirty_lo_ / ps, pg1 = std::min<int64_t>(store_pages_[(size_t) cur_], (dirty_hi_ + ps - 1) / ps);
-        for (int i = 0; i < na && pg1 > pg0; ++i)
-            cudaMemcpyAsync((uint8_t*) stores_[(size_t) cur_][(size_t) i] + pg0 * lay[i].page_bytes,
-                            (const uint8_t*) lay[i].p + pg0 * lay[i].page_bytes, (size_t) ((pg1 - pg0) * lay[i].page_bytes),
-                            cudaMemcpyDeviceToDevice, cs_);
+    if (dirty_hi_ > dirty_lo_) {   // the written pages go back to the sequence that held them, as far as its ring reaches
+        const size_t c = (size_t) cur_;
+        const int64_t pg1 = std::min<int64_t>(store_pages_[c], (std::min(dirty_hi_, store_hi_[c]) + ps - 1) / ps);
+        copy_pages(cur_, false, cur_, true, std::max<int64_t>(dirty_lo_ / ps, pg1 - store_ring_[c]), pg1, lay, na);
     }
+    // the new sequence's last pages: all its window reads
     const int64_t n1 = std::min<int64_t>(store_pages_[(size_t) id], (store_hi_[(size_t) id] + ps - 1) / ps);
-    for (int i = 0; i < na && n1 > 0; ++i)
-        cudaMemcpyAsync(lay[i].p, stores_[(size_t) id][(size_t) i], (size_t) ((uint64_t) n1 * lay[i].page_bytes),
-                        cudaMemcpyDeviceToDevice, cs_);
+    copy_pages(id, true, id, false, std::max<int64_t>(0, n1 - store_ring_[(size_t) id]), n1, lay, na);
     cur_ = id;
     dirty_lo_ = dirty_hi_ = 0;
     if (cudaGetLastError() != cudaSuccess) { err = "mtp: swapping the K/V failed"; return false; }
@@ -1648,19 +1694,54 @@ bool MtpDrafter::copy_store(int from, int to, int64_t cells, std::string& err) {
     const int na = kv_layout(lay);
     const int64_t ps = shapes_of(*g_).page_size;
     const int64_t n1 = std::min<int64_t>({store_pages_[(size_t) from], store_pages_[(size_t) to], (cells + ps - 1) / ps});
-    for (int i = 0; i < na && n1 > 0; ++i)
-        cudaMemcpyAsync(store_ptr(to, i, lay), store_ptr(from, i, lay), (size_t) ((uint64_t) n1 * lay[i].page_bytes),
-                        cudaMemcpyDeviceToDevice, cs_);
+    // the last pages both sides keep (a store its ring, the working state all)
+    const int64_t keep = std::min(from == cur_ ? n1 : store_ring_[(size_t) from], to == cur_ ? n1 : store_ring_[(size_t) to]);
+    copy_pages(to, to == cur_, from, from == cur_, std::max<int64_t>(0, n1 - keep), n1, lay, na);
     if (to == cur_) note_cells(0, cells);
     store_hi_[(size_t) to] = std::min<int64_t>({cells, st_.max_cells, store_pages_[(size_t) to] * ps});
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: copying the K/V failed"; return false; }
     return true;
 }
 
+bool MtpDrafter::save_store(int id, int64_t cells, ConversationKv& out, std::string& err) {
+    if (n_stores_ == 0) return conversation_kv_save(out, st_, *g_, cells, false, err);
+    if (id < 0 || id > n_stores_) { err = "mtp: no such K/V store"; return false; }
+    const int prev = cur_;
+    if (!pend_tok_[(size_t) id].empty()) {
+        // its deferred rows are computed in the working state; the sequence there comes back whole within its ring
+        note_cells(0, store_hi_[(size_t) prev]);
+        if (!flush(id, err)) return false;
+    }
+    if (!conversation_kv_save(out, st_, *g_, cells, false, err)) return false;
+    if (cur_ != id) {   // the pages the store keeps, over the working state's
+        const OnDevice on_device(device_);
+        KvArr lay[4];
+        const int na = kv_layout(lay);
+        ConversationBuffer* dst[4] = {&out.k, &out.v, &out.k_scale, &out.v_scale};
+        const int64_t ps = shapes_of(*g_).page_size, ring = store_ring_[(size_t) id];
+        const int64_t n1 = std::min<int64_t>(store_pages_[(size_t) id], (cells + ps - 1) / ps);
+        for (int64_t p = std::max<int64_t>(0, n1 - ring); p < n1;) {
+            const int64_t n = std::min(n1 - p, ring - p % ring);
+            for (int i = 0; i < na; ++i) {
+                const uint8_t* src = (const uint8_t*) stores_[(size_t) id][(size_t) i] +
+                                     (uint64_t) (p % ring) * lay[i].page_bytes;
+                const size_t off = (size_t) ((uint64_t) p * lay[i].page_bytes);
+                if (!dst[i]->visit(off, (size_t) ((uint64_t) n * lay[i].page_bytes), [&](uint8_t* q, size_t m, size_t at) {
+                        return cudaMemcpy(q, src + (at - off), m, cudaMemcpyDeviceToHost) == cudaSuccess;
+                    })) {
+                    err = "mtp: saving the K/V failed";
+                    return false;
+                }
+            }
+            p += n;
+        }
+    }
+    return cur_ == prev || use_store(prev, err);
+}
+
 QsaState& MtpDrafter::kv_state_rw() {
     std::string e;
     if (!use_main(e)) basalt::log::error("basalt mtp", "%s", e.c_str());
-    note_cells(0, prompt_len_ > 0 ? prompt_len_ : st_.max_cells);
     return st_;
 }
 

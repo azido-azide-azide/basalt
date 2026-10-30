@@ -60,7 +60,9 @@ logits, so log-probabilities stay finite. The block partition does not depend on
 are the same bits at every T.
 
 What it changes: the argmax and the sampler's top-64 list come from exact rows unless the copy's error exceeds the margin;
-the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit).
+the softmax tail outside the rescored rows carries the copy's error (rms about 0.7 logit). A request whose sampled list
+is longer than 64 (top_k 0 or above 64) reads every row, so its windows run the plain Q6_K head again over the same
+columns (`Verifier::exact_head_rows`): every logit exact.
 
 Offline, on 3,614 real verify-head inputs dumped from the engine (conv, struct, prose fixtures), all 248,320 rows, exact =
 Q6_K x q8_1 in float:
@@ -167,7 +169,9 @@ against the base.
 ### Scope
 
 - Identity is bitwise with the expert tiers pinned. With adaptation on, experts move between the CPU pool and the GPU,
-  which round differently: a rounding difference, not a quality difference.
+  which round differently: a rounding difference, not a quality difference. The same holds for the slots the elastic KV
+  takes from the expert cache and gives back. An idle conversation moved to RAM and back keeps its bytes exactly: with
+  the tiers pinned, its next turns write the same tokens and accept the same drafts as when it stays in VRAM.
 - The GPU tiers (VRAM and peer card) share one arithmetic; the CPU tier quantizes with ggml's vec_dot_type (Q8_K per 256
   for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:48-49, 76-86). In the quality gate about 0.8% of
   routed experts were computed on the CPU (IQ3_XXS, default placement). The split is fixed per placement, so it is the
