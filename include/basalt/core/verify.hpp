@@ -127,6 +127,13 @@ public:
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
     void set_cpu_warm(basalt::kernels::cpu::ExpertPool* pool, ExpertSource* src) { warm_pool_ = pool; warm_src_ = src; }
+    /// Opt-in routing changes, each of which changes the output; before init, and only with the device-planned MoE
+    /// tail (otherwise init switches them off).  Route tail skip: see `kernels::route_tail_skip` (0 = off).
+    void set_route_tail_skip(int rank) { route_tail_skip_ = rank; }
+    /// Residency-biased routing: see `kernels::route_prior_top10` (0 = off).
+    void set_route_prior(float lambda) { route_prior_ = lambda; }
+    /// What the routing changes did since the start, one line each; empty when none applied.
+    std::vector<std::string> route_report() const;
 
     /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -197,6 +204,10 @@ public:
     void set_draft_probe(bool on) { draft_probe_ = on; if (next_) next_->set_draft_probe(on); }
     /// Valid after a sampled run() with the probe on.
     float draft_prob(int t) const { return next_ ? next_->draft_prob(t) : ((volatile float*) h_qp_)[t]; }
+    /// After a sampled run(): row t's kept list at [t * kTopIds, (t + 1) * kTopIds), best first, -1 after it.
+    /// nullptr after a window that did not sample.
+    static constexpr int kTopIds = 8;
+    const int32_t* top_ids() const { return next_ ? next_->top_ids() : (top_valid_ ? h_top_ : nullptr); }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -404,6 +415,7 @@ private:
     bool run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after = nullptr);
     bool run_serve(PoolMultiFn pool, void* user, std::string& err);
     bool run_end(int32_t* out, std::string& err);
+    bool window_intact(std::string& err);   // after a window's sync: false when a bounded device wait of it timed out
     /// One step of the host's service of the window's rings: 1 = every ring served, 0 = the GPU has not reached the next
     /// one, -1 = an error.
     int serve_poll(PoolMultiFn pool, void* user, std::string& err);
@@ -567,6 +579,8 @@ private:
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
     int32_t* h_q_ = nullptr;     int32_t* m_q_ = nullptr;       // the probe's tokens: the window's drafts
     float* h_qp_ = nullptr;      float* m_qp_ = nullptr;        // the probe's probabilities
+    int32_t* h_top_ = nullptr;   int32_t* m_top_ = nullptr;     // T * kTopIds: the sampled rows' kept lists
+    bool top_valid_ = false;                                    // the last window wrote them
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
@@ -609,6 +623,8 @@ private:
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
+    int route_tail_skip_ = 0;
+    float route_prior_ = 0.0f;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot();

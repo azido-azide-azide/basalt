@@ -643,7 +643,7 @@ class EffortAtTheEnd(unittest.TestCase):
         return self.svc.encode_prompt(messages, None, kw)
 
     def checkpoint(self, ids, tail, resume=0):
-        """Where the engine checkpoints a prompt (the tokens before it), as generate.cpp's serve loop does."""
+        """Where the engine checkpoints a prompt (the tokens before it), as the serve loop (src/program/serve) does."""
         turn_at = next((i for i in range(len(ids) - 1, resume, -1) if ids[i] == self.TURN), -1)
         if turn_at > 0 and tail:
             i = next((i for i in range(turn_at - 1, resume, -1) if ids[i] == self.TURN), None)
@@ -1614,6 +1614,18 @@ class StartFailureLog(unittest.TestCase):
         self.assertEqual(engine_error("basalt error: x y"), "x y")
         self.assertIsNone(engine_error("basalt error: "))
         self.assertIsNone(engine_error("basalt warning: x"))
+
+    def test_route_warnings_reach_the_start_output(self):
+        from serve.engine.progress import engine_warning
+        self.assertEqual(
+            engine_warning("basalt: warning: --route-tail-skip 9 drops low-ranked missed experts"),
+            "--route-tail-skip 9 drops low-ranked missed experts")
+
+    def test_route_prior_warning_reaches_the_start_output(self):
+        from serve.engine.progress import engine_warning
+        self.assertEqual(
+            engine_warning("basalt: warning: --route-prior 0.5 changes expert routing"),
+            "--route-prior 0.5 changes expert routing")
 
     def test_marked_lines_of_any_area(self):
         from serve.engine.progress import engine_error, engine_ram_floor, engine_warning, start_errors
