@@ -105,11 +105,13 @@ if(MSVC)
   set(_isa_avx512_flags "/arch:AVX512;-D__F16C__=1;-D__AVX512VNNI__=1;-D__AVX512VBMI__=1")
   set(_isa_avx2_flags "/arch:AVX2;-D__F16C__=1")
   set(_isa_avxvnni_flags "/arch:AVX2;-D__F16C__=1")
+  set(_isa_avxvnniint8_flags "/arch:AVX2;-D__F16C__=1")
   set(_isa_avx1_flags "/arch:AVX")
 else()
   set(_isa_avx512_flags "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set(_isa_avx2_flags "-mavx2;-mfma;-mf16c")
-  set(_isa_avxvnni_flags "-mavx2;-mfma;-mf16c;-mavxvnni")
+  set(_isa_avxvnni_flags "-mavx2;-mfma;-mf16c;-mavxvnni;-mbmi2")
+  set(_isa_avxvnniint8_flags "-mavx2;-mfma;-mf16c;-mavxvnniint8")
   set(_isa_avx1_flags "-mavx")
 endif()
 
@@ -558,8 +560,12 @@ add_library(tokenizer STATIC src/program/tokenizer/bpe.cpp src/program/tokenizer
             src/program/tokenizer/unicode_flags.cpp)
 target_include_directories(tokenizer PUBLIC include PRIVATE src/program/tokenizer)
 target_link_libraries(tokenizer PRIVATE warnings)
-add_executable(tokenizer_test tests/program/tokenizer_test.cpp)
-target_link_libraries(tokenizer_test PRIVATE tokenizer warnings)
+# built from the tokenizer sources with the standard library range checks on, so an out-of-range index aborts the test
+add_executable(tokenizer_test tests/program/tokenizer_test.cpp src/program/tokenizer/bpe.cpp
+               src/program/tokenizer/pretok_qwen35.cpp src/program/tokenizer/unicode_flags.cpp)
+target_include_directories(tokenizer_test PRIVATE include src/program/tokenizer)
+target_compile_definitions(tokenizer_test PRIVATE _GLIBCXX_ASSERTIONS)
+target_link_libraries(tokenizer_test PRIVATE warnings)
 basalt_embed_manifest(tokenizer_test)
 add_executable(tokenizer_bench tests/program/tokenizer_bench.cpp)
 target_link_libraries(tokenizer_bench PRIVATE tokenizer warnings)
@@ -972,6 +978,10 @@ add_executable(ple_win_parity tests/kernels/ple_win_parity.cpp)
 target_include_directories(ple_win_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(ple_win_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME ple_win_parity COMMAND ple_win_parity 20)
+add_executable(ple_key_rows_parity tests/kernels/ple_key_rows_parity.cpp)
+target_include_directories(ple_key_rows_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(ple_key_rows_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME ple_key_rows_parity COMMAND ple_key_rows_parity 20)
 add_executable(q5k_head_parity tests/kernels/q5k_head_parity.cpp)
 target_include_directories(q5k_head_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(q5k_head_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -991,7 +1001,7 @@ basalt_gpu_test(NAME q6k_head_parity COMMAND q6k_head_parity 20000 5)
 add_executable(q6k_vhead_parity tests/kernels/q6k_vhead_parity.cpp)
 target_include_directories(q6k_vhead_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(q6k_vhead_parity PRIVATE kernels ${_gpu_runtime_target})
-basalt_gpu_test(NAME q6k_vhead_parity COMMAND q6k_vhead_parity 20000 5)
+basalt_gpu_test(NAME q6k_vhead_parity COMMAND q6k_vhead_parity 65536 5)
 
 # KV streaming: streamed vs resident attention, bitwise (GPU, synthetic, no model).
 add_executable(kv_stream_parity tests/kernels/kv_stream_parity.cpp)
@@ -1122,6 +1132,13 @@ target_link_libraries(loan_moves_test PRIVATE warnings)
 basalt_embed_manifest(loan_moves_test)
 basalt_cpu_test(NAME loan_moves_test COMMAND loan_moves_test)
 set_tests_properties(loan_moves_test PROPERTIES TIMEOUT 60)
+# the rows a verify window keeps when it ends the reply or not (CPU only)
+add_executable(reply_rows_test tests/program/reply_rows_test.cpp)
+target_include_directories(reply_rows_test PRIVATE src/program/serve)
+target_link_libraries(reply_rows_test PRIVATE warnings)
+basalt_embed_manifest(reply_rows_test)
+basalt_cpu_test(NAME reply_rows_test COMMAND reply_rows_test)
+set_tests_properties(reply_rows_test PROPERTIES TIMEOUT 60)
 add_executable(auto_plan_test tests/program/auto_plan_test.cpp)
 target_link_libraries(auto_plan_test PRIVATE engine_session warnings)
 basalt_embed_manifest(auto_plan_test)
@@ -1214,7 +1231,8 @@ if(BUILD_TESTING)
 endif()
 
 add_library(kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/cpu_quota.cpp src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp
+            src/kernels/cpu/q2_avx2_vnni.cpp)
 target_include_directories(kernels_cpu PUBLIC include)
 # only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1222,6 +1240,8 @@ target_include_directories(kernels_cpu PUBLIC include)
 set_source_files_properties(src/kernels/cpu/expert.cpp
                             PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+# the same Q2_0 rows with the AVX-VNNI instructions, called only behind cpu_avxvnni_ok()
+set_source_files_properties(src/kernels/cpu/q2_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
 find_package(Threads REQUIRED)
 target_link_libraries(kernels_cpu PUBLIC Threads::Threads platform)
 
@@ -1248,7 +1268,7 @@ endforeach()
 # one-pass static linking has no cycle to resolve)
 target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                          src/kernels/cpu/nvfp4_avx512.cpp
-                                         src/kernels/cpu/nvfp4_avx2.cpp
+                                         src/kernels/cpu/nvfp4_avx2.cpp src/kernels/cpu/nvfp4_avx2_vnni.cpp
                                          src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/iq_avx2_vnni.cpp
                                          src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
@@ -1263,9 +1283,11 @@ endif()
 set_source_files_properties(src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "${_isa_avx512_flags}")
 set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
-# the same rows with the AVX-VNNI instructions, called only behind cpu_avxvnni_ok()
+# the same rows with the AVX-VNNI instructions and BMI2 (pdep for the grid indices), called only behind cpu_avxvnni_ok()
 set_source_files_properties(src/kernels/cpu/iq_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnni_flags}")
 set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+# the same rows with AVX-VNNI-INT8 (`vpdpbssd`), called only behind cpu_avxvnni_int8_ok()
+set_source_files_properties(src/kernels/cpu/nvfp4_avx2_vnni.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avxvnniint8_flags}")
 set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 # the router lookahead's AVX1 dot (called behind cpu_avx1_ok)
 set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx1_flags}")
@@ -1445,7 +1467,7 @@ if(BUILD_TESTING)
   add_executable(nvfp4_cpu_rows_test tests/kernels/cpu/nvfp4_cpu_rows_test.cpp)
   target_link_libraries(nvfp4_cpu_rows_test PRIVATE kernels_cpu)
   basalt_cpu_test(NAME nvfp4_cpu_rows_test COMMAND nvfp4_cpu_rows_test)
-  set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx512")
+  set_tests_properties(nvfp4_cpu_rows_test PROPERTIES SKIP_RETURN_CODE 77 LABELS "cpu;avx2")
 
   add_executable(expert_parity tests/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE kernels_cpu platform)
