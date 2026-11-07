@@ -337,8 +337,8 @@ public:
     std::string info_words() const override {
         std::string e;
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
-        return t == nullptr ? std::string("kv=fp16")
-                            : "expert_slots=" + std::to_string(t->slots()) + " kv=fp16 " + program::spill_words(t->spill());
+        const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
+        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }
@@ -425,12 +425,12 @@ public:
                 size_t free_b = 0, total_b = 0;
                 return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
             };
-            bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err) && above_floor();
+            bool opened = vis_->init(mp, std::max(pl.n_patches(), 4096), m_.vision_blas(), err) && above_floor();
             if (!opened && t) {
                 vis_ = std::make_unique<VisionEncoder>();
                 t->lend_all();
                 err.clear();
-                opened = vis_->init(mp, std::max(pl.n_patches(), 4096), err);
+                opened = vis_->init(mp, std::max(pl.n_patches(), 4096), m_.vision_blas(), err);
                 if (opened && !above_floor()) {
                     opened = false;
                     err = "not enough free device memory for the image encoder above the VRAM reserve";
@@ -539,7 +539,7 @@ private:
         // the tier opens at its normal size before anything else takes the card; the workspaces size to what is left
         ExpertTier* t = ops_->expert_tier(e);
         if (!t || prefill_) return;
-        short_prompt_ = t->has_homes() && n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
+        short_prompt_ = n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
         if (!short_prompt_) t->shrink();
     }
     void settle_tier() {
