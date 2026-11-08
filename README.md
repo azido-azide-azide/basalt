@@ -1,5 +1,25 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
+## This fork
+
+Upstream, plus the two patches one deployment runs on top of it:
+
+- **A shared arena on hugetlbfs** (`src/platform/memory.cpp`): `--shared-expert-arena` takes a file on a
+  huge-page mount, not only `/dev/shm`. The file is truncated to a multiple of the huge page and its header
+  is reached through the mapping, since hugetlbfs accepts neither an unrounded `ftruncate` nor `read`/`write`;
+  a size mismatch is then told by the header, naming the size it wanted.
+- **`--load-threads N`** (`src/models/qwen4exp/flags.cpp`, `src/models/qwen4exp/load/sources.cpp`,
+  `docs/configuration/index.md`): the thread count of the
+  start-up arena read. Upstream hardcodes 6 at the call site; this fork runs 16. A flag and a config entry, so it
+  follows `CONTRIBUTING.md` (no environment-variable knobs).
+- **Tests**: `pinned_shared_test` run with its arena file on hugetlbfs. The BF16 PLE rows this fork pioneered
+  shipped upstream in 0.3.1 ([#185](https://github.com/jesdga95/basalt/pull/185)) and are no longer a fork patch.
+
+Nothing else is changed.
+
+Synced to upstream main at `eaaedc7` (2026-11-08, 0.3.2): the `load-threads` patch is re-landed where upstream
+grew the RAM and file-cache floors around its flag homes; the fork's BF16 PLE patch is dropped as merged upstream.
+
 Basalt is a local inference engine for mixture-of-experts models: **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**. It runs on
 an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with the experts that do not fit in VRAM in system RAM (and optionally
 on more GPUs). The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
