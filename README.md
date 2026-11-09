@@ -17,8 +17,8 @@ Upstream, plus the two patches one deployment runs on top of it:
 
 Nothing else is changed.
 
-Synced to upstream main at `eaaedc7` (2026-11-08, 0.3.2): the `load-threads` patch is re-landed where upstream
-grew the RAM and file-cache floors around its flag homes; the fork's BF16 PLE patch is dropped as merged upstream.
+Synced to upstream main at `f19f69e` (2026-11-09): pure rebase - no patch re-landing needed this wave; the
+fork's BF16 PLE patch stays dropped as merged upstream (0.3.1, #185).
 
 Basalt is a local inference engine for mixture-of-experts models: **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**. It runs on
 an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with the experts that do not fit in VRAM in system RAM (and optionally
