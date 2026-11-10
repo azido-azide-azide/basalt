@@ -580,7 +580,7 @@ def make_handler(target: Service | Router):
             limit = min(number("limit", LOG_FIRST_LINES), LOG_MAX_LINES) if after is None else \
                 min(number("limit", LOG_MAX_LINES), LOG_MAX_LINES)
             lines, last = svc.logs.since(after or 0, limit)
-            self._json(200, {"lines": lines, "last": last})
+            self._json(200, {"lines": lines, "last": last, "levels": svc.logs.levels()})
 
         def _sse(self):
             if self.sse_open:
