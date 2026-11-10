@@ -85,8 +85,8 @@ def seed(ring: LogBuffer, path: str, tail_lines: int) -> int:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "basalt-dash"
-    state: State = None       # set by build_server
-    args = None               
+    state: "State | None" = None   # bound per-server by build_server
+    args: "object" = None          # argparse.Namespace, bound by build_server
 
     def log_message(self, fmt, *args):      # keep the unit log to real events
         pass
@@ -141,6 +141,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self) -> bool:
+        # capy-dash parity: one optional dash key; run it as the wrapper's key too so the
+        # UI's single key input satisfies both the dash gate and the forwarded Authorization.
+        if not self.args.api_key:
+            return True
+        return self.headers.get("Authorization", "") == f"Bearer {self.args.api_key}"
+
     # ---------------------------------------------------------------- dashboard
     def do_GET(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
@@ -152,8 +159,11 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/health", "/api/health"):
             return self._json(200, {"status": "ok", "service": "basalt-dash",
                                     "engine_up": bool(self.state.engine_up),
-                                    "api_key": bool(self.state.api_key),
+                                    "api_key": bool(self.args.api_key) or bool(self.state.api_key),
                                     "model": self.state.model})
+        if path in ("/metrics", "/slots") or path == "/api/logs":
+            if not self._authorized():
+                return self._json(401, {"error": {"message": "missing or wrong API key"}})
         if path in ("/metrics", "/slots"):
             return self._relay(path + (("?" + query) if query else ""))
         if path == "/api/logs":
@@ -163,6 +173,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlsplit(self.path).path.rstrip("/")
         if path == "/v1/load":                          # the UI's own hot-load control
+            if not self._authorized():
+                return self._json(401, {"error": {"message": "missing or wrong API key"}})
             return self._relay(path, "POST")
         return self._json(405, {"error": {"message": "the observer relays /v1/load only"}})
 
@@ -225,6 +237,9 @@ def main():
     ap.add_argument("--log", default="/var/log/basalt-serve.log", help="wrapper log to tail")
     ap.add_argument("--web", default=WEB_DIR_DEFAULT, help="serve/web directory to display")
     ap.add_argument("--seed", type=int, default=500, help="log lines to preload into the ring")
+    ap.add_argument("--api-key", default="",
+                    help="guards /metrics, /slots, /api/logs and the /v1/load relay; set it to the "
+                         "wrapper's own key so the UI's single key input passes both gates")
     args = ap.parse_args()
 
     srv = build_server(args)

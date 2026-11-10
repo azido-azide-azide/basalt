@@ -17,6 +17,11 @@ flips, pauses, wrapper restarts and engine-down windows.
 | any other `POST` | `405` | `405` |
 | `GET /health` | this dash: `{service:"basalt-dash", engine_up, api_key, model}` | same |
 
+With `--api-key` set, `/metrics`, `/slots`, `/api/logs` and the `/v1/load` relay answer `401`
+until `Authorization: Bearer <key>` matches (capy-dash parity; the UI's key overlay handles this);
+statics and `/health` stay public so the `#auth` form can render. Set the flag to the wrapper's
+own key so the UI's single key input passes both gates. Default off.
+
 Read-only observer apart from relaying the UI's own `/v1/load`: it never spawns, signals, restarts
 or reads secrets from the engine or wrapper. The wrapper's `api_key` and `model` come from its
 public `/health`.
