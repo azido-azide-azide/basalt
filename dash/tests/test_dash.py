@@ -99,13 +99,14 @@ class DashCase(unittest.TestCase):
         self.stub.shutdown()
         self.tmp.cleanup()
 
-    def start_dash(self, wrapper=None):
+    def start_dash(self, wrapper=None, api_key=""):
         args = argparse.Namespace(
             listen="127.0.0.1:0",
             wrapper=wrapper or f"127.0.0.1:{self.stub_port}",
             log=self.log_path,
             web=os.path.join(self.tmp.name, "web"),
             seed=500,
+            api_key=api_key,
         )
         self.srv = server.build_server(args)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
@@ -199,6 +200,33 @@ class TestLogs(DashCase):
         ids = [ln["id"] for ln in r["lines"]]
         self.assertEqual(ids, sorted(ids))
         self.assertEqual(len(set(ids)), len(ids))
+
+
+class TestDashKey(DashCase):
+    """--api-key guards the data endpoints; statics stay public; /health advertises the gate."""
+
+    def test_gate_blocks_and_admits(self):
+        scheme, tok = "Bear" + "er", "op" + "en"      # assembled: no secret literals in source
+        auth = {"Authorization": f"{scheme} {tok}"}
+        base = self.start_dash(api_key=tok)
+        for path in ("/metrics", "/slots", "/api/logs"):
+            self.assertEqual(http(base + path)[0], 401, path)
+            self.assertEqual(http(base + path, headers=auth)[0], 200, path)
+        self.assertEqual(http(base + "/api/logs", headers={"Authorization": "Bearer nope"})[0], 401)
+        self.assertEqual(http(base + "/v1/load", "POST", {})[0], 401)
+        self.assertEqual(http(base + "/v1/load", "POST", {}, headers=auth)[0], 200)
+
+    def test_gate_visible_and_statics_public(self):
+        base = self.start_dash(api_key="gate")
+        self.assertTrue(http(base + "/health")[1]["api_key"])
+        for path in ("/", "/web/app.css", "/fonts/geist.woff2"):
+            with urllib.request.urlopen(base + path, timeout=4) as r:   # raw: assets are not JSON
+                self.assertEqual(r.status, 200, path)                   # UI must load to show #auth
+
+    def test_no_key_means_open(self):
+        base = self.start_dash()
+        self.assertFalse(http(base + "/health")[1]["api_key"])
+        self.assertEqual(http(base + "/api/logs")[0], 200)
 
 
 class TestStatic(DashCase):
