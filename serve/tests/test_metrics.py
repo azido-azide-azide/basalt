@@ -75,7 +75,7 @@ class Http(unittest.TestCase):
     def test_the_contract(self):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
-        self.assertEqual(set(m), {"engine", "live", "requests", "best", "means", "hardware", "hardware_static", "history", "models", "swap"})
+        self.assertEqual(set(m), {"engine", "live", "requests", "best", "p85", "hardware", "hardware_static", "history", "models", "swap"})
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
@@ -210,16 +210,16 @@ class Http(unittest.TestCase):
         self.assertEqual((code, body["last"]), (200, 1))
         self.assertEqual(self.call("/metrics")[0], 401)
 
-    def test_means_are_gated_like_best(self):
-        self.assertEqual(self.call("/metrics")[1]["means"], {})
+    def test_p85_is_gated_like_best(self):
+        self.assertEqual(self.call("/metrics")[1]["p85"], {})
         for out, prompt, ms, rate in ((300, 5000, 5000.0, 60.0), (400, 6000, 5000.0, 80.0),
                                       (500, 5500, 5000.0, 100.0), (10, 100, 100.0, 999.0)):   # the last under both gates
             self.svc.history.append({"id": f"r_{len(self.svc.history):04d}", "time": time.time(), "duration_s": 5.0,
                                      "finish": "stop", "prompt_tokens": prompt, "reused": 0, "prompt_ms": ms,
                                      "output_tokens": out, "decode_tok_s": rate})
-        means = self.call("/metrics")[1]["means"]
-        self.assertEqual(means["decode"], {"tok_s": 80.0, "n": 3, "min_tokens": 256})
-        self.assertEqual(means["prefill"], {"tok_s": 1100.0, "n": 3, "min_tokens": 4096})    # reads of 5000, 6000 and 5500 tok over 5 s each
+        p85 = self.call("/metrics")[1]["p85"]
+        self.assertEqual(p85["decode"], {"tok_s": 100.0, "n": 3, "min_tokens": 256})    # nearest rank of 60, 80, 100
+        self.assertEqual(p85["prefill"], {"tok_s": 1200.0, "n": 3, "min_tokens": 4096})  # of 1000, 1200 and 1100 tok over 5 s each
 
 
 class FakeGpu:
