@@ -47,6 +47,13 @@ class LogBuffer:
             last = self.last
         return (fresh[-limit:] if limit > 0 else []), last
 
+    def level_lines(self, level: str, after_id: int = 0, limit: int = 500) -> tuple[list[dict], int]:
+        """The newest `limit` lines at `level` above `after_id`, oldest first, and the newest id in the buffer."""
+        with self.lock:
+            fresh = [dict(x) for x in self.lines if x["id"] > after_id and x["lvl"] == level]
+            last = self.last
+        return (fresh[-limit:] if limit > 0 else []), last
+
     def levels(self) -> dict:
         """The lines per level since the server started, outliving every ring."""
         with self.lock:

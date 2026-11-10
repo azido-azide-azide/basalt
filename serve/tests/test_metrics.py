@@ -210,6 +210,18 @@ class Http(unittest.TestCase):
         self.assertEqual((code, body["last"]), (200, 1))
         self.assertEqual(self.call("/metrics")[0], 401)
 
+    def test_logs_level_filter(self):
+        self.svc.logs.add("eng", "basalt serve: warning: an old one")
+        for i in range(3):
+            self.svc.logs.add("srv", f"line {i}")
+        body = self.call("/api/logs?level=warn&after=0")[1]
+        self.assertEqual([x["msg"] for x in body["lines"]], ["basalt serve: warning: an old one"])
+        self.assertEqual(body["last"], 4)
+        self.assertEqual(self.call("/api/logs?level=err&after=0")[1]["lines"], [])
+        self.assertEqual([x["lvl"] for x in self.call("/api/logs?level=nonsense&after=0")[1]["lines"]],
+                         ["warn", "info", "info", "info"])           # not a level: the plain newest lines
+        self.assertEqual(self.call("/api/logs?level=warn&after=4")[1]["lines"], [])   # above the old one's id
+
     def test_p85_is_gated_like_best(self):
         self.assertEqual(self.call("/metrics")[1]["p85"], {})
         for out, prompt, ms, rate in ((300, 5000, 5000.0, 60.0), (400, 6000, 5000.0, 80.0),

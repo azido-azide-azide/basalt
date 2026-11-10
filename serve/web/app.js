@@ -414,6 +414,7 @@ function draw() {
 const logEl = $("#log"), MAXLOG = 400;
 let logCount = 0, follow = true;
 let logBuf = [], logLevels = null, logTab = sessionStorage.getItem("basalt.logtab") || "all";
+let logWin = null, logWinMax = 0;      // the open level's newest lines, fetched from the server's whole ring
 const LOG_TABS = [["all", "All"], ["warn", "Warnings"], ["err", "Errors"]];
 const logShown = e => logTab === "all" || e.lvl === logTab;
 function lineEl(e) {
@@ -429,36 +430,52 @@ function drawLogTabs() {
   html($("#logtabs"), LOG_TABS.map(([k, word]) =>
     `<button type="button" role="tab" data-t="${k}" aria-selected="${k === logTab}" title="${k === "all" ? "lines" : word.toLowerCase()} since the server started">${word} (${fmt(k === "all" ? total : at(k))})</button>`).join(""));
 }
-function renderLogs() {
-  drawLogTabs();
-  const lines = logBuf.filter(logShown);
-  if (!lines.length) {
-    const d = document.createElement("div"); d.className = "empty";
-    d.textContent = logTab === "all" ? "No log lines yet." : `No ${logTab === "warn" ? "warnings" : "errors"} in the kept lines.`;
-    logEl.replaceChildren(d);
-  } else logEl.replaceChildren(...lines.map(lineEl));
+function emptyNote(text) {
+  const d = document.createElement("div"); d.className = "empty"; d.textContent = text; logEl.replaceChildren(d);
+}
+function domAppend(lines) {
+  if (!lines.length) return;
+  logEl.querySelector(".empty")?.remove();
+  logEl.append(...lines.map(lineEl));
+  while (logEl.childElementCount > MAXLOG) logEl.firstChild.remove();
   if (follow) logEl.scrollTop = logEl.scrollHeight;
+}
+function renderLogs() {                // the All tab shows the client's own newest lines
+  const lines = logBuf.filter(logShown);
+  if (lines.length) { logEl.replaceChildren(...lines.map(lineEl)); if (follow) logEl.scrollTop = logEl.scrollHeight; }
+  else emptyNote("No log lines yet.");
+}
+async function showLogs() {            // the level tabs ask the server for the newest lines at their level,
+  drawLogTabs();                       // so boot-time lines show up although no client kept them
+  if (logTab === "all") { logWin = null; renderLogs(); return; }
+  const tab = logTab;
+  logWin = null;
+  try {
+    const r = await get(`api/logs?level=${tab}&limit=${MAXLOG}&after=0`);
+    if (logTab !== tab) return;        // another tab was chosen while this was in flight
+    logWin = r.lines; logWinMax = logWin.length ? logWin[logWin.length - 1].id : 0;
+    if (logWin.length) { logEl.replaceChildren(...logWin.map(lineEl)); if (follow) logEl.scrollTop = logEl.scrollHeight; }
+    else emptyNote(logLevels && logLevels[tab] ? `The ${tab === "warn" ? "warning" : "error"} lines are older than what the server keeps.` : `No ${tab === "warn" ? "warnings" : "errors"}.`);
+  } catch (e) { /* the metrics poll reports the connection */ }
 }
 $("#logtabs").addEventListener("click", e => {
   const b = e.target.closest("button[data-t]"); if (!b) return;
   logTab = b.dataset.t; try { sessionStorage.setItem("basalt.logtab", logTab); } catch (err) { /* private mode */ }
-  renderLogs();
+  showLogs();
 });
 function append(lines) {
   logBuf.push(...lines);
   if (logBuf.length > MAXLOG) logBuf.splice(0, logBuf.length - MAXLOG);
-  const fresh = lines.filter(logShown);
-  if (fresh.length) {
-    logEl.querySelector(".empty")?.remove();
-    logEl.append(...fresh.map(lineEl));
-    while (logEl.childElementCount > MAXLOG) logEl.firstChild.remove();
+  if (logTab === "all") domAppend(lines);
+  else if (logWin) {                   // a live line at the open level joins the window's lines
+    const fresh = lines.filter(e => e.lvl === logTab && e.id > logWinMax);
+    if (fresh.length) { logWinMax = fresh[fresh.length - 1].id; domAppend(fresh); }
   }
   logCount += lines.length; text($("#log-count"), `${fmt(logCount)} lines`);
-  if (follow) logEl.scrollTop = logEl.scrollHeight;
 }
 logEl.addEventListener("scroll", () => { follow = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 12; });
 function clearLog(note) {
-  logCount = 0; logBuf = []; text($("#log-count"), "");
+  logCount = 0; logBuf = []; logWin = null; logWinMax = 0; text($("#log-count"), "");
   const d = document.createElement("div"); d.className = "empty"; d.textContent = note; logEl.replaceChildren(d);
 }
 
@@ -491,5 +508,5 @@ $("#auth").onsubmit = e => {
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
-renderLogs();
+showLogs();
 pollMetrics(); pollLog();
