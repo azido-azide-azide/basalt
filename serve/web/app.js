@@ -211,10 +211,12 @@ function drawHero(live, hist, reqs, best, slots, total) {
   text($("#pre-hit"), r && r.prompt_tokens > 0 && num(r.reused) ? `${Math.round(r.reused / r.prompt_tokens * 100)}%` : "-");
 
   const bd = best.decode, bp = best.prefill, busy = slots.filter(s => s.is_processing).length;
-  html($("#foot-dec"), `${multi ? `${busy} of ${total} slots busy` : "Single slot"} · Best <b>${bd ? fmt(bd.tok_s, 1) : "-"}</b> tok/s`);
-  html($("#foot-pre"), `Best <b>${bp ? fmt(bp.tok_s) : "-"}</b> tok/s`);
-  $("#foot-dec").title = bd ? `Fastest whole request since the server started: ${bd.id}, ${fmt(bd.output_tokens)} tokens, ${clock(bd.time * 1000)}` : "";
-  $("#foot-pre").title = bp ? `Fastest prompt read since the server started: ${bp.id}, ${fmt(bp.read_tokens)} tokens read, ${clock(bp.time * 1000)}` : "";
+  const means = M.means || {}, md = means.decode, mp = means.prefill;
+  const meanNote = (m, unit) => m ? ` · Mean of ${fmt(m.n)} requests over the newest kept, with at least ${fmt(m.min_tokens)} ${unit}` : "";
+  html($("#foot-dec"), `${multi ? `${busy} of ${total} slots busy` : "Single slot"} · Best <b>${bd ? fmt(bd.tok_s, 1) : "-"}</b> · Mean <b>${md ? fmt(md.tok_s, 1) : "-"}</b> tok/s`);
+  html($("#foot-pre"), `Best <b>${bp ? fmt(bp.tok_s) : "-"}</b> · Mean <b>${mp ? fmt(mp.tok_s, 1) : "-"}</b> tok/s`);
+  $("#foot-dec").title = (bd ? `Fastest whole request since the server started: ${bd.id}, ${fmt(bd.output_tokens)} tokens, ${clock(bd.time * 1000)}` : "") + meanNote(md, "output tokens");
+  $("#foot-pre").title = (bp ? `Fastest prompt read since the server started: ${bp.id}, ${fmt(bp.read_tokens)} tokens read, ${clock(bp.time * 1000)}` : "") + meanNote(mp, "newly read tokens");
 }
 $("#chips").addEventListener("click", e => {
   const b = e.target.closest(".ck"); if (!b) return;
