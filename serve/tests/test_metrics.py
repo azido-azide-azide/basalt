@@ -177,18 +177,19 @@ class Http(unittest.TestCase):
 
     # --- /api/logs
     def test_logs(self):
-        self.assertEqual(self.call("/api/logs")[1], {"lines": [], "last": 0})
+        self.assertEqual(self.call("/api/logs")[1], {"lines": [], "last": 0, "levels": {"info": 0, "warn": 0, "err": 0}})
         for i in range(5):
             self.svc.logs.add("srv", f"line {i}")
         self.svc.logs.add("eng", "basalt: error: CUDA boom")
         code, body = self.call("/api/logs")
         self.assertEqual(code, 200)
-        self.assertEqual(set(body), {"lines", "last"})
+        self.assertEqual(set(body), {"lines", "last", "levels"})
         self.assertEqual((len(body["lines"]), body["last"]), (6, 6))
         self.assertEqual(body["lines"][-1]["msg"], "basalt: error: CUDA boom")
         self.assertEqual((body["lines"][-1]["src"], body["lines"][-1]["lvl"]), ("eng", "err"))
+        self.assertEqual(body["levels"], {"info": 5, "warn": 0, "err": 1})
         self.assertEqual([x["id"] for x in self.call("/api/logs?after=4")[1]["lines"]], [5, 6])
-        self.assertEqual(self.call("/api/logs?after=6")[1], {"lines": [], "last": 6})
+        self.assertEqual(self.call("/api/logs?after=6")[1], {"lines": [], "last": 6, "levels": {"info": 5, "warn": 0, "err": 1}})
         self.assertEqual([x["id"] for x in self.call("/api/logs?limit=2")[1]["lines"]], [5, 6])
         self.assertEqual(self.call("/api/logs?after=x")[1]["last"], 6)                  # a bad id: the newest lines
 
