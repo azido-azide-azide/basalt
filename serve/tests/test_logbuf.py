@@ -138,8 +138,8 @@ class Buffer(unittest.TestCase):
         self.assertEqual(len(b.since(0)[0]), 4)                      # the ring kept four, the counts saw all 16
 
     def test_level_lines_read_whole_ring_in_order(self):
-        b = LogBuffer(capacity=10)
-        b.add("eng", "basalt serve: warning: an old one")            # id 1, long out of any client's window
+        b = LogBuffer(capacity=30)
+        b.add("eng", "basalt serve: warning: an old one")            # id 1, far from the newest few
         for i in range(20):
             b.add("srv", f"n{i}")
         b.add("eng", "basalt serve: error: boom")                    # id 22
