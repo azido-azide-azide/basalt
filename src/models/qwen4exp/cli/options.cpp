@@ -142,7 +142,7 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
     }
     if (!std::isfinite(o.temperature) || o.temperature < 0 || !std::isfinite(o.top_p) ||
         o.top_p <= 0 || o.top_p > 1 || o.top_k < 0 || o.expert_cache < -1 ||
-        o.pool_workers < 0) {
+        o.pool_workers < 0 || o.load_threads < 1) {
         basalt::log::error("basalt generate", "invalid sampling or resource parameter");
         return 2;
     }
