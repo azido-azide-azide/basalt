@@ -238,10 +238,12 @@ function drawHero(live, hist, reqs, best, slots, total) {
   text($("#pre-hit"), r && r.prompt_tokens > 0 && num(r.reused) ? `${Math.round(r.reused / r.prompt_tokens * 100)}%` : "-");
 
   const bd = best.decode, bp = best.prefill;
-  html($("#foot-dec"), `<span>Best <b>${bd ? fmt(bd.tok_s, 1) : "-"}</b> tok/s</span>${chip}`);
-  html($("#foot-pre"), `Best <b>${bp ? fmt(bp.tok_s) : "-"}</b> tok/s`);
-  $("#foot-dec").title = bd ? `Fastest whole request since the server started: ${bd.id}, ${fmt(bd.output_tokens)} tokens, ${clock(bd.time * 1000)}` : "";
-  $("#foot-pre").title = bp ? `Fastest prompt read since the server started: ${bp.id}, ${fmt(bp.read_tokens)} tokens read, ${clock(bp.time * 1000)}` : "";
+  const p85 = M.p85 || {}, pDec = p85.decode, pPre = p85.prefill;
+  const pNote = (m, unit) => m ? ` · The 85th percentile of ${fmt(m.n)} kept requests with at least ${fmt(m.min_tokens)} ${unit}` : "";
+  html($("#foot-dec"), `<span>Best <b>${bd ? fmt(bd.tok_s, 1) : "-"}</b> · P85 <b>${pDec ? fmt(pDec.tok_s, 1) : "-"}</b> tok/s</span>${chip}`);
+  html($("#foot-pre"), `Best <b>${bp ? fmt(bp.tok_s) : "-"}</b> · P85 <b>${pPre ? fmt(pPre.tok_s, 1) : "-"}</b> tok/s`);
+  $("#foot-dec").title = (bd ? `Fastest whole request since the server started: ${bd.id}, ${fmt(bd.output_tokens)} tokens, ${clock(bd.time * 1000)}` : "") + pNote(pDec, "output tokens");
+  $("#foot-pre").title = (bp ? `Fastest prompt read since the server started: ${bp.id}, ${fmt(bp.read_tokens)} tokens read, ${clock(bp.time * 1000)}` : "") + pNote(pPre, "newly read tokens");
 }
 $("#chips").addEventListener("click", e => {
   const b = e.target.closest(".ck"); if (!b) return;
@@ -439,7 +441,7 @@ function draw() {
   drawMain(live, hist, reqs, slots, total);
 }
 
-/* ---- logs ---- */
+/* ---- logs: level tabs filter the kept lines, their counts are the server's lifetime ones ---- */
 // the engine's long conversation cache lines, shortened for the panel (the log and the API keep the raw line)
 function shortLog(msg) {
   const k = n => n >= 1000 ? `${Math.round(n / 1000)}k` : String(n), g = b => `${(b / 1024 ** 3).toFixed(1)} GiB`;
@@ -450,6 +452,10 @@ function shortLog(msg) {
 }
 const logEl = $("#log"), MAXLOG = 400;
 let logCount = 0, follow = true;
+let logBuf = [], logLevels = null, logTab = sessionStorage.getItem("basalt.logtab") || "all";
+let logWin = null, logWinMax = 0;      // the open level's newest lines, fetched from the server's whole ring
+const LOG_TABS = [["all", "All"], ["warn", "Warnings"], ["err", "Errors"]];
+const logShown = e => logTab === "all" || e.lvl === logTab;
 function lineEl(e) {
   const d = document.createElement("div");
   if (e.lvl !== "info") d.className = e.lvl;
@@ -459,16 +465,58 @@ function lineEl(e) {
   if (e.src !== "srv" || true) d.title = e.msg;
   return d;
 }
-function append(lines) {
+function drawLogTabs() {
+  const at = l => (logLevels && logLevels[l]) || 0;
+  const total = logLevels ? at("info") + at("warn") + at("err") : 0;
+  html($("#logtabs"), LOG_TABS.map(([k, word]) =>
+    `<button type="button" role="tab" data-t="${k}" aria-selected="${k === logTab}" title="${k === "all" ? "lines" : word.toLowerCase()} since the server started">${word} (${fmt(k === "all" ? total : at(k))})</button>`).join(""));
+}
+function emptyNote(text) {
+  const d = document.createElement("div"); d.className = "empty"; d.textContent = text; logEl.replaceChildren(d);
+}
+function domAppend(lines) {
+  if (!lines.length) return;
   logEl.querySelector(".empty")?.remove();
   logEl.append(...lines.map(lineEl));
   while (logEl.childElementCount > MAXLOG) logEl.firstChild.remove();
-  logCount += lines.length; text($("#log-count"), `${fmt(logCount)} lines`);
   if (follow) logEl.scrollTop = logEl.scrollHeight;
+}
+function renderLogs() {                // the All tab shows the client's own newest lines
+  const lines = logBuf.filter(logShown);
+  if (lines.length) { logEl.replaceChildren(...lines.map(lineEl)); if (follow) logEl.scrollTop = logEl.scrollHeight; }
+  else emptyNote("No log lines yet.");
+}
+async function showLogs() {            // the level tabs ask the server for the newest lines at their level,
+  drawLogTabs();                       // so boot-time lines show up although no client kept them
+  if (logTab === "all") { logWin = null; renderLogs(); return; }
+  const tab = logTab;
+  logWin = null;
+  try {
+    const r = await get(`api/logs?level=${tab}&limit=${MAXLOG}&after=0`);
+    if (logTab !== tab) return;        // another tab was chosen while this was in flight
+    logWin = r.lines; logWinMax = logWin.length ? logWin[logWin.length - 1].id : 0;
+    if (logWin.length) { logEl.replaceChildren(...logWin.map(lineEl)); if (follow) logEl.scrollTop = logEl.scrollHeight; }
+    else emptyNote(logLevels && logLevels[tab] ? `The ${tab === "warn" ? "warning" : "error"} lines are older than what the server keeps.` : `No ${tab === "warn" ? "warnings" : "errors"}.`);
+  } catch (e) { /* the metrics poll reports the connection */ }
+}
+$("#logtabs").addEventListener("click", e => {
+  const b = e.target.closest("button[data-t]"); if (!b) return;
+  logTab = b.dataset.t; try { sessionStorage.setItem("basalt.logtab", logTab); } catch (err) { /* private mode */ }
+  showLogs();
+});
+function append(lines) {
+  logBuf.push(...lines);
+  if (logBuf.length > MAXLOG) logBuf.splice(0, logBuf.length - MAXLOG);
+  if (logTab === "all") domAppend(lines);
+  else if (logWin) {                   // a live line at the open level joins the window's lines
+    const fresh = lines.filter(e => e.lvl === logTab && e.id > logWinMax);
+    if (fresh.length) { logWinMax = fresh[fresh.length - 1].id; domAppend(fresh); }
+  }
+  logCount += lines.length; text($("#log-count"), `${fmt(logCount)} lines`);
 }
 logEl.addEventListener("scroll", () => { follow = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 12; });
 function clearLog(note) {
-  logCount = 0; text($("#log-count"), "");
+  logCount = 0; logBuf = []; logWin = null; logWinMax = 0; text($("#log-count"), "");
   const d = document.createElement("div"); d.className = "empty"; d.textContent = note; logEl.replaceChildren(d);
 }
 
@@ -488,6 +536,7 @@ async function pollMetrics() {
 async function pollLog() {
   try {
     const r = await get(`api/logs?after=${lastLog}`);
+    if (r.levels) { logLevels = r.levels; drawLogTabs(); }        // counts that outlive the client and every ring
     if (r.last < lastLog) { lastLog = 0; clearLog("The server restarted."); }
     else if (r.lines.length) { lastLog = r.last; append(r.lines); }
     else if (!logCount && !logEl.firstChild) clearLog("No log lines yet.");
@@ -500,4 +549,5 @@ $("#auth").onsubmit = e => {
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
+showLogs();
 pollMetrics(); pollLog();
