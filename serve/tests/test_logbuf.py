@@ -127,6 +127,27 @@ class Buffer(unittest.TestCase):
         ids = [x["id"] for x in b.since(0, 1000)[0]]
         self.assertEqual(ids, list(range(1, 801)))
 
+    def test_level_counts_outlive_the_ring(self):
+        b = LogBuffer(capacity=4)
+        b.add("srv", "[server] ready\n[server] warning: low")
+        b.add("eng", "basalt serve: error: boom")
+        b.add("srv", "Traceback (most recent call last):\n  x\nValueError: 1")
+        for i in range(10):
+            b.add("srv", f"n{i}")
+        self.assertEqual(b.levels(), {"info": 11, "warn": 1, "err": 4})
+        self.assertEqual(len(b.since(0)[0]), 4)                      # the ring kept four, the counts saw all 16
+
+    def test_level_lines_read_whole_ring_in_order(self):
+        b = LogBuffer(capacity=30)
+        b.add("eng", "basalt serve: warning: an old one")            # id 1, far from the newest few
+        for i in range(20):
+            b.add("srv", f"n{i}")
+        b.add("eng", "basalt serve: error: boom")                    # id 22
+        lines, last = b.level_lines("warn", 0, 400)
+        self.assertEqual(([x["id"] for x in lines], last), ([1], 22))
+        self.assertEqual([x["id"] for x in b.level_lines("err", 0, 400)[0]], [22])
+        self.assertEqual([x["id"] for x in b.level_lines("info", 0, 3)[0]], [19, 20, 21])   # newest three, oldest first
+
 
 class Tee(unittest.TestCase):
     def test_the_stream_is_unchanged_and_whole_lines_are_kept(self):
