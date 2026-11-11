@@ -19,6 +19,7 @@
 #include <linux/mman.h>   // MAP_HUGE_2MB
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <unistd.h>
 #endif
 #include <cerrno>
@@ -722,47 +723,74 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
             return nullptr;
         }
 
+        // hugetlbfs requires truncate/read/write sizes (and offsets) to be
+        // multiples of the hugepage size. fstatfs reports the hugepage size
+        // as f_bsize on hugetlbfs; on regular/tmpfs filesystems f_bsize is
+        // the 4 KiB page size, so all padding below is a no-op there.
+        unsigned long blk = 4096;
+        struct statfs afs{};
+        if (fstatfs(fd, &afs) == 0 && (unsigned long) afs.f_bsize > 0)
+            blk = (unsigned long) afs.f_bsize;
+        const off_t want = (off_t)((file_bytes + blk - 1) & ~(off_t)(blk - 1));
+
         const bool fresh = st.st_size == 0;
         if (fresh) {
-            if (ftruncate(fd, (off_t) file_bytes) != 0) {
+            if (ftruncate(fd, want) != 0) {
                 const int e = errno;
                 close(fd);
                 note = "cannot size shared arena " + shared_file + ": " + std::strerror(e);
                 return nullptr;
             }
-            SharedArenaHeader hdr{};
-            std::memcpy(hdr.magic, kSharedArenaMagic, sizeof hdr.magic);
-            hdr.version = 1;
-            hdr.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
-            hdr.arena_bytes = bytes;
-            hdr.arena_hash = shared_hash;
-            const ssize_t written = ::pwrite(fd, &hdr, sizeof hdr, 0);
-            if (written != (ssize_t) sizeof hdr) {
-                const int e = errno;
-                close(fd);
-                note = "cannot write shared arena header " + shared_file + ": " +
-                       (written < 0 ? std::string(std::strerror(e)) : std::string("short write"));
-                return nullptr;
-            }
         } else {
-            if (st.st_size < 0 || (uint64_t) st.st_size != file_bytes) {
+            if (st.st_size < 0 || (uint64_t) st.st_size < file_bytes || (uint64_t) st.st_size > (uint64_t) want) {
                 close(fd);
                 note = "shared arena " + shared_file + " is " +
                        std::to_string((unsigned long long) st.st_size) + " B, expected " +
                        std::to_string((unsigned long long) file_bytes) + " B including its header";
                 return nullptr;
             }
+        }
+
+        // This kernel rejects read(2)/write(2) on hugetlbfs even when fully
+        // hugepage-aligned (EINVAL), so the file is only ever touched through
+        // its mapping - the same mapping the expert fill below writes into.
+        void* map = mmap(nullptr, (size_t) file_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        const int e = errno;
+        close(fd);
+        if (map == MAP_FAILED) {
+            note = "cannot map shared arena " + shared_file + ": " + std::strerror(e);
+            return nullptr;
+        }
+        if (fresh) {
             SharedArenaHeader hdr{};
-            const ssize_t got_header = ::pread(fd, &hdr, sizeof hdr, 0);
-            if (got_header != (ssize_t) sizeof hdr ||
-                std::memcmp(hdr.magic, kSharedArenaMagic, sizeof hdr.magic) != 0 ||
-                hdr.version != 1 || hdr.header_bytes != kSharedArenaHeaderBytes || hdr.arena_bytes != bytes) {
-                close(fd);
+            std::memcpy(hdr.magic, kSharedArenaMagic, sizeof hdr.magic);
+            hdr.version = 1;
+            hdr.header_bytes = (uint32_t) kSharedArenaHeaderBytes;
+            hdr.arena_bytes = bytes;
+            hdr.arena_hash = shared_hash;
+            std::memcpy(map, &hdr, sizeof hdr);
+            // Best effort: hugetlbfs has no writeback cache to flush.
+            msync(map, (size_t) want, MS_SYNC);
+        } else {
+            SharedArenaHeader hdr{};
+            std::memcpy(&hdr, map, sizeof hdr);
+            if (std::memcmp(hdr.magic, kSharedArenaMagic, sizeof hdr.magic) != 0 ||
+                hdr.version != 1 || hdr.header_bytes != kSharedArenaHeaderBytes) {
+                munmap(map, (size_t) file_bytes);
                 note = "shared arena " + shared_file + " has an incompatible or missing header";
                 return nullptr;
             }
+            // A hugetlbfs file's size is rounded up to the huge page, so two different
+            // arena sizes can share one size: the header's own count is what decides.
+            if (hdr.arena_bytes != bytes) {
+                munmap(map, (size_t) file_bytes);
+                note = "shared arena " + shared_file + " holds " +
+                       std::to_string((unsigned long long) hdr.arena_bytes) +
+                       " B of arena, expected " + std::to_string((unsigned long long) bytes) + " B";
+                return nullptr;
+            }
             if (hdr.arena_hash != shared_hash) {
-                close(fd);
+                munmap(map, (size_t) file_bytes);
                 char b[256];
                 std::snprintf(b, sizeof b,
                               "shared arena %s was written for model hash %016llx, expected %016llx",
@@ -771,14 +799,6 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
                 note = b;
                 return nullptr;
             }
-        }
-
-        void* map = mmap(nullptr, (size_t) file_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        const int e = errno;
-        close(fd);
-        if (map == MAP_FAILED) {
-            note = "cannot map shared arena " + shared_file + ": " + std::strerror(e);
-            return nullptr;
         }
         mapping_base = map;
         mapping_bytes = file_bytes;
