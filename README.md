@@ -1,5 +1,31 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
+## This fork
+
+Upstream, plus the five changes one deployment runs on top of it:
+
+- **A shared arena on hugetlbfs** (`src/platform/memory.cpp`): `--shared-expert-arena` takes a file on a
+  huge-page mount, not only `/dev/shm`. The file is truncated to a multiple of the huge page and its header
+  is reached through the mapping, since hugetlbfs accepts neither an unrounded `ftruncate` nor `read`/`write`;
+  a size mismatch is then told by the header, naming the size it wanted.
+- **`--load-threads N`** (`src/models/qwen4exp/flags.cpp`, `src/models/qwen4exp/load/sources.cpp`,
+  `docs/configuration/index.md`): the thread count of the start-up arena read. Upstream hardcodes 6 at the
+  call site; this fork runs 16. A flag and a config entry, so it follows `CONTRIBUTING.md` (no
+  environment-variable knobs).
+- **Console figures** (`serve/service.py`, `serve/handler.py`, `serve/util/logbuf.py`, `serve/web/`): the speed
+  footers keep a Mean and a P85 beside the Best, over the same gates, and the logs panel has All, Warnings and
+  Errors tabs whose counts are the server's lifetime ones, read through `/api/logs?level=`.
+- **`dash/`**: a second, always-up observer with its own small server, so the panels and the request history
+  survive an engine restart, with an optional `--api-key` gate on its data endpoints.
+- **`"vision-threads": N`** (`serve/config.py`, `serve/engine/vision.py`, `serve/server.py`): a model key that
+  passes `--threads N` to the `basalt-vision` sidecar, bounding the CPU burst of a `vision: "cpu"` encode.
+
+Nothing else is changed.
+
+Synced to upstream main at `3075cd6` (2026-11-13). The BF16 PLE rows this fork pioneered shipped upstream in
+0.3.1 ([#185](https://github.com/jesdga95/basalt/pull/185)), and this rig's community runs now live upstream in
+`docs/community/benchmarks.json`, so neither is carried here any more.
+
 Basalt is a local inference engine for mixture-of-experts models: **Qwen3.8-Flash-Next** and **DeepSeek-V4.1-Flash**. It runs on
 an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, with the experts that do not fit in VRAM in system RAM (and optionally
 on more GPUs). The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
