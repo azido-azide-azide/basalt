@@ -75,8 +75,8 @@ class Http(unittest.TestCase):
     def test_the_contract(self):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
-        self.assertEqual(set(m), {"engine", "live", "requests", "best", "totals", "conversation", "hardware", "hardware_static",
-                                 "history", "models", "swap"})
+        self.assertEqual(set(m), {"engine", "live", "requests", "best", "p85", "totals", "conversation",
+                                 "hardware", "hardware_static", "history", "models", "swap"})
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
@@ -187,18 +187,19 @@ class Http(unittest.TestCase):
 
     # --- /api/logs
     def test_logs(self):
-        self.assertEqual(self.call("/api/logs")[1], {"lines": [], "last": 0})
+        self.assertEqual(self.call("/api/logs")[1], {"lines": [], "last": 0, "levels": {"info": 0, "warn": 0, "err": 0}})
         for i in range(5):
             self.svc.logs.add("srv", f"line {i}")
         self.svc.logs.add("eng", "basalt: error: CUDA boom")
         code, body = self.call("/api/logs")
         self.assertEqual(code, 200)
-        self.assertEqual(set(body), {"lines", "last"})
+        self.assertEqual(set(body), {"lines", "last", "levels"})
         self.assertEqual((len(body["lines"]), body["last"]), (6, 6))
         self.assertEqual(body["lines"][-1]["msg"], "basalt: error: CUDA boom")
         self.assertEqual((body["lines"][-1]["src"], body["lines"][-1]["lvl"]), ("eng", "err"))
+        self.assertEqual(body["levels"], {"info": 5, "warn": 0, "err": 1})
         self.assertEqual([x["id"] for x in self.call("/api/logs?after=4")[1]["lines"]], [5, 6])
-        self.assertEqual(self.call("/api/logs?after=6")[1], {"lines": [], "last": 6})
+        self.assertEqual(self.call("/api/logs?after=6")[1], {"lines": [], "last": 6, "levels": {"info": 5, "warn": 0, "err": 1}})
         self.assertEqual([x["id"] for x in self.call("/api/logs?limit=2")[1]["lines"]], [5, 6])
         self.assertEqual(self.call("/api/logs?after=x")[1]["last"], 6)                  # a bad id: the newest lines
 
@@ -218,6 +219,29 @@ class Http(unittest.TestCase):
         code, body = self.call("/api/logs", headers={"Authorization": "Bearer secret"})
         self.assertEqual((code, body["last"]), (200, 1))
         self.assertEqual(self.call("/metrics")[0], 401)
+
+    def test_logs_level_filter(self):
+        self.svc.logs.add("eng", "basalt serve: warning: an old one")
+        for i in range(3):
+            self.svc.logs.add("srv", f"line {i}")
+        body = self.call("/api/logs?level=warn&after=0")[1]
+        self.assertEqual([x["msg"] for x in body["lines"]], ["basalt serve: warning: an old one"])
+        self.assertEqual(body["last"], 4)
+        self.assertEqual(self.call("/api/logs?level=err&after=0")[1]["lines"], [])
+        self.assertEqual([x["lvl"] for x in self.call("/api/logs?level=nonsense&after=0")[1]["lines"]],
+                         ["warn", "info", "info", "info"])           # not a level: the plain newest lines
+        self.assertEqual(self.call("/api/logs?level=warn&after=4")[1]["lines"], [])   # above the old one's id
+
+    def test_p85_is_gated_like_best(self):
+        self.assertEqual(self.call("/metrics")[1]["p85"], {})
+        for out, prompt, ms, rate in ((300, 5000, 5000.0, 60.0), (400, 6000, 5000.0, 80.0),
+                                      (500, 5500, 5000.0, 100.0), (10, 100, 100.0, 999.0)):   # the last under both gates
+            self.svc.history.append({"id": f"r_{len(self.svc.history):04d}", "time": time.time(), "duration_s": 5.0,
+                                     "finish": "stop", "prompt_tokens": prompt, "reused": 0, "prompt_ms": ms,
+                                     "output_tokens": out, "decode_tok_s": rate})
+        p85 = self.call("/metrics")[1]["p85"]
+        self.assertEqual(p85["decode"], {"tok_s": 100.0, "n": 3, "min_tokens": 256})    # nearest rank of 60, 80, 100
+        self.assertEqual(p85["prefill"], {"tok_s": 1200.0, "n": 3, "min_tokens": 4096})  # of 1000, 1200 and 1100 tok over 5 s each
 
 
 class FakeGpu:

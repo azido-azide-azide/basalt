@@ -617,7 +617,8 @@ def make_handler(target: Service | Router):
             return True
 
         def _logs(self):
-            """GET /api/logs?after=<id>&limit=<n>: the newest lines after that id, and the newest id."""
+            """GET /api/logs?after=<id>&limit=<n>: the newest lines after that id, and the newest id.
+            With level=<info|warn|err>, only that level's lines: the newest `limit` of them in the buffer."""
             query = parse_qs(urlsplit(self.path).query)
 
             def number(name, default):
@@ -628,8 +629,12 @@ def make_handler(target: Service | Router):
             after = number("after", None) if "after" in query else None
             limit = min(number("limit", LOG_FIRST_LINES), LOG_MAX_LINES) if after is None else \
                 min(number("limit", LOG_MAX_LINES), LOG_MAX_LINES)
-            lines, last = svc.logs.since(after or 0, limit)
-            self._json(200, {"lines": lines, "last": last})
+            level = (query.get("level", [""])[0]).lower()
+            if level in ("info", "warn", "err"):
+                lines, last = svc.logs.level_lines(level, after or 0, limit)
+            else:
+                lines, last = svc.logs.since(after or 0, limit)
+            self._json(200, {"lines": lines, "last": last, "levels": svc.logs.levels()})
 
         def _sse(self):
             if self.sse_open:
