@@ -47,6 +47,7 @@ struct Options : CommonOptions {
     bool gpu_only_full = false;   ///< pre + post + head, the true per-token GPU floor
     bool mmap_experts = false;    ///< opt OUT of the resident arena, back to a file mapping
     std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes
+    int load_threads = 6;         ///< threads that read the pack into the resident arena at start-up
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM resident mode): `--resident-cpu-experts` with the copy
     /// page-locked when the driver allows (else locked in the working set), the RAM reserve as headroom, and plain mmap
