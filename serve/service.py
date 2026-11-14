@@ -676,7 +676,18 @@ class Service:
         with self.status_lock:
             self._drop_stale_best()
             best = {k: dict(v) for k, v in self.best.items()}
-        return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
+        # the 85th percentiles over the same gates as best's: numbers dragged around by requests too short
+        # to reach steady speed would not be comparable to the best standing beside them
+        dec = sorted(r["decode_tok_s"] for r in hist if (r["output_tokens"] or 0) >= BEST_MIN_OUT and r.get("decode_tok_s"))
+        pre = sorted(((r["prompt_tokens"] or 0) - (r["reused"] or 0)) * 1000 / r["prompt_ms"]
+                     for r in hist if (r["prompt_tokens"] or 0) - (r["reused"] or 0) >= BEST_MIN_READ and r.get("prompt_ms"))
+
+        def nearest_rank(v):                                    # the 85th percentile of a sorted rate list
+            return v[(len(v) * 85 + 99) // 100 - 1]
+
+        p85 = {k: {"tok_s": round(nearest_rank(v), 1), "n": len(v), "min_tokens": gate}
+               for k, v, gate in (("decode", dec, BEST_MIN_OUT), ("prefill", pre, BEST_MIN_READ)) if v}
+        return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best, "p85": p85,
                 "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
                 "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
 
