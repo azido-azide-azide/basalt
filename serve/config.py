@@ -23,7 +23,7 @@ CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the confi
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
-    "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
+    "gpu", "vision", "vision-threads", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
@@ -541,6 +541,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="image input: off (default), dynamic (inside the engine: it borrows expert-cache slots "
                          "on the main GPU while it reads an image, no standing VRAM), cpu (no VRAM, slow) or a "
                          "GPU number, as nvidia-smi numbers them: the encoder sidecar, always on that card")
+    ap.add_argument("--vision-threads", type=int, default=None, metavar="N",
+                    help="worker-thread cap for the CPU vision encoder sidecar (vision cpu mode); default: the "
+                         "sidecar's own count")
     ap.add_argument("--image-url-host", action="append", default=[], metavar="HOST[:PORT]", type=image_url_host,
                     help="let requests from other machines name http(s) image URLs on exactly this host (repeatable; "
                          "without a port, 80 and 443). A name must resolve to public addresses; an IP address is "
