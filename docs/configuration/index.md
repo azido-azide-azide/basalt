@@ -104,7 +104,8 @@ Command line `--name`; the Where column says which config block takes it.
 | `resident-experts` | engine | switch | on with a profile | Flash-Next only. Keep experts the GPU does not hold in page-locked RAM. Falls back to a file mapping when RAM is short. |
 | `resident-budget-gib` | engine | GiB | auto | At most N GiB of experts in RAM, hottest first. |
 | `mmap-experts` | engine | switch | off | Flash-Next only. Use a file mapping instead of the RAM copy. |
-| `shared-expert-arena` | engine | file path | off | Flash-Next only. One shared file for the resident arena across processes (put it on `/dev/shm`). |
+| `shared-expert-arena` | engine | file path | off | Flash-Next only. One shared file for the resident arena across processes (put it on `/dev/shm`, or on a hugetlbfs mount when a huge-page pool is reserved: the file is then rounded up to the huge-page size). |
+| `load-threads` | engine | integer, at least 1 | 6 | Flash-Next only. Threads that read the pack into the resident arena at start-up. Start-up time only - raise it when the drive and the cores stream the pack faster than 6 threads pull; the output is the same either way. |
 | `expert-profile` | engine | file | `data/profiles/<arch>-<layers>x<experts>.prof` | Which experts start in VRAM. |
 | `expert-profile-save` | engine | file | off | Flash-Next only. Save the learned placement on exit and periodically; a start places from it. Needs the adaptive tier. |
 | `expert-profile-save-every` | engine | minutes | 10 (`0` = on exit only) | Flash-Next only. Save period. |
