@@ -146,6 +146,7 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--gpu-stages") o.gpu_stages = true;
     else if (a == "--mmap-experts") o.mmap_experts = true;
     else if (a == "--shared-expert-arena") o.shared_expert_arena = args.next("--shared-expert-arena");
+    else if (a == "--load-threads") o.load_threads = std::atoi(args.next("--load-threads"));
     else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
     else if (a == "--resident-experts") {
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
