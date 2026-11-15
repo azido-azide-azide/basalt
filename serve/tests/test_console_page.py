@@ -22,7 +22,8 @@ class PageContract(unittest.TestCase):
         self.m = self.svc.metrics()
 
     def reads(self, var, text=APP_JS):
-        return set(re.findall(rf"\b{var}\.([a-z_]+)", text))
+        # fork: this branch's /metrics adds `p85`, so a field name may hold digits
+        return set(re.findall(rf"\b{var}\.([a-z_][a-z_0-9]*)", text))
 
     def test_the_top_level_fields(self):
         top = self.reads("M") - {"slots", "models", "swap"}          # /slots, and the router's
