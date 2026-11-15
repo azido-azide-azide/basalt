@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 
-from serve.util.loglevel import ERR, WARN, LevelReader
+from serve.util.loglevel import ERR, INFO, WARN, LevelReader
 
 CAPACITY = 2000
 MAX_LINE = 2000
@@ -26,6 +26,7 @@ class LogBuffer:
         self.instance_id = uuid.uuid4().hex
         self.clients = threading.BoundedSemaphore(8)
         self.readers: dict[str, LevelReader] = {}      # per source: a traceback spans lines
+        self.counts = {INFO: 0, WARN: 0, ERR: 0}       # lines per level since the server started
 
     def add(self, src: str, text: str) -> None:
         """Add each non-empty line of `text` (ANSI codes removed, long lines cut) from source `src`. A line's level is
@@ -37,6 +38,7 @@ class LogBuffer:
                 continue
             with self.lock:
                 lvl = self.readers.setdefault(src, LevelReader()).read(msg)
+                self.counts[lvl] += 1
                 self.last += 1
                 self.lines.append({"id": self.last, "t": now, "src": src, "lvl": lvl,
                                    "msg": msg.removeprefix(SERVER_PREFIX)})
@@ -61,6 +63,17 @@ class LogBuffer:
             return {"lines": [dict(x) for x in lines], "last": self.last,
                     "next": lines[-1]["id"] if lines else self.last,
                     "instance_id": self.instance_id, "reset": reset, "dropped": dropped}
+    def level_lines(self, level: str, after_id: int = 0, limit: int = 500) -> tuple[list[dict], int]:
+        """The newest `limit` lines at `level` above `after_id`, oldest first, and the newest id in the buffer."""
+        with self.lock:
+            fresh = [dict(x) for x in self.lines if x["id"] > after_id and x["lvl"] == level]
+            last = self.last
+        return (fresh[-limit:] if limit > 0 else []), last
+
+    def levels(self) -> dict:
+        """The lines per level since the server started, outliving every ring."""
+        with self.lock:
+            return dict(self.counts)
 
 
 class TeeStream:
