@@ -23,7 +23,7 @@ const shortCpu = s => String(s || "").replace(/\((R|TM)\)/gi, "").replace(/\s+\d
 let apiKey = sessionStorage.getItem("basalt.key") || "";
 
 async function get(path) {
-  const r = await fetch(path, { cache: "no-store", headers: apiKey ? { Authorization: *** ${apiKey}` } : {} });
+  const r = await fetch(path, { cache: "no-store", headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} });
   if (r.status === 401) throw Object.assign(new Error("locked"), { locked: true });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
@@ -1001,7 +1001,6 @@ const connectLogs = stream(() => "api/logs/stream" + (lastLog === null ? "" :
   if (reset && !fresh.length && !data.dropped) draw();
 }, state => text($("#log-status"), { connecting: "Connecting", locked: "API key required",
   live: "Live", offline: "Disconnected; retrying" }[state]));
-}
 /* the server's lifetime level counts: /api/logs answers with them on every call, so a line-free
    poll keeps the level buttons' numbers current without touching the SSE line transport */
 async function pollLevels() {
@@ -1010,6 +1009,7 @@ async function pollLevels() {
     if (r.levels) { logLevels = r.levels; drawLFilter(); }
   } catch (e) { /* the state stream reports the connection */ }
   setTimeout(pollLevels, 2000);
+}
 $("#auth").onsubmit = e => {
   e.preventDefault(); apiKey = $("#key").value.trim(); sessionStorage.setItem("basalt.key", apiKey);
   connectState(); connectLogs();
