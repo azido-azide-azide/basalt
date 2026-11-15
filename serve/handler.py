@@ -1,6 +1,7 @@
 """The HTTP server and its request handler: routes, authentication, CORS and streaming."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import select
@@ -83,13 +84,29 @@ def make_handler(target: Service | Router):
                            "x-grok-conv-id", "x-grok-session-id")
 
         def _session_id(self, req) -> str | None:
-            """The conversation this request belongs to, or None when it names no session (admission is prompt-only)."""
+            """The conversation this request belongs to, or None when it names no session.
+
+            A multi-turn chat also identifies itself by its first user message: clients that resend the whole
+            history keep one slot even when a turn's re-rendered prompt matches none of the held K/V.
+            """
             for h in self.SESSION_HEADERS:
                 v = (self.headers.get(h) or "").strip()
                 if v:
                     return v
             v = req.get("session_id") if isinstance(req, dict) else None
-            return v if isinstance(v, str) and v else None
+            if isinstance(v, str) and v:
+                return v
+            messages = req.get("messages") if isinstance(req, dict) else None
+            if isinstance(messages, list) and len(messages) > 1:
+                for m in messages:
+                    if not isinstance(m, dict) or m.get("role") != "user":
+                        continue
+                    content = m.get("content")
+                    text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, ensure_ascii=False)
+                    if isinstance(text, str) and text:
+                        return "chat:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+                    break
+            return None
 
         def log_message(self, fmt, *args):
             pass
@@ -656,7 +673,8 @@ def make_handler(target: Service | Router):
             return True
 
         def _logs(self):
-            """GET /api/logs?after=<id>&limit=<n>: the newest lines after that id, and the newest id."""
+            """GET /api/logs?after=<id>&limit=<n>: the newest lines after that id, and the newest id.
+            With level=<info|warn|err>, only that level's lines: the newest `limit` of them in the buffer."""
             query = parse_qs(urlsplit(self.path).query)
 
             def number(name, default):
@@ -667,8 +685,12 @@ def make_handler(target: Service | Router):
             after = number("after", None) if "after" in query else None
             limit = min(number("limit", LOG_FIRST_LINES), LOG_MAX_LINES) if after is None else \
                 min(number("limit", LOG_MAX_LINES), LOG_MAX_LINES)
-            lines, last = svc.logs.since(after or 0, limit)
-            self._json(200, {"lines": lines, "last": last})
+            level = (query.get("level", [""])[0]).lower()
+            if level in ("info", "warn", "err"):
+                lines, last = svc.logs.level_lines(level, after or 0, limit)
+            else:
+                lines, last = svc.logs.since(after or 0, limit)
+            self._json(200, {"lines": lines, "last": last, "levels": svc.logs.levels()})
 
         def _sse(self):
             if self.sse_open:
