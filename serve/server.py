@@ -186,6 +186,9 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
         cfg["model_name"] = a.alias
     if not cfg.get("model_name") and a.model:
         cfg["model_name"] = Path(a.model).name
+    if getattr(a, "vision_threads", None) and isinstance(cfg.get("vision"), dict) \
+            and cfg["vision"].get("mode") == "cpu":
+        cfg["vision"]["threads"] = int(a.vision_threads)
     return cfg
 
 
