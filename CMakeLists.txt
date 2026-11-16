@@ -235,6 +235,12 @@ if(BUILD_TESTING)
   target_include_directories(qwen35_split_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qwen35_split_plan_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen35_split_plan_test COMMAND qwen35_split_plan_test)
+  # the widths each card of a tensor-parallel pair runs: heads and widths sharing out whole, the pair adding back to the
+  # model, each card's delta-net being its key-head group as a smaller layer, its state only its heads' (host only)
+  add_executable(dense_tp_geometry_test tests/dense/tp_geometry_test.cpp)
+  target_include_directories(dense_tp_geometry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(dense_tp_geometry_test PRIVATE warnings)
+  basalt_cpu_test(NAME dense_tp_geometry_test COMMAND dense_tp_geometry_test)
   # the pair's half of every matrix: the heads that divide, a rule for every tensor of the pack, and the two cards' byte
   # spans cutting it in two, read against the pack's own scale tiles (host only; the byte checks need a pack)
   add_executable(qwen35_tp_shard_test tests/models/qwen35/tp_shard_test.cpp src/dense/weight_shard.cpp)
