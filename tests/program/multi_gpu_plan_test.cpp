@@ -71,6 +71,11 @@ int main() {
         CHECK(rate > 0.9 * 147.5 && rate < 1.1 * 147.5);
         CHECK(price(p, Mechanism::LayerSplit).ms > 1.1 * price(p, Mechanism::ExpertTier).ms);
         CHECK(!price(p, Mechanism::TensorParallel).runs);   // priced, not built
+        MgModel built = model();
+        built.tp_built = true;                              // the same pair once the engine can run split layers
+        const MgPlan pt = plan_multi_gpu({card(0, "RTX 5080", 960, 16), card(1, "RTX 5080", 960, 16)}, built);
+        CHECK(price(pt, Mechanism::TensorParallel).runs);
+        CHECK(pt.line.find("(not built)") == std::string::npos);
     }
     // three and four equal cards, and equal cards big enough to hold every expert: priced, one line, a valid pick
     for (int n = 2; n <= 4; ++n) {

@@ -92,6 +92,21 @@ int main() {
     expect("16+16, 8K fp16", inputs(fp16_8k, 1, kMainFixed8K, r5070, r5070), 32);
     expect("two RTX 5070 Ti, 128K int8, spec 16 (#376)", inputs(int8_128k, 1, kMainFixed, r5070, r5070), 32);
     expect_error("16+16, 262K fp16 (fits neither one card nor a split)", inputs(fp16_262k, 1, kMainFixed, r5070, r5070));
+    // width-2 tensor parallel: half of every layer's bytes and half of every slot's states on each card, plus fixed parts
+    {
+        SplitInputs fit = inputs(int8_128k, 1, kMainFixed, r5070, r5070);
+        fit.tensor_parallel = true;
+        const SplitPlan p = basalt::dense::plan_split(fit);
+        check(p.tp_fits == (p.tp_main <= r5070.free && p.tp_peer <= r5070.free) && p.cut == 0 &&
+              p.tp_main > 0 && p.tp_peer > 0,
+              "16+16, 128K int8 tensor-parallel fit: " + std::to_string(p.tp_main >> 20) + " + " +
+              std::to_string(p.tp_peer >> 20) + " MiB");
+        SplitInputs nofit = inputs(fp16_262k, 1, kMainFixed, r5070, r5070);
+        nofit.tensor_parallel = true;
+        const SplitPlan q = basalt::dense::plan_split(nofit);
+        check(!q.tp_fits && q.error.find("tensor parallel") != std::string::npos,
+              "262K fp16 cells do not fit the pair even split across every layer");
+    }
     // the diagnostic cut
     expect("32+16, 8K, forced at 40", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 40), 40);
     expect("32+16, 8K, forced at 8", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 8), 8);
