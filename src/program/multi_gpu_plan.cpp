@@ -21,7 +21,7 @@ constexpr double kDraftMs = 1.75;        // the drafter on the first card, at 44
 constexpr double kRelayMs = 0.3;         // the last stage's window rows to the drafter's card
 constexpr uint64_t kHeadBytes = 600ull << 20;       // the head's copy on the last card, before its experts
 constexpr uint64_t kDrafterBytes = 1000ull << 20;   // the drafter and its copy of the head on the first card
-constexpr double kExchangeUs = 5.4;      // one mailbox exchange of 10 KiB between two cards
+constexpr double kExchangeUs = 3.5;      // one mailbox exchange of 10 KiB between two cards; measured 3.49 us graph-captured on 2x RTX 5060 Ti (2026-11-16)
 constexpr double kWinMargin = 0.95;      // a mechanism beyond the expert tier must beat it by 5%
 
 double bandwidth(const GpuCard& c) { return c.mem_gbps > 0 ? c.mem_gbps : 448.0; }
@@ -100,7 +100,7 @@ MgPlan plan_multi_gpu(const std::vector<GpuCard>& cards, const MgModel& m) {
     const double dense_saving = kDenseShare * kGpuGB * (1.0 / bw[0] - 1.0 / total_bw) * 1000.0;
     const double exchange = (double) m.layers * m.tp_exchanges_per_layer * (double) (n - 1) * kExchangeUs *
                             (m.tokens * m.exchange_mib_per_token) / 1000.0;
-    MgPrice tp{Mechanism::TensorParallel, false, tier.ms - dense_saving + exchange};
+    MgPrice tp{Mechanism::TensorParallel, m.tp_built, tier.ms - dense_saving + exchange};
     plan.prices = {tier, split, tp};
     plan.pick = Mechanism::ExpertTier;
     double best = tier.ms;

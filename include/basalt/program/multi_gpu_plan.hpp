@@ -28,6 +28,7 @@ struct MgModel {
     int tp_exchanges_per_layer = 2;     ///< all-reduces a layer needs when each layer is split across the cards
     double tokens = 3.0;                ///< rows in a decode window
     double exchange_mib_per_token = 1;  ///< what one all-reduce of a tensor-parallel layer moves for a row
+    bool tp_built = false;              ///< the engine can run split layers now: until it says so, tensor parallel is priced but never runs
 };
 
 /// The mechanism's figure for a card set.
