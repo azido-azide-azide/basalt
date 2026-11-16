@@ -42,7 +42,7 @@ struct DecRecArgs {
     void* yq = nullptr;              // q8_1 of the output, token t at block t * h_v * S / 32
     int C = 0, n_embd = 0, h_k = 0, h_v = 0;
     float eps = 0.0f;
-    // Head map (gdn_head_split.hpp): with nk > 0 the launch runs only key heads [k0, k0 + nk) and their value heads,
+    // Head map (core/gdn_head_split.hpp): with nk > 0 the launch runs only key heads [k0, k0 + nk) and their value heads,
     // in place in the layer's full state, conv weights, gates and h (strides C, h_v).  qkv and z are then the card's
     // packed rows (qkv stride (2 nk + nv) S, z stride nv S), and y, o and yq are written packed (stride nv S).
     // qkv_out, when set, gets the raw qkv channels of these heads at the full layout (the commit's conv history).

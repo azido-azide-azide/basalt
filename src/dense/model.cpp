@@ -332,7 +332,7 @@ uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd) {
 }
 
 SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
-                         uint64_t main_weights, SplitCard main_card, SplitCard peer_card) {
+                         uint64_t main_weights, SplitCard main_card, SplitCard peer_card, uint64_t main_weights_splittable) {
     SplitInputs in;
     const bool mtp = o.drafter == Drafter::Mtp;
     in.layer = layer_weights;
@@ -346,6 +346,7 @@ SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter
                                (o.drafter == Drafter::Block ? block_session_bytes(g, bd) : 0);
     const uint64_t scratch = shared_bytes(g, o.max_context, o.kv_int8, o.kv_resident);
     in.main_fixed = main_weights + scratch + (uint64_t) in.slots * slot_rest + stage_main_bytes(g, bd);
+    in.main_fixed_splittable = std::min(main_weights_splittable, main_weights);
     in.peer_fixed = scratch + 2ull * kChunk * g.n_embd * 2;   // its own scratch and the landing residuals
     in.main = main_card;
     in.peer = peer_card;

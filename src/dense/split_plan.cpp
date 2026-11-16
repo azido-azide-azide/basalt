@@ -28,14 +28,16 @@ SplitPlan plan_split(const SplitInputs& in) {
     if (in.tensor_parallel) {
         // width-2 tensor parallel: every card holds half of every layer's weights and half of every slot's cells and
         // recurrent states (the attention's and the GDN's heads split between the cards), plus its own fixed part.
-        // Upper bound: the main card's fixed part is counted whole, although the head's vocab and the per-slot logits
-        // split as well; the drafter stays on one card. A layer cut is not used when TP runs.
+        // Of the fixed part only what the vocabulary splits moves to the second card (the head's matrices and their scales);
+        // the norms multiply both cards' residuals, and the scratch, the drafter and the per-slot logits stay whole on the
+        // main card, which is the fit's upper bound. A layer cut is not used when TP runs.
         uint64_t wsum = 0, slotsum = 0;
         for (uint64_t b : in.layer) wsum += b;
         for (uint64_t s : in.per_slot) slotsum += s;
         const uint64_t share = wsum / 2 + (uint64_t) in.slots * slotsum / 2;
-        p.tp_main = share + in.main_fixed;
-        p.tp_peer = share + in.peer_fixed;
+        const uint64_t head = std::min(in.main_fixed_splittable, in.main_fixed) / 2;
+        p.tp_main = share + in.main_fixed - head;
+        p.tp_peer = share + in.peer_fixed + head;
         p.tp_fits = p.tp_main <= in.main.free && p.tp_peer <= in.peer.free;
         if (!p.tp_fits)
             p.error = "tensor parallel needs " + mib(p.tp_main) + " on the main card (" + mib(in.main.free) + " free) and " +

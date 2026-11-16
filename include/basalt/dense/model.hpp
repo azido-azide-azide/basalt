@@ -34,6 +34,8 @@ struct Linear {
     int64_t rows = 0, cols = 0;
     const float* scale = nullptr;
     const float* row_scales = nullptr;
+    int dev = 0;                 ///< the CUDA device the bytes are on
+    int shard = 0, shards = 1;   ///< the card's slice of the whole matrix: rows / shards (its outputs) or cols / shards (its inputs)
 };
 
 struct Layer {
@@ -173,8 +175,9 @@ uint64_t shared_bytes(const Geometry& g, int64_t max_context, bool kv_int8 = fal
 /// Device bytes a session's block drafter keeps (its context ring and its window rows); 0 without one.
 uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd);
 /// The layer split's inputs for `o` (its sessions, context and drafter) on a main card with `main_free` bytes free and a second
-/// card with `peer_free`: `layer_weights` per layer, `main_weights` the rest the main card holds (head, norms, drafter).
+/// card with `peer_free`: `layer_weights` per layer, `main_weights` the rest the main card holds (head, norms, drafter),
+/// `main_weights_splittable` the part of those bytes a tensor-parallel pair shares out (the head's vocab and its scales).
 SplitInputs split_inputs(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
-                         uint64_t main_weights, SplitCard main_card, SplitCard peer_card);
+                         uint64_t main_weights, SplitCard main_card, SplitCard peer_card, uint64_t main_weights_splittable = 0);
 
 }  // namespace basalt::dense

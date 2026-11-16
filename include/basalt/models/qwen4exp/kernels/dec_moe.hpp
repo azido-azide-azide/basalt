@@ -133,7 +133,7 @@ bool dec_moe_glue_ok(const NativeExpertLayout& L);
 /// `scratch` / `out` / `cap` as native_expert_grouped's (entries cap, rows into out at the entry's index).
 void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a, void* scratch, float* out, int cap, void* stream);
 
-/// The peer's key heads of one GDN layer (gdn_head_split.hpp's packed layout): qkv and z rows and the out
+/// The peer's key heads of one GDN layer (core/gdn_head_split.hpp's packed layout): qkv and z rows and the out
 /// projection's columns in native formats (Q4_K, Q5_K, Q6_K, IQ4_XS), and the recurrence's arguments on the slice
 /// (nk 0, its h_k / h_v / C) with qkv, z, o, yq and x in the peer's scratch.
 struct DmMixLayer {

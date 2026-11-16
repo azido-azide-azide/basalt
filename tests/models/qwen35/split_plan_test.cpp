@@ -107,6 +107,32 @@ int main() {
         check(!q.tp_fits && q.error.find("tensor parallel") != std::string::npos,
               "262K fp16 cells do not fit the pair even split across every layer");
     }
+    // the head's vocabulary is the fixed part the pair shares out: every card runs half the rows, so half those bytes
+    // move to the second card and the pair's total does not change (the 27B pack's FP8 head and its per-row scales)
+    {
+        constexpr uint64_t kHead = 1271398400 + 993280;   // output.weight (F8_E4M3) + output.scale (F32 per row)
+        SplitInputs fit = inputs(int8_128k, 1, kMainFixed, r5070, r5070);
+        fit.tensor_parallel = true;
+        const SplitPlan whole = basalt::dense::plan_split(fit);
+        fit.main_fixed_splittable = kHead;
+        const SplitPlan half = basalt::dense::plan_split(fit);
+        check(half.tp_main == whole.tp_main - kHead / 2 && half.tp_peer == whole.tp_peer + kHead / 2 &&
+                  half.tp_main + half.tp_peer == whole.tp_main + whole.tp_peer,
+              "the head shares out between the pair: " + std::to_string(half.tp_main >> 20) + " + " +
+              std::to_string(half.tp_peer >> 20) + " MiB (was " + std::to_string(whole.tp_main >> 20) + " + " +
+              std::to_string(whole.tp_peer >> 20) + ")");
+        // a main card that bare that the head is what tips it over: the pack's own fit, minus the head's half
+        const SplitCard tight = card(k16GB - kHead / 2, 896);
+        SplitInputs tip = inputs(int8_128k, 1, kMainFixed, tight, r5070);
+        tip.tensor_parallel = true;
+        check(!basalt::dense::plan_split(tip).tp_fits, "the head whole on the main card tips the tighter pair over");
+        tip.main_fixed_splittable = kHead;
+        check(basalt::dense::plan_split(tip).tp_fits, "half the head is what fits the tighter pair");
+        SplitInputs over = tip;
+        over.main_fixed_splittable = kMainFixed * 2;   // more than the main card holds at all
+        const SplitPlan o = basalt::dense::plan_split(over);
+        check(o.tp_main == whole.tp_main - kMainFixed / 2, "bytes beyond the main card's own cannot move to the second");
+    }
     // the diagnostic cut
     expect("32+16, 8K, forced at 40", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 40), 40);
     expect("32+16, 8K, forced at 8", inputs(fp16_8k, 1, kMainFixed8K, r5090, r5060, 8), 8);

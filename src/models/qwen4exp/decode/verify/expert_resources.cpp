@@ -4,7 +4,7 @@
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
-#include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
+#include "basalt/core/gdn_head_split.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"

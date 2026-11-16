@@ -19,6 +19,7 @@ struct SplitInputs {
     std::vector<uint64_t> per_slot; ///< per layer: a slot's cells and recurrent state there
     int slots = 1;
     uint64_t main_fixed = 0;        ///< the main card's own: head, norms, drafter, scratch, per-slot logits and drafter state
+    uint64_t main_fixed_splittable = 0;  ///< the part of `main_fixed` the second card takes half of (the head's vocab and its scales)
     uint64_t peer_fixed = 0;        ///< the second card's own: its scratch
     SplitCard main, peer;
     int forced = 0;                 ///< a cut to take as given (0: plan one)
@@ -29,7 +30,7 @@ struct SplitPlan {
     int cut = 0;                    ///< 0: the main card holds everything; else the first layer on the second card
     uint64_t main_bytes = 0, peer_bytes = 0;
     bool tp_fits = false;            ///< width-2 TP: half of every layer's weights plus half of every slot's cells and states fits both cards
-    uint64_t tp_main = 0, tp_peer = 0;  ///< the TP fit's per-card bytes (upper bound: the main card's fixed part is counted whole)
+    uint64_t tp_main = 0, tp_peer = 0;  ///< the TP fit's per-card bytes (upper bound: the fixed part other than the head is counted whole)
     std::string error;              ///< non-empty: neither one card nor a split fits
 };
 

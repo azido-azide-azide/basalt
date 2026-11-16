@@ -56,8 +56,9 @@ inline model::ModelDesc describe_meta(const GgufFile& g) {
     return d;
 }
 
-/// The dense stack's geometry from the metadata; empty `err` when it is whole.
-inline dense::Geometry geometry(const GgufFile& g, std::string& err) {
+/// What the metadata says the model's shape is, before asking the kernels whether they run it (which is what `geometry`
+/// adds, and the one thing of it a host-only test of the shapes cannot link).
+inline dense::Geometry geometry_meta(const GgufFile& g, std::string& err) {
     dense::Geometry o;
     o.n_layers = (int) key_u(g, "block_count");
     o.n_embd = (int) key_u(g, "embedding_length");
@@ -89,6 +90,12 @@ inline dense::Geometry geometry(const GgufFile& g, std::string& err) {
                                                                                 : (il + 1) % interval != 0;
         o.kinds.push_back(recurrent ? dense::Mixer::Gdn : dense::Mixer::Attention);
     }
+    return o;
+}
+
+/// The dense stack's geometry from the metadata; empty `err` when it is whole.
+inline dense::Geometry geometry(const GgufFile& g, std::string& err) {
+    dense::Geometry o = geometry_meta(g, err);
     if (err.empty()) err = o.check();
     return o;
 }

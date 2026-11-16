@@ -201,7 +201,8 @@ endif()
 if(BASALT_MODEL_QWEN35)
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it
-add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp src/dense/split_plan.cpp)
+add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp src/dense/split_plan.cpp
+  src/dense/weight_shard.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
 target_link_libraries(dense PUBLIC model kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
@@ -234,6 +235,13 @@ if(BUILD_TESTING)
   target_include_directories(qwen35_split_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qwen35_split_plan_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen35_split_plan_test COMMAND qwen35_split_plan_test)
+  # the pair's half of every matrix: the heads that divide, a rule for every tensor of the pack, and the two cards' byte
+  # spans cutting it in two, read against the pack's own scale tiles (host only; the byte checks need a pack)
+  add_executable(qwen35_tp_shard_test tests/models/qwen35/tp_shard_test.cpp src/dense/weight_shard.cpp)
+  target_include_directories(qwen35_tp_shard_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(qwen35_tp_shard_test PRIVATE artifact model_file platform warnings)
+  basalt_cpu_test(NAME qwen35_tp_shard_test COMMAND qwen35_tp_shard_test)
+  set_tests_properties(qwen35_tp_shard_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 endif()
 

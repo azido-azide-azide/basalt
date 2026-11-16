@@ -2,6 +2,8 @@
 // pack into the shared dense stack and hands out its sessions.
 #include "models/qwen35/adapter.hpp"
 
+#include "models/qwen35/shard.hpp"
+
 #include "basalt/core/diag.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -56,14 +58,19 @@ bool block_meta(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& 
 // tensor from one allocation per card, so the planner counts exactly what the load takes).
 uint64_t weight_bytes(const TensorInfo& t) { return (tensor_payload_bytes(t) + 255) & ~(uint64_t) 255; }
 
+// as weight_bytes, for the bytes a tensor-parallel card holds of it
+uint64_t shard_weight_bytes(uint64_t payload) { return (payload + 255) & ~(uint64_t) 255; }
+
 // Whether the load places tensor `name` on a card: the layers [lo, hi), and with lo == 0 the head and the drafter in use.
-bool on_card(const std::string& name, const dense::Options& o, int lo, int hi) {
+// The drafter is one card's (its layers run whole there); the head is every card's, each its own shard of it.
+bool on_card(const std::string& name, const dense::Options& o, int lo, int hi, int rank = 0) {
     if (name.starts_with("blk.")) {
         const int il = std::atoi(name.c_str() + 4);
         return il >= lo && il < hi;
     }
-    return lo == 0 && (name.starts_with("output") || (o.drafter == dense::Drafter::Block && name.starts_with("dflash.")) ||
-                       (o.drafter == dense::Drafter::Mtp && name.starts_with("mtp.")));
+    return lo == 0 && (name.starts_with("output") ||
+                       (rank == 0 && ((o.drafter == dense::Drafter::Block && name.starts_with("dflash.")) ||
+                                      (o.drafter == dense::Drafter::Mtp && name.starts_with("mtp.")))));
 }
 
 // The dense stack's options for a run of these flags (the drafter the pack carries, when drafting).
@@ -90,17 +97,19 @@ dense::Options run_options(const GgufFile& gg, int64_t max_context, int sessions
 
 // Where the layers go with a second card: all on the main card when the model, its cells and scratch fit there (the second card
 // then reads long prompts), else split across the two (dense::plan_split), from the pack's bytes per layer and both cards'
-// free memory (CUDA device 0 and `peer`).  `forced`: a cut taken as given.
+// free memory (CUDA device 0 and `peer`).  `forced`: a cut taken as given.  `tp`: price every card holding half of every matrix
+// instead of a layer cut, with which half of the fixed bytes the pair shares out (the head's).
 dense::SplitPlan plan_pack(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd, int peer,
-                           double main_gbps, double peer_gbps, int reserve_mib, int forced) {
+                           double main_gbps, double peer_gbps, int reserve_mib, int forced, int tp = 0) {
     std::vector<uint64_t> layer((size_t) g.n_layers, 0);
-    uint64_t main_weights = 0;
+    uint64_t main_weights = 0, head_weights = 0;
     for (const TensorInfo& t : gg.tensors()) {
         if (t.name.starts_with("blk.")) {
             const int il = std::atoi(t.name.c_str() + 4);
             if (il >= 0 && il < g.n_layers) layer[(size_t) il] += weight_bytes(t);
         } else if (on_card(t.name, o, 0, 0)) {
             main_weights += weight_bytes(t);
+            if (t.name.starts_with("output.")) head_weights += weight_bytes(t);   // the vocabulary: both cards run part of it
         }
     }
     size_t main_free = 0, peer_free = 0, total = 0;
@@ -116,8 +125,9 @@ dense::SplitPlan plan_pack(const GgufFile& gg, const dense::Geometry& g, const d
     const uint64_t reserve = ((uint64_t) std::max(reserve_mib, 0) << 20) + kMargin;
     const dense::SplitCard mc{main_free > reserve ? main_free - reserve : 0, main_gbps};
     const dense::SplitCard pc{peer_free > kMargin ? peer_free - kMargin : 0, peer_gbps};
-    dense::SplitInputs in = dense::split_inputs(g, o, bd, layer, main_weights, mc, pc);
+    dense::SplitInputs in = dense::split_inputs(g, o, bd, layer, main_weights, mc, pc, head_weights);
     in.forced = forced;
+    in.tensor_parallel = tp > 0;
     return dense::plan_split(in);
 }
 
@@ -166,6 +176,7 @@ public:
             return false;
         }
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
+        geom_ = g;
         dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;
@@ -183,6 +194,28 @@ public:
         uint64_t peer_total = 0;
         for (const TensorInfo& t : gg.tensors())
             if (split_at_ > 0 && t.name.starts_with("blk.") && std::atoi(t.name.c_str() + 4) >= split_at_) peer_total += tensor_payload_bytes(t);
+        // a tensor-parallel pair counts what each card reads: its shard of a split tensor, the whole of a shared one
+        if (tp_ > 0) {
+            total = peer_total = 0;
+            for (const TensorInfo& t : gg.tensors()) {
+                if (t.name.starts_with("mtp.")) continue;   // the drafter layer joins the count with --spec, as before
+                if (t.name == "token_embd.weight") {        // page-locked RAM, read once for both cards
+                    total += tensor_payload_bytes(t);
+                    continue;
+                }
+                if (on_card(t.name, o, 0, g.n_layers, 0)) {
+                    const uint64_t n = card_payload(t, 0, err);
+                    if (!n) return false;
+                    total += n;
+                }
+                if (on_card(t.name, o, 0, g.n_layers, 1)) {
+                    const uint64_t n = card_payload(t, 1, err);
+                    if (!n) return false;
+                    peer_total += n;
+                }
+            }
+            total += peer_total;   // as in the other paths, `total` is what both cards read
+        }
         core::LoadProgress::announce_total(total);
         core::LoadProgress::plan(core::LoadProgress::cuda(0), total - peer_total);
         if (peer_total) core::LoadProgress::plan(core::LoadProgress::cuda(req.peer_devices.front()), peer_total);
@@ -196,6 +229,9 @@ public:
             if (split_at_ > 0) {
                 const core::OnDevice on(req.peer_devices.front());
                 if (!reserve_block(gg, o, split_at_, g.n_layers, err)) return false;
+            } else if (tp_ > 0) {   // the pair's second card: its own block, its own shards
+                const core::OnDevice on(req.peer_devices.front());
+                if (!reserve_block(gg, o, 0, g.n_layers, err, 1)) return false;
             }
         }
         dense::Weights w;
@@ -236,7 +272,27 @@ public:
                 return false;
             }
             w.layers.push_back(L);
-            peer_w.layers.push_back(P);
+            if (tp_ == 0) peer_w.layers.push_back(P);   // the pair's layers are read together, on the second card
+        }
+        if (tp_ > 0) {   // the pair's second card, in its own block on its own device: its shards of the head and of every layer
+            const uint64_t before = dev_bytes_;
+            bool ok = true;
+            {
+                const core::OnDevice on(req.peer_devices.front());
+                progress_ = &*peer_progress;
+                peer_w.out_norm = floats(gg, "output_norm.weight", H, err, 1);
+                ok = peer_w.out_norm && linear(gg, "output", g.n_vocab, H, peer_w.head, err, 1);
+                for (int il = 0; ok && il < g.n_layers; ++il) {
+                    dense::Layer P;
+                    P.kind = g.kinds[(size_t) il];
+                    ok = layer(gg, g, il, P, err, 1);
+                    peer_w.layers.push_back(P);
+                }
+                progress_ = &progress;
+            }
+            if (!ok) return false;
+            peer_bytes_ += dev_bytes_ - before;
+            dev_bytes_ = before;
         }
         if (want_block && !block_drafter(gg, w.dflash, H, err)) return false;
         if (want_mtp) {   // the pack's drafter layer, for --spec
@@ -269,6 +325,14 @@ public:
         if (split_at_ > 0)
             basalt::log::info("basalt qwen35", "layer split: %.2f GiB of layers %d-%d on CUDA%d", (double) peer_bytes_ / 1073741824.0, split_at_,
                               g.n_layers - 1, req.peer_devices.front());
+        if (tp_ > 0) {
+            basalt::log::info("basalt qwen35", "tensor parallel %d: %.2f GiB on CUDA0, %.2f GiB on CUDA%d (half of every matrix, the "
+                              "delta-net by key-head group)", tp_, (double) dev_bytes_ / 1073741824.0,
+                              (double) peer_bytes_ / 1073741824.0, req.peer_devices.front());
+            // The plan and both cards' bytes are in place; no product crosses the pair yet, so this load cannot serve.
+            err = "qwen35: tensor parallel places both cards' shards, but the layers do not run split between the cards";
+            return false;
+        }
         o.host_embedding_bytes = tensor_payload_bytes(*te);
         o.gpu_weight_bytes = dev_bytes_ + peer_bytes_;
         o.layer_end = split_at_;
@@ -304,15 +368,24 @@ public:
     }
 
 private:
-    // Where the layers go with a second card (plan_pack); --diag-split-at takes its cut as given.
+    // Where the layers go with a second card (plan_pack); --diag-split-at takes its cut as given, --diag-tp prices the
+    // pair that holds half of every matrix instead.
     bool plan_cards(const GgufFile& gg, const dense::Geometry& g, const dense::Options& o, const dense::BlockDrafter& bd,
                     const model::LoadRequest& req, std::string& err) {
         const int peer = req.peer_devices.front();
+        if (req.diag_tp_width > 0 && !tp_geometry(g, req.diag_tp_width, err)) return false;
         const dense::SplitPlan p = plan_pack(gg, g, o, bd, peer, req.card_gbps.size() > 0 ? req.card_gbps[0] : 0,
-                                             req.card_gbps.size() > 1 ? req.card_gbps[1] : 0, req.vram_reserve_mib, req.diag_split_at);
+                                             req.card_gbps.size() > 1 ? req.card_gbps[1] : 0, req.vram_reserve_mib,
+                                             req.diag_split_at, req.diag_tp_width);
         if (!p.error.empty()) {
             err = "qwen35: " + p.error + "; lower --max-context or --parallel";
             return false;
+        }
+        if (req.diag_tp_width > 0) {
+            tp_ = req.diag_tp_width;
+            basalt::log::info("basalt qwen35", "tensor parallel %d: %.2f GiB on CUDA0 and %.2f GiB on CUDA%d, %lld layers", tp_,
+                              (double) p.tp_main / 1073741824.0, (double) p.tp_peer / 1073741824.0, peer, (long long) g.n_layers);
+            return true;
         }
         split_at_ = p.cut;
         if (p.cut > 0)
@@ -363,36 +436,36 @@ private:
         (void) cudaGetLastError();
     }
 
-    // layer il's weights (on the current device)
-    bool layer(const GgufFile& gg, const dense::Geometry& g, int il, dense::Layer& L, std::string& err) {
+    // layer il's weights, as card `rank` of the pair holds them (on the current device)
+    bool layer(const GgufFile& gg, const dense::Geometry& g, int il, dense::Layer& L, std::string& err, int rank = 0) {
         const int H = g.n_embd;
         const int C = g.conv_channels(), VD = g.value_width(), HV = g.gdn_v_heads, AQ = g.n_head * g.head_dim;
         const int KV = g.n_kv * g.head_dim;
         const std::string p = "blk." + std::to_string(il) + ".";
         L.kind = g.kinds[(size_t) il];
-        L.attn_norm = floats(gg, p + "attn_norm.weight", H, err);
-        L.ffn_norm = floats(gg, p + "post_attention_norm.weight", H, err);
+        L.attn_norm = floats(gg, p + "attn_norm.weight", H, err, rank);
+        L.ffn_norm = floats(gg, p + "post_attention_norm.weight", H, err, rank);
         if (!L.attn_norm || !L.ffn_norm) return false;
         if (L.kind == dense::Mixer::Gdn) {
-            if (!linear(gg, p + "attn_qkv", C, H, L.qkv, err) || !linear(gg, p + "attn_gate", VD, H, L.z, err) ||
-                !linear(gg, p + "ssm_out", H, VD, L.out, err))
+            if (!linear(gg, p + "attn_qkv", C, H, L.qkv, err, rank) || !linear(gg, p + "attn_gate", VD, H, L.z, err, rank) ||
+                !linear(gg, p + "ssm_out", H, VD, L.out, err, rank))
                 return false;
-            L.w_ab = bf16_pair(gg, p + "ssm_alpha.weight", p + "ssm_beta.weight", (int64_t) HV * H, err);
-            L.dt = floats(gg, p + "ssm_dt.bias", HV, err);
-            L.ssm_a = floats(gg, p + "ssm_a", HV, err);
-            L.conv = floats(gg, p + "ssm_conv1d.weight", (int64_t) C * g.gdn_conv, err);
-            L.gamma = floats(gg, p + "ssm_norm.weight", g.gdn_state, err);
+            L.w_ab = bf16_pair(gg, p + "ssm_alpha.weight", p + "ssm_beta.weight", (int64_t) HV * H, err, rank);
+            L.dt = floats(gg, p + "ssm_dt.bias", HV, err, rank);
+            L.ssm_a = floats(gg, p + "ssm_a", HV, err, rank);
+            L.conv = floats(gg, p + "ssm_conv1d.weight", (int64_t) C * g.gdn_conv, err, rank);
+            L.gamma = floats(gg, p + "ssm_norm.weight", g.gdn_state, err, rank);
             if (!L.w_ab || !L.dt || !L.ssm_a || !L.conv || !L.gamma) return false;
         } else {
-            if (!linear(gg, p + "attn_q", 2 * AQ, H, L.q, err) || !linear(gg, p + "attn_k", KV, H, L.k, err) ||
-                !linear(gg, p + "attn_v", KV, H, L.v, err) || !linear(gg, p + "attn_output", H, AQ, L.o, err))
+            if (!linear(gg, p + "attn_q", 2 * AQ, H, L.q, err, rank) || !linear(gg, p + "attn_k", KV, H, L.k, err, rank) ||
+                !linear(gg, p + "attn_v", KV, H, L.v, err, rank) || !linear(gg, p + "attn_output", H, AQ, L.o, err, rank))
                 return false;
-            L.q_norm = floats(gg, p + "attn_q_norm.weight", g.head_dim, err);
-            L.k_norm = floats(gg, p + "attn_k_norm.weight", g.head_dim, err);
+            L.q_norm = floats(gg, p + "attn_q_norm.weight", g.head_dim, err, rank);
+            L.k_norm = floats(gg, p + "attn_k_norm.weight", g.head_dim, err, rank);
             if (!L.q_norm || !L.k_norm) return false;
         }
-        if (!linear(gg, p + "ffn_gate", g.n_ff, H, L.gate, err) || !linear(gg, p + "ffn_up", g.n_ff, H, L.up, err) ||
-            !linear(gg, p + "ffn_down", H, g.n_ff, L.down, err))
+        if (!linear(gg, p + "ffn_gate", g.n_ff, H, L.gate, err, rank) || !linear(gg, p + "ffn_up", g.n_ff, H, L.up, err, rank) ||
+            !linear(gg, p + "ffn_down", H, g.n_ff, L.down, err, rank))
             return false;
         return true;
     }
@@ -438,9 +511,9 @@ private:
         return true;
     }
 
-    const uint16_t* bf16(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err) {
+    const uint16_t* bf16(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err, int rank = 0) {
         const TensorInfo* t = need(gg, name, kTypeBf16, elems, err);
-        return t ? (const uint16_t*) upload(gg, *t, err) : nullptr;
+        return t ? (const uint16_t*) upload(gg, *t, err, rank) : nullptr;
     }
 
     const TensorInfo* need(const GgufFile& gg, const std::string& name, int type, int64_t elems, std::string& err) {
@@ -458,11 +531,40 @@ private:
         return t;
     }
 
+    // The card's shard of `t`, whole-dimension runs and all (dim None when the split leaves the tensor alone).  The whole
+    // matrix is the pack's declared shape (GGUF order: `shape[0]` is a row's width), so the rules check the pack's shapes.
+    bool shard_of(const TensorInfo& t, int rank, dense::MatrixShard& out, std::string& err) const {
+        if (tp_ == 0) return (out = dense::MatrixShard{}, true);
+        const int64_t cols = t.shape.size() > 1 ? (int64_t) t.shape[0] : 1;
+        return tp_shard(geom_, t.name, (int64_t) t.elements() / cols, cols, tp_, rank, out, err);
+    }
+
+    // the payload card `rank` holds of `t`: its shard's when the split cuts it, all of it otherwise
+    uint64_t card_payload(const TensorInfo& t, int rank, std::string& err) const {
+        dense::MatrixShard s;
+        if (tp_ == 0) return tensor_payload_bytes(t);
+        if (!shard_of(t, rank, s, err)) return 0;
+        if (s.whole()) return tensor_payload_bytes(t);
+        const int64_t n = dense::shard_bytes(t.type, s, err);
+        if (n <= 0) { err = "qwen35: " + t.name + ": " + err; return 0; }
+        return (uint64_t) n;
+    }
+
+    // as weight_bytes, for what the card holds
+    uint64_t card_bytes(const TensorInfo& t, int rank, std::string& err) const {
+        const uint64_t n = card_payload(t, rank, err);
+        return n ? shard_weight_bytes(n) : 0;
+    }
+
     // One allocation on the current device for the tensors the load places there (on_card's), carved by take().
-    bool reserve_block(const GgufFile& gg, const dense::Options& o, int lo, int hi, std::string& err) {
+    bool reserve_block(const GgufFile& gg, const dense::Options& o, int lo, int hi, std::string& err, int rank = 0) {
         uint64_t bytes = 0;
-        for (const TensorInfo& t : gg.tensors())
-            if (on_card(t.name, o, lo, hi)) bytes += weight_bytes(t);
+        for (const TensorInfo& t : gg.tensors()) {
+            if (!on_card(t.name, o, lo, hi, rank)) continue;
+            const uint64_t n = card_bytes(t, rank, err);
+            if (!n) return false;
+            bytes += n;
+        }
         int dev = 0;
         cudaGetDevice(&dev);
         Block& b = blocks_[dev];
@@ -492,54 +594,91 @@ private:
         return d;
     }
 
-    void* upload(const GgufFile& gg, const TensorInfo& t, std::string& err) {
-        void* d = take(tensor_payload_bytes(t), t.name, err);
+    void* upload(const GgufFile& gg, const TensorInfo& t, std::string& err, int rank = 0) {
+        const uint64_t n = card_payload(t, rank, err);
+        if (!n) return nullptr;
+        void* d = take(n, t.name, err);
         if (!d) return nullptr;
-        constexpr uint64_t kChunk = 64ull << 20;
-        staging_.resize((size_t) std::min<uint64_t>(tensor_payload_bytes(t), kChunk));
-        for (uint64_t off = 0; off < tensor_payload_bytes(t); off += kChunk) {
-            const uint64_t n = std::min<uint64_t>(kChunk, tensor_payload_bytes(t) - off);
-            if (!platform::pread_all(fd_, staging_.data(), n, gg.data_start() + t.offset + off) ||
-                cudaMemcpy((char*) d + off, staging_.data(), n, cudaMemcpyHostToDevice) != cudaSuccess) {
-                err = "qwen35: reading " + t.name + " failed";
-                return nullptr;
-            }
-            if (progress_) progress_->add(n);
-        }
-        dev_bytes_ += tensor_payload_bytes(t);
+        if (!place(gg, t, rank, (uint8_t*) d, err)) return nullptr;
+        dev_bytes_ += n;
         return d;
     }
 
-    const float* floats(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err) {
-        const TensorInfo* t = need(gg, name, kTypeF32, elems, err);
-        return t ? (const float*) upload(gg, *t, err) : nullptr;
+    // the card's bytes of `t` at `dst`: a whole tensor read in chunks, or its shard, whose runs the pack's layout
+    // scattered - read the tensor once and cut the card's copy here, or read the runs straight from the file when the
+    // tensor is too big to hold twice
+    bool place(const GgufFile& gg, const TensorInfo& t, int rank, uint8_t* dst, std::string& err) {
+        dense::MatrixShard s;
+        if (!shard_of(t, rank, s, err)) return false;
+        constexpr uint64_t kChunk = 64ull << 20, kTwice = 128ull << 20;
+        std::vector<dense::ByteSpan> spans;
+        if (!s.whole()) {
+            if (!dense::shard_spans(t.type, s, spans, err)) {
+                err = "qwen35: " + t.name + ": " + err;
+                return false;
+            }
+        } else {
+            spans.push_back({0, 0, (int64_t) tensor_payload_bytes(t)});
+        }
+        uint64_t card = 0;
+        for (const dense::ByteSpan& sp : spans) card += (uint64_t) sp.n;
+        if (spans.size() > 8 && tensor_payload_bytes(t) <= kTwice) {
+            whole_.resize((size_t) tensor_payload_bytes(t));
+            cut_.resize((size_t) card);
+            if (!platform::pread_all(fd_, whole_.data(), tensor_payload_bytes(t), gg.data_start() + t.offset)) {
+                err = "qwen35: reading " + t.name + " failed";
+                return false;
+            }
+            if (progress_) progress_->add(card);   // the card's bytes, as every path counts (this one read the tensor whole)
+            dense::gather_spans(whole_.data(), spans, cut_.data());
+            if (cudaMemcpy(dst, cut_.data(), (size_t) card, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "qwen35: placing " + t.name + " failed";
+                return false;
+            }
+            return true;
+        }
+        for (const dense::ByteSpan& sp : spans) {
+            staging_.resize((size_t) std::min<uint64_t>((uint64_t) sp.n, kChunk));
+            for (uint64_t off = 0; off < (uint64_t) sp.n; off += kChunk) {
+                const uint64_t n = std::min<uint64_t>(kChunk, (uint64_t) sp.n - off);
+                if (!platform::pread_all(fd_, staging_.data(), n, gg.data_start() + t.offset + (uint64_t) sp.src + off) ||
+                    cudaMemcpy(dst + sp.dst + off, staging_.data(), n, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "qwen35: reading " + t.name + " failed";
+                    return false;
+                }
+                if (progress_) progress_->add(n);
+            }
+        }
+        return true;
     }
 
-    // two BF16 tensors in one buffer, the first then the second
-    const uint16_t* bf16_pair(const GgufFile& gg, const std::string& a, const std::string& b, int64_t elems, std::string& err) {
+    const float* floats(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err, int rank = 0) {
+        const TensorInfo* t = need(gg, name, kTypeF32, elems, err);
+        return t ? (const float*) upload(gg, *t, err, rank) : nullptr;
+    }
+
+    // two BF16 tensors in one buffer, the first then the second (each card's share of them, back to back)
+    const uint16_t* bf16_pair(const GgufFile& gg, const std::string& a, const std::string& b, int64_t elems, std::string& err,
+                              int rank = 0) {
         const TensorInfo* ta = need(gg, a, kTypeBf16, elems, err);
         const TensorInfo* tb = ta ? need(gg, b, kTypeBf16, elems, err) : nullptr;
         if (!tb) return nullptr;
-        void* d = take(tensor_payload_bytes(*ta) + tensor_payload_bytes(*tb), a, err);
+        const uint64_t na = card_payload(*ta, rank, err);
+        if (!na) return nullptr;
+        const uint64_t nb = card_payload(*tb, rank, err);
+        if (!nb) return nullptr;
+        void* d = take(na + nb, a, err);
         if (!d) return nullptr;
-        uint64_t at = 0;
-        for (const TensorInfo* t : {ta, tb}) {
-            staging_.resize((size_t) tensor_payload_bytes(*t));
-            if (!platform::pread_all(fd_, staging_.data(), tensor_payload_bytes(*t), gg.data_start() + t->offset) ||
-                cudaMemcpy((char*) d + at, staging_.data(), tensor_payload_bytes(*t), cudaMemcpyHostToDevice) != cudaSuccess) {
-                err = "qwen35: reading " + t->name + " failed";
-                return nullptr;
-            }
-            at += tensor_payload_bytes(*t);
-            if (progress_) progress_->add(tensor_payload_bytes(*t));
-        }
-        dev_bytes_ += at;
+        if (!place(gg, *ta, rank, (uint8_t*) d, err)) return nullptr;
+        if (!place(gg, *tb, rank, (uint8_t*) d + na, err)) return nullptr;   // the second starts where the kernels read it
+        dev_bytes_ += na + nb;
         return (const uint16_t*) d;
     }
 
     // `<base>.weight` (Q8_0, NVFP4_PLANES or F8_E4M3, rows x cols) and, for the last two, its tensor scale `<base>.scale`
     // (F32 [1]; the F8 head's may be F32 [rows], a scale per row)
-    bool linear(const GgufFile& gg, const std::string& base, int64_t rows, int64_t cols, dense::Linear& l, std::string& err) {
+    bool linear(const GgufFile& gg, const std::string& base, int64_t rows, int64_t cols, dense::Linear& l, std::string& err,
+                int rank = 0) {
         auto it = tensors_.find(base + ".weight");
         if (it == tensors_.end()) {
             err = "qwen35: the pack has no " + base + ".weight";
@@ -552,18 +691,28 @@ private:
             if (err.empty()) err = "qwen35: " + base + ".weight has the wrong shape";
             return false;
         }
+        // the card's copy is a matrix of its own shape, in the pack's layout; the products read it as the unsplit one
+        dense::MatrixShard s;
+        if (!shard_of(*t, rank, s, err)) return false;
         l.type = type;
-        l.rows = rows;
-        l.cols = cols;
-        l.w = upload(gg, *t, err);
+        l.rows = s.whole() ? rows : s.shard_rows();
+        l.cols = s.whole() ? cols : s.shard_cols();
+        l.w = upload(gg, *t, err, rank);
         if (!l.w) return false;
+        int dev = 0;
+        cudaGetDevice(&dev);
+        l.dev = dev;
+        if (tp_ > 0) {
+            l.shard = rank;
+            l.shards = tp_;
+        }
         if (type == kTypeNvfp4Planes || type == kTypeF8) {
             auto sc = tensors_.find(base + ".scale");
             if (type == kTypeF8 && base == "output" && sc != tensors_.end() && (int64_t) sc->second.elements() == rows && rows > 1) {
-                l.row_scales = floats(gg, base + ".scale", rows, err);
+                l.row_scales = floats(gg, base + ".scale", rows, err, rank);   // a scale per row, split with the head's rows
                 return l.row_scales != nullptr;
             }
-            l.scale = floats(gg, base + ".scale", 1, err);
+            l.scale = floats(gg, base + ".scale", 1, err, rank);   // one value every card applies to its own shard
             if (!l.scale) return false;
         }
         return true;
@@ -582,7 +731,10 @@ private:
     void* embd_ = nullptr;
     int fd_ = -1;
     std::vector<uint8_t> staging_;
+    std::vector<uint8_t> whole_, cut_;   // a split tensor read whole from the pack, and the card's copy cut from it
+    dense::Geometry geom_;               // the geometry the shard rules read while loading
     int split_at_ = 0;                   // the first layer on the second card (0: no split)
+    int tp_ = 0;                         // the pair's width, every matrix split between them (0: not tensor parallel)
     uint64_t peer_bytes_ = 0;            // the weights there
     core::LoadProgress* progress_ = nullptr;
 };
@@ -610,7 +762,7 @@ public:
     bool second_card_reads_prompts() const override { return true; }
     // the load's own plan (plan_pack) on the flags and both cards' free memory before it
     bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const override {
-        if (o.diag_split_at > 0) return true;
+        if (o.diag_split_at > 0 || o.diag_tp > 0) return true;
         core::ModelFile file;   // the pack's tensor table, read in place (as the load reads it)
         std::string err;
         if (!file.open(o.model, err) || !file.load_meta(err) || !file.register_gguf_view(err)) return false;
@@ -621,7 +773,15 @@ public:
         const dense::Options opt = run_options(gg, o.max_context, std::max(o.batch, 1), o.spec, draft, o.vision, o.kv, o.kv_resident);
         dense::BlockDrafter bd;
         if (opt.drafter == dense::Drafter::Block && !block_meta(gg, bd, g.n_embd, err)) return false;
-        const dense::SplitPlan p = plan_pack(gg, g, opt, bd, 1, main_gbps, peer_gbps, o.vram_reserve_given ? o.vram_reserve_mib : 0, 0);
+        const dense::SplitPlan p = plan_pack(gg, g, opt, bd, 1, main_gbps, peer_gbps, o.vram_reserve_given ? o.vram_reserve_mib : 0,
+                                             o.diag_split_at, o.diag_tp);
+        if (o.diag_tp > 0) {
+            if (!p.error.empty()) {
+                basalt::log::warn("basalt qwen35", "%s", p.error.c_str());
+                return false;
+            }
+            return true;   // the pair needs no layer cut: the roles are the pair's
+        }
         return p.error.empty() && p.cut > 0;
     }
 
@@ -632,6 +792,7 @@ public:
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
         else if (a == "--diag-split-at") o.diag_split_at = std::atoi(args.next("--diag-split-at"));
+        else if (a == "--diag-tp") o.diag_tp = std::atoi(args.next("--diag-tp"));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
@@ -657,6 +818,14 @@ public:
         }
         if (o.spec_given && (o.spec < 0 || o.spec > 16)) {
             basalt::log::error("basalt qwen35", "--spec %d: 0 (off) to 16", o.spec);
+            return 2;
+        }
+        if (o.diag_tp != 0 && o.diag_tp != 2) {
+            basalt::log::error("basalt qwen35", "--diag-tp %d: 2 (a pair of cards), or 0 (off)", o.diag_tp);
+            return 2;
+        }
+        if (o.diag_tp > 0 && o.diag_split_at > 0) {
+            basalt::log::error("basalt qwen35", "--diag-tp and --diag-split-at are two ways to use a second card, not both");
             return 2;
         }
         if (!o.spec_given) o.spec = has_drafter(o.model) ? kDefaultSpec : 0;

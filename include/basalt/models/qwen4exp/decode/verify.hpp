@@ -706,7 +706,7 @@ private:
     cudaEvent_t hs_fork_ = nullptr;   // CUDA0: the head's input is quantized
     cudaEvent_t hs_post_ = nullptr;   // CUDA0: the input is posted
     // GDN mixer split by key head: CUDA0 owns key heads [0, gs_nk0_), the peer the rest; gs_nk0_ 0 means no split
-    struct GsLayer {   // peer: one GDN layer's weights for its heads (gdn_head_split.hpp layout)
+    struct GsLayer {   // peer: one GDN layer's weights for its heads (core/gdn_head_split.hpp layout)
         void *wqkv = nullptr, *wz = nullptr, *wo = nullptr;
         void *wqkv0 = nullptr, *wz0 = nullptr, *wo0 = nullptr;   // CUDA0: its heads' packed qkv/z rows, out columns
         float *conv_w = nullptr, *dt = nullptr, *ssm_a = nullptr, *gamma = nullptr;

@@ -1,5 +1,5 @@
 #pragma once
-// include/basalt/models/qwen4exp/decode/gdn_head_split.hpp - the GDN mixer split by key-head group: the rows, columns and state a card
+// include/basalt/core/gdn_head_split.hpp - the GDN mixer split by key-head group: the rows, columns and state a card
 // holds when it owns key heads [k0, k0 + nk) of a GDN layer.
 //
 // Value head v reads key head v % h_k, so the card's value heads are the runs [j * h_k + k0, j * h_k + k0 + nk) for
@@ -27,13 +27,15 @@ struct GdnRun {
     int64_t start, len;
 };
 
-// channel runs of the full qkv axis [q | k | v], in packed order
-inline std::vector<GdnRun> gdn_qkv_runs(const GdnHeadSlice& g) {
-    const int64_t s = g.s;
-    std::vector<GdnRun> r{{g.k0 * s, g.nk * s}, {(g.h_k + g.k0) * s, g.nk * s}};
-    for (int j = 0; j < g.rep(); ++j) r.push_back({2 * g.h_k * s + (int64_t) (j * g.h_k + g.k0) * s, g.nk * s});
+// channel runs of the full qkv axis [q | k | v], in packed order, `per` elements (or rows, or channels) per head
+inline std::vector<GdnRun> gdn_qkv_runs(const GdnHeadSlice& g, int64_t per) {
+    std::vector<GdnRun> r{{g.k0 * per, g.nk * per}, {(g.h_k + g.k0) * per, g.nk * per}};
+    for (int j = 0; j < g.rep(); ++j) r.push_back({2 * g.h_k * per + (int64_t) (j * g.h_k + g.k0) * per, g.nk * per});
     return r;
 }
+
+// the same in the head's own elements: the qkv rows and the convolution's channels
+inline std::vector<GdnRun> gdn_qkv_runs(const GdnHeadSlice& g) { return gdn_qkv_runs(g, g.s); }
 
 // runs over the value-head axis, `per` elements per head (1: gates, dt, ssm_a; s: z rows, out columns, state rows)
 inline std::vector<GdnRun> gdn_vhead_runs(const GdnHeadSlice& g, int64_t per) {
