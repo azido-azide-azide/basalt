@@ -323,6 +323,39 @@ void add_from_mapped_bf16(uint16_t* x, const uint16_t* y, int64_t n, void* strea
     check_launch("add_from_mapped_bf16");
 }
 
+// x += own + peer, the three BF16 values added as floats and rounded once
+__global__ void add_pair_bf16_kernel(uint16_t* __restrict__ x, const uint16_t* __restrict__ own,
+                                     const uint16_t* peer, int64_t n8) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += (int64_t) gridDim.x * blockDim.x) {
+        uint4 a = ((const uint4*) x)[i];
+        const uint4 o = ((const uint4*) own)[i];
+        const uint4 b = ((const uint4*) peer)[i];   // the peer wrote it behind its flag, and this kernel sits behind the wait
+        const uint16_t* res = (const uint16_t*) &a;
+        const uint16_t* one = (const uint16_t*) &o;
+        const uint16_t* two = (const uint16_t*) &b;
+        uint16_t* into = (uint16_t*) &a;
+        for (int q = 0; q < 8; ++q)
+            into[q] = bf16_from_f32(f32_from_bf16(res[q]) + f32_from_bf16(one[q]) + f32_from_bf16(two[q]));
+        ((uint4*) x)[i] = a;
+    }
+}
+
+void add_pair_bf16(uint16_t* x, const uint16_t* own, const uint16_t* peer, int64_t n, void* stream) {
+    if (n <= 0) return;
+    if ((n & 7) != 0 || ((uintptr_t) x & 15) != 0 || ((uintptr_t) own & 15) != 0 || ((uintptr_t) peer & 15) != 0) {
+        basalt::log::error("basalt", "add_pair_bf16: n must be a multiple of 8 and all three pointers 16-byte aligned");
+        std::exit(1);
+    }
+    if (x == own) {
+        basalt::log::error("basalt", "add_pair_bf16: the residual and the card's own partial would count the same row twice");
+        std::exit(1);
+    }
+    const int64_t n8 = n / 8;
+    const int blocks = (int) ((n8 + 255) / 256 < 64 ? (n8 + 255) / 256 : 64);
+    add_pair_bf16_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(x, own, peer, n8);
+    check_launch("add_pair_bf16");
+}
+
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {

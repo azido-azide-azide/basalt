@@ -8,6 +8,8 @@
 //
 // The partials are distinct per exchange so a card's result is the sum of two known values, not an accumulation: each
 // exchange reads its own block of the card's buffer, the way every exchange's product is its own output in the forward.
+// The other form - the sum landing added into the running residual rows - is the pair's other half of the proof: both
+// cards must end with rows identical to the bit, because the residual is the stream the pair keeps replicated.
 // The flags are lowered between windows only after both cards' streams are idle, which is the discipline `TpHand` states.
 //
 // GPU, synthetic, no model.  Needs two cards with some free memory; skips (77) without them.
@@ -170,6 +172,10 @@ bool run_case(const char* what, Cfg& c, int rows) {
     run_window(*c.h, 1, c.s1, c.x1, rows);
     if (!drain(c.s0, c.s1, *c.h, std::string(what) + ": window")) return false;
     check_sums(c.dev0, c.dev1, c.x0, c.x1, rows, std::string(what) + ": launched");
+    // Both cards are past this window, so its flags go down before the next one runs - replayed or launched.  Lowering is
+    // only legal here: a raise still in flight from a window that has not finished would otherwise release the next one's
+    // wait before its peer's write.
+    dense::tp_hand_lower(*c.h);
     // as captured per card and replayed, the flags lowered between the windows
     cudaGraphExec_t g0 = nullptr, g1 = nullptr;
     const auto capture = [&](int dev, cudaStream_t s, uint16_t* x, cudaGraphExec_t& g) {
@@ -218,6 +224,87 @@ bool run_case(const char* what, Cfg& c, int rows) {
     return bad == 0;
 }
 
+// the residual rows the window starts with: the SAME rows on both cards, which is what the pair's exchanges keep them
+uint16_t resid(int64_t i) { return kernels::bf16_from_f32(1.25f + 0.5f * (float) ((i * 5) % 9)); }
+
+// one exchange added into the residual: its own rounding, in the order the pair runs the exchanges
+uint16_t step_resid(uint16_t from, int e, int64_t i) {
+    return kernels::bf16_from_f32(kernels::f32_from_bf16(from) + kernels::f32_from_bf16(part_a(e, i)) +
+                                  kernels::f32_from_bf16(part_b(e, i)));
+}
+
+// The other form the forward uses: every exchange's sum landing ADDED INTO the running residual rows, which both cards
+// must end with identical to the bit - the residual is the one stream the pair keeps replicated.
+bool run_add_case(const char* what, Cfg& c, int rows) {
+    const int64_t block = (int64_t) rows * kEmb;
+    uint16_t *r0 = nullptr, *r1 = nullptr;
+    for (int d : {c.dev0, c.dev1}) {
+        const core::OnDevice on(d);
+        uint16_t*& r = d == c.dev0 ? r0 : r1;
+        if (cudaMalloc((void**) &r, (size_t) block * 2) != cudaSuccess) {
+            check(false, std::string(what) + ": the residual rows did not fit on the card");
+            return false;
+        }
+    }
+    c.rows = rows;
+    c.hp0 = host_partials(0, rows);
+    c.hp1 = host_partials(1, rows);
+    if (!c.reset()) return check(false, std::string(what) + ": the partials did not reach the cards"), false;
+    std::vector<uint16_t> hr((size_t) block);
+    for (int64_t i = 0; i < block; ++i) hr[(size_t) i] = resid(i);
+    bool up = true;
+    {
+        const core::OnDevice on0(c.dev0);
+        up = up && cudaMemcpyAsync(r0, hr.data(), (size_t) block * 2, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    {
+        const core::OnDevice on1(c.dev1);
+        up = up && cudaMemcpyAsync(r1, hr.data(), (size_t) block * 2, cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    if (!up || cudaDeviceSynchronize() != cudaSuccess) return check(false, std::string(what) + ": the residual rows did not reach the cards"), false;
+    for (int e = 0; e < kExch; ++e) {
+        dense::tp_allreduce2_add(*c.h, 0, e, c.x0 + (int64_t) e * block, r0, rows, c.s0);
+        dense::tp_allreduce2_add(*c.h, 1, e, c.x1 + (int64_t) e * block, r1, rows, c.s1);
+    }
+    if (!drain(c.s0, c.s1, *c.h, std::string(what) + ": window")) return false;
+    dense::tp_hand_lower(*c.h);
+    std::vector<uint16_t> g0((size_t) block), g1((size_t) block), p0((size_t) kExch * block), p1((size_t) kExch * block);
+    bool read_ok = true;
+    {
+        const core::OnDevice on(c.dev0);
+        read_ok = read_ok && cuda_ok(what, cudaMemcpy(g0.data(), r0, g0.size() * 2, cudaMemcpyDeviceToHost));
+        read_ok = read_ok && cuda_ok(what, cudaMemcpy(p0.data(), c.x0, p0.size() * 2, cudaMemcpyDeviceToHost));
+    }
+    {
+        const core::OnDevice on(c.dev1);
+        read_ok = read_ok && cuda_ok(what, cudaMemcpy(g1.data(), r1, g1.size() * 2, cudaMemcpyDeviceToHost));
+        read_ok = read_ok && cuda_ok(what, cudaMemcpy(p1.data(), c.x1, p1.size() * 2, cudaMemcpyDeviceToHost));
+    }
+    {
+        const core::OnDevice on(c.dev0);
+        cudaFree(r0);   // each card frees its own rows
+    }
+    {
+        const core::OnDevice on(c.dev1);
+        cudaFree(r1);
+    }
+    if (!read_ok) return false;
+    int wrong = 0, same = 0, moved = 0;
+    for (int64_t i = 0; i < block; ++i) {
+        uint16_t w = resid(i);
+        for (int e = 0; e < kExch; ++e) w = step_resid(w, e, i);
+        if (g0[(size_t) i] != w || g1[(size_t) i] != w) ++wrong;
+        if (g0[(size_t) i] != g1[(size_t) i]) ++same;
+    }
+    for (int64_t i = 0; i < (int64_t) kExch * block; ++i)
+        if (p0[(size_t) i] != c.hp0[(size_t) i] || p1[(size_t) i] != c.hp1[(size_t) i]) ++moved;
+    check(wrong == 0, std::string(what) + ": both cards' residual rows hold the sum of all " + std::to_string(kExch) +
+                           " exchanges, each rounded once");
+    check(same == 0, std::string(what) + ": the pair's residual rows stayed identical to the bit");
+    check(moved == 0, std::string(what) + ": the exchanges left the partials they read alone");
+    return wrong == 0 && same == 0 && moved == 0;
+}
+
 }  // namespace
 
 int main() {
@@ -260,6 +347,7 @@ int main() {
     check(true, "the pair's streams and buffers are there");
     run_case("a full window", c, kRows);
     run_case("a one-row window", c, kNarrow);
+    run_add_case("added into the residual", c, kRows);
     dense::tp_hand_free(c.h);
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;

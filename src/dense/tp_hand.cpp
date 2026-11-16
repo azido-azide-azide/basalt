@@ -61,19 +61,37 @@ uint16_t* tp_block(const TpHand& h, int wrote, int e) {
     return h.slot + ((size_t) wrote * h.exchanges + (size_t) e) * (size_t) kBatch * h.n_embd;
 }
 
-}  // namespace
-
-void tp_allreduce2(const TpHand& h, int rank, int e, uint16_t* partial, int rows, void* s) {
+/// both forms of the all-reduce take the same window row block and the same exchange number
+void tp_check(const TpHand& h, int e, int rows) {
     if (rows <= 0 || rows > kBatch || e < 0 || e >= h.exchanges) {
         basalt::log::error("basalt", "dense: a tensor-parallel exchange of %d rows at number %d of %d does not fit the hand-off",
                            rows, e, h.exchanges);
         std::exit(1);
     }
-    const int64_t values = (int64_t) rows * h.n_embd;   // the row block's BF16 values
+}
+
+/// card `rank`'s half of exchange `e`: its rows into the block its peer reads, its own flag raised to `e` + 1, then the
+/// wait for the peer's flag at that value.  Everything queued after it on `s` reads the peer's block of `e`.
+void tp_send_wait(const TpHand& h, int rank, int e, const uint16_t* partial, int64_t values, void* s) {
     kernels::copy_from_mapped((float*) tp_block(h, rank, e), (const float*) partial, values / 2, s);   // the bytes, as floats
     kernels::signal_flag(h.flag + rank, (uint32_t) e + 1, s);
     kernels::wait_flag_ge(h.flag + (1 - rank), (uint32_t) e + 1, s);
+}
+
+}  // namespace
+
+void tp_allreduce2(const TpHand& h, int rank, int e, uint16_t* partial, int rows, void* s) {
+    tp_check(h, e, rows);
+    const int64_t values = (int64_t) rows * h.n_embd;   // the row block's BF16 values
+    tp_send_wait(h, rank, e, partial, values, s);
     kernels::add_from_mapped_bf16(partial, tp_block(h, 1 - rank, e), values, s);
+}
+
+void tp_allreduce2_add(const TpHand& h, int rank, int e, const uint16_t* partial, uint16_t* x, int rows, void* s) {
+    tp_check(h, e, rows);
+    const int64_t values = (int64_t) rows * h.n_embd;
+    tp_send_wait(h, rank, e, partial, values, s);
+    kernels::add_pair_bf16(x, partial, tp_block(h, 1 - rank, e), values, s);   // the residual gains both partials
 }
 
 void tp_hand_lower(TpHand& h) {

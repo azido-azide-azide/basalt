@@ -145,6 +145,10 @@ void tp_hand_free(TpHand* h);
 /// card's partial.  `e` is the exchange's number in the window (`[0, TpHand::exchanges)`); both cards run the same numbers
 /// in the same order, so a card's write always precedes its wait and the pair cannot wait on each other.
 void tp_allreduce2(const TpHand& h, int rank, int e, uint16_t* partial, int rows, void* s);
+/// The same exchange with the SUM landing added to the card's running residual rows `x` instead of back into `partial`:
+/// `x` gains both cards' partials (added as floats, rounded once), which is where a row-parallel product's result belongs
+/// when the next matrix it feeds is split along its inputs.  `partial` is left as it was; `x` and `partial` must differ.
+void tp_allreduce2_add(const TpHand& h, int rank, int e, const uint16_t* partial, uint16_t* x, int rows, void* s);
 /// Both flags lowered for the next window (both cards are past the last exchange's, as `TpHand` explains).
 void tp_hand_lower(TpHand& h);
 

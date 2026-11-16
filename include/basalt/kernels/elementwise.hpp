@@ -107,6 +107,13 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// aligned, like the copies above; it is a kernel rather than a memcpy for the same reason they are.
 void add_from_mapped_bf16(uint16_t* x, const uint16_t* y, int64_t n, void* stream);
 
+/// `x[i] += own[i] + peer[i]` over `n` BF16 values: the card's running residual row, its OWN partial of it, and the other
+/// card's partial read from MAPPED pinned host memory - the pair's row-parallel product landing added to the residual in
+/// one step.  The three are added as floats and rounded to BF16 ONCE, so the residual keeps the rounding one card's
+/// fused-add epilogue would have given it.  `x` and `own` must differ (one row must not count twice on one card); `n` a
+/// multiple of 8 and all three pointers 16-byte aligned, like the copy above.
+void add_pair_bf16(uint16_t* x, const uint16_t* own, const uint16_t* peer, int64_t n, void* stream);
+
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).  With
