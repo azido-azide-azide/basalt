@@ -100,6 +100,13 @@ void signal_flag(uint32_t* flag, uint32_t value, void* stream);
 /// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
 /// operation, which is submitted separately and costs a flush per node).
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
+
+/// `x[i] += y[i]` over `n` BF16 values, `y` read from MAPPED pinned host memory: the two cards' partial sums of the SAME
+/// rows, adding up to their sum on the card that reads the slot.  The values are summed as floats and rounded to BF16 ONCE,
+/// so a row block crosses the pair with one rounding rather than two.  `n` a multiple of 8 and both pointers 16-byte
+/// aligned, like the copies above; it is a kernel rather than a memcpy for the same reason they are.
+void add_from_mapped_bf16(uint16_t* x, const uint16_t* y, int64_t n, void* stream);
+
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).  With

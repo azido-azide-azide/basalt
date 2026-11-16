@@ -120,6 +120,34 @@ struct SplitHand {
     size_t first_tap = 0;          ///< the first of them among the drafter's target layers
 };
 
+/// The tensor-parallel pair's window hand-off, page-locked and mapped so both cards reach it: one row block per exchange in
+/// each direction, and a flag per direction counting the exchanges that card has put in.  A row-parallel product leaves each
+/// card a PARTIAL of the same rows; `tp_allreduce2` gives each card the sum of the two, which is what its own shard of the
+/// next matrix multiplies.  Every exchange of a window has its own block, which is what makes a card's write safe without
+/// waiting for the peer to have read it: the peer's last signal of a window sits behind its read of every block of that
+/// window, and this card's next window sits behind its own wait for that signal.  The flags hold the exchange's number, so
+/// the waits are fixed at capture and the host lowers both flags between windows - once both cards are past the previous
+/// window's last exchange, which is what keeps a raised flag of a window that has not run yet out of the next one's waits.
+struct TpHand {
+    uint32_t* flag = nullptr;      ///< [0]: the row blocks card 0 has put in; [1]: card 1's
+    uint16_t* slot = nullptr;      ///< [2][exchanges][kBatch][n_embd] BF16: [r] is what card r wrote and the other reads
+    int n_embd = 0;                ///< the width of a row block
+    int exchanges = 0;             ///< the row blocks of one window: two per layer the pair runs
+    void* mem = nullptr;           ///< the page-locked allocation these point into (the host view lowers the flags)
+};
+
+/// The pair's hand-off for `exchanges` row blocks of `n_embd` (two per layer the pair runs), page-locked, mapped, zeroed.
+/// Null with `err` when the memory is not there.
+TpHand* tp_hand_alloc(int n_embd, int exchanges, std::string& err);
+void tp_hand_free(TpHand* h);
+/// One all-reduce of `rows` x `n_embd` BF16 partials across the pair, queued on `s` as card `rank`: this card's rows into the
+/// block its peer reads, its own flag raised to `e` + 1, the peer's awaited at that value, the peer's block added into this
+/// card's partial.  `e` is the exchange's number in the window (`[0, TpHand::exchanges)`); both cards run the same numbers
+/// in the same order, so a card's write always precedes its wait and the pair cannot wait on each other.
+void tp_allreduce2(const TpHand& h, int rank, int e, uint16_t* partial, int rows, void* s);
+/// Both flags lowered for the next window (both cards are past the last exchange's, as `TpHand` explains).
+void tp_hand_lower(TpHand& h);
+
 class Model {
 public:
     Geometry g;

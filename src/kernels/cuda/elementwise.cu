@@ -297,6 +297,32 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     check_launch("copy_from_mapped");
 }
 
+// eight BF16 values to a 16-byte block on both sides: the card's own partial from device memory, the peer's from the mapped
+// slot it wrote.  Summed as floats and rounded once, so the pair's two halves of a row cost one rounding between them.
+__global__ void add_from_mapped_bf16_kernel(uint16_t* __restrict__ x, const volatile uint16_t* y, int64_t n8) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += (int64_t) gridDim.x * blockDim.x) {
+        uint4 a = ((const uint4*) x)[i];
+        const uint4 b = ((const uint4*) y)[i];   // the peer wrote it behind its flag, and this kernel sits behind the wait
+        const uint16_t* from = (const uint16_t*) &a;
+        const uint16_t* add = (const uint16_t*) &b;
+        uint16_t* into = (uint16_t*) &a;
+        for (int q = 0; q < 8; ++q) into[q] = bf16_from_f32(f32_from_bf16(from[q]) + f32_from_bf16(add[q]));
+        ((uint4*) x)[i] = a;
+    }
+}
+
+void add_from_mapped_bf16(uint16_t* x, const uint16_t* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    if ((n & 7) != 0 || ((uintptr_t) x & 15) != 0 || ((uintptr_t) y & 15) != 0) {
+        basalt::log::error("basalt", "add_from_mapped_bf16: n must be a multiple of 8 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    const int64_t n8 = n / 8;
+    const int blocks = (int) ((n8 + 255) / 256 < 64 ? (n8 + 255) / 256 : 64);
+    add_from_mapped_bf16_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(x, y, n8);
+    check_launch("add_from_mapped_bf16");
+}
+
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {
