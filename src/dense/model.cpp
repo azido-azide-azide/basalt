@@ -649,6 +649,17 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
             f.v = f.k + cells;
         }
     }
+    // A row-parallel product leaves its card one PARTIAL of the window's rows; the exchange carries those across the door as
+    // BF16, so the card needs them somewhere of their own - they cannot land in the residual `x` the exchange adds to.
+    if (o.tp_cards > 1) {
+        void* p = nullptr;
+        if (cudaMalloc(&p, (size_t) kBatch * m->cg.n_embd * sizeof(uint16_t)) != cudaSuccess) {
+            err = o.arch + ": out of device memory for the tensor-parallel partials";
+            return nullptr;
+        }
+        m->owned.push_back(p);
+        m->tp_partial = (uint16_t*) p;
+    }
     if (!decode_drafter(*m, err)) return nullptr;
     if (!m->ready_products(err) || cudaDeviceSynchronize() != cudaSuccess) {
         if (err.empty()) err = o.arch + ": readying the products failed";

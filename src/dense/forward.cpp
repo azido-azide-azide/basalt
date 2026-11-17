@@ -149,8 +149,21 @@ void prod_group(Model& m, const float* x, const void* xq, int type, std::initial
         prod(m, *o.l, xq, o.y, T, s);
     }
 }
-// x [T][rows] += scale W y into the BF16 residual (the add in fp32, rounded once; in the window gemm's epilogue)
+// x [T][rows] += scale W y into the BF16 residual (the add in fp32, rounded once; in the window gemm's epilogue).
+// On a tensor-parallel pair this is where the row-parallel products are: `l`'s rows are full width (`n_embd` - the residual,
+// which a pair never cuts) while its columns are the card's own heads' or its own share of the intermediate, so the product
+// is a PARTIAL of the rows the next layer needs at full width. The pair's hand-off turns it into the sum: this card's partial
+// across the door, its peer's back, and the SUM added into `x` - which is one exchange, numbered by the order the cards reach
+// it in (window_layers resets the counter; both cards run the same layers in the same order, so the numbers agree by
+// construction, and a captured window bakes them, which is what lets the waits be inside the graph).
 void prod_add(Model& m, const Linear& l, const void* yq, uint16_t* x, int T, cudaStream_t s) {
+    if (m.tp_hand) {
+        float* part = m.ws.tmp;   // these products all have n_embd columns, which is what `tmp` is sized for
+        prod(m, l, yq, part, T, s);
+        wg::pack(part, l.rows, l.rows, T, m.tp_partial, s);
+        tp_allreduce2_add(*m.tp_hand, m.o.tp_rank, m.tp_exchange++, m.tp_partial, x, T, s);
+        return;
+    }
     if (on_wg(l.type)) {
         wg::Call c = wcall(l, wg::Epilogue::AddBf16);
         c.m[0] = wmat(l, nullptr);
@@ -617,6 +630,7 @@ void window_layers(Model& m, int rows, float* dacc, LayerFn layer, cudaStream_t 
     const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const SplitHand* h = m.hand;
+    m.tp_exchange = 0;   // the pair numbers a window's exchanges by the order its layers reach them in
     const int64_t half = (int64_t) rows * g.n_embd / 2;   // the rows' BF16 values, as floats for the mapped copies
     const size_t slot = (size_t) kBatch * g.n_embd;
     const BlockDrafter& bd = m.bd_dec;
@@ -814,6 +828,7 @@ namespace {
 // captured once per composition (the sessions and their row counts) and replayed at any positions.
 void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
     const Geometry& g = m.cg;
+    m.tp_exchange = 0;   // as in window_layers: the pair numbers a window's exchanges in the order its layers reach them
     const Weights& w = m.w;
     WindowScratch& b = m.ws;
     const cudaStream_t s = segs[0].st->stream;

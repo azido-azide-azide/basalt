@@ -224,6 +224,8 @@ public:
     Geometry cg;                                 // the widths THIS card runs (== g unless it is one card of a pair)
     TpHand* tp_hand = nullptr;                   // the pair's row-block hand-off (null: no pair)
     uint16_t* tp_partial = nullptr;              // a window row block's BF16 partials awaiting their exchange
+    int tp_exchange = 0;                         // the exchange number the NEXT row-parallel product of this window is
+
     bool owns_drafter() const { return o.tp_cards <= 1 || o.tp_rank == 0; }
     StagePtr line;                               // the prompt line: a second card reading long prompts' last layers (null: none)
     StagePtr split;                              // the layer split's second card: layers [le, n) (null: none)
