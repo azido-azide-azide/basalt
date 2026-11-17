@@ -128,6 +128,10 @@ struct Options {
     /// The layers this card holds and runs, [layer_begin, layer_end) (layer_end 0: to the last); its sessions keep the cells
     /// and recurrent state of those layers only.
     int layer_begin = 0, layer_end = 0;
+    /// The tensor-parallel pair: this model is card `tp_rank` of `tp_cards` (tp_cards 1: no pair, the whole model on one
+    /// card).  Unlike the layer split, a pair cuts EVERY layer across the cards, so each card holds a slice of every layer's
+    /// weights and runs a NARROWER model - `Model::cg` is the geometry of the widths it actually runs.
+    int tp_rank = 0, tp_cards = 1;
     core::FileRange mmproj;             ///< the vision projector (vision/mmproj)
     std::string arch;                   ///< the architecture name, for messages
 };

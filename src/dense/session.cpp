@@ -1,6 +1,7 @@
 // src/dense/session.cpp - a conversation of the dense stack as a model::ModelSession.
 #include "internal.hpp"
 
+#include "basalt/dense/tp_geometry.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/logprobs.hpp"
@@ -27,7 +28,9 @@ Result fail(const std::string& m) { return {Status::Error, m}; }
 // One session's device state on the card of model `m` (its layers' cells and recurrent state; on the card that holds layer 0
 // also the logits, the picks and the drafter's state), on the current device.
 bool init_state(Model& m, SessionState& st, std::string& err) {
-    const Geometry& g = m.g;
+    // The card's own widths: with a tensor-parallel pair a session holds only this card's key-value cells and only its
+    // delta-net key-head group's state, and the widths `cg` carries are exactly those slices (tp_geometry.hpp).
+    const Geometry& g = m.cg;
     if (cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&st.side, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&st.fork, cudaEventDisableTiming) != cudaSuccess ||
@@ -36,7 +39,8 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         return false;
     }
     // the drafter's state, the logits and the picks on the card that holds layer 0
-    const bool head = m.lb == 0, mtp = head && m.o.drafter == Drafter::Mtp, block = head && m.o.drafter == Drafter::Block;
+    const bool head = m.lb == 0, mtp = head && m.o.drafter == Drafter::Mtp,
+               block = head && m.owns_drafter() && m.o.drafter == Drafter::Block;
     size_t blockbytes = 0;
     if (block) {
         const BlockDrafter& bd = m.w.dflash;
@@ -50,7 +54,7 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         return false;
     }
     const size_t C = (size_t) g.conv_channels(), HV = (size_t) g.gdn_v_heads;
-    st.gdn_floats = (size_t) g.gdn_state * HV * g.gdn_state + C * 3;
+    st.gdn_floats = tp_gdn_state_floats(m.g, m.o.tp_cards, m.o.tp_rank, 3);   // == g.gdn_state * HV * g.gdn_state + C * 3
     const size_t ng = (size_t) m.n_gdn;
     if (ng) {
         st.gdn = st.gdn_first = st.arena.take<float>(ng * st.gdn_floats);

@@ -1,6 +1,7 @@
 // src/dense/model.cpp - the dense stack's shared scratch and geometry checks.
 #include "internal.hpp"
 
+#include "basalt/dense/tp_geometry.hpp"
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
@@ -423,7 +424,7 @@ bool Model::ready_products(std::string& err) {
 
 bool Model::ensure_chunk(std::string& err) {
     if (chunk_ready) return true;
-    const Geometry& gg = g;
+    const Geometry& gg = cg;   // the prompt chunks are as wide as this card's products
     if (!pre_arena.reserve(chunk_bytes(gg))) {
         err = o.arch + ": out of device memory for the prompt workspaces";
         return false;
@@ -509,6 +510,24 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         m->gdn_index.push_back(here && k == Mixer::Gdn ? m->n_gdn++ : -1);
         m->attn_index.push_back(here && k == Mixer::Attention ? m->n_attn++ : -1);
     }
+    // The card's own widths.  A pair cuts every layer, so a card runs the SAME layer code as a smaller model: its query
+    // and key-value heads, its delta-net key-head group and its intermediate width are `tp_cards`-th of the model's, and
+    // every buffer it sizes for itself comes from `cg` from here on.  Refused here rather than approximated: a head, a
+    // delta-net key-head group or an NVFP4 block that does not share out whole is not something the loader can place.
+    m->cg = g;
+    if (o.tp_cards > 1) {
+        std::string e;
+        if (!tp_card_geometry(g, o.tp_cards, o.tp_rank, m->cg, e)) {
+            err = o.arch + ": " + e;
+            return nullptr;
+        }
+        if (!m->owns_drafter())
+            basalt::log::info("basalt dense", "tensor parallel card %d: the block drafter runs on card %d alone", o.tp_rank, 0);
+        basalt::log::info("basalt dense",
+                          "tensor parallel card %d of %d runs %d query heads, %d key-value heads, %d delta-net key heads "
+                          "(of %d), intermediate %d of %d",
+                          o.tp_rank, o.tp_cards, m->cg.n_head, m->cg.n_kv, m->cg.gdn_k_heads, g.gdn_k_heads, m->cg.n_ff, g.n_ff);
+    }
     if (o.vision) {   // the projector stays in page-locked RAM; each request's pictures take it to the card
         m->mmproj = std::make_unique<vision::Mmproj>();
         m->encoder = std::make_unique<vision::CudaEncoder>();
@@ -528,39 +547,43 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         basalt::log::info("basalt dense", "image encoder: %.2f GiB staged in page-locked RAM, on the card per request",
                           (double) m->encoder->weights_bytes() / 1073741824.0);
     }
-    if (!m->dec_arena.reserve(window_bytes(g, o.drafter == Drafter::Block ? w.dflash : BlockDrafter{}, o.max_context))) {
+    const BlockDrafter& bd_of = o.drafter == Drafter::Block ? w.dflash : BlockDrafter{};
+    if (!m->dec_arena.reserve(window_bytes(m->cg, m->owns_drafter() ? bd_of : BlockDrafter{}, o.max_context))) {
         err = o.arch + ": out of device memory for the decode scratch";
         return nullptr;
     }
-    const size_t W = kBatch, H = (size_t) g.n_embd, AQ = (size_t) g.n_head * g.head_dim, KV = (size_t) g.n_kv * g.head_dim;
+    const Geometry& card = m->cg;   // the widths this card runs; `g` stays for the vocabulary-wide buffers
+    const size_t W = kBatch, H = (size_t) card.n_embd, AQ = (size_t) card.n_head * card.head_dim,
+                 KV = (size_t) card.n_kv * card.head_dim;
     WindowScratch& b = m->ws;
     Arena& a = m->dec_arena;
     b.x = a.take<uint16_t>(W * H);
     b.xn = a.take<float>(W * H);
     b.tmp = a.take<float>(W * H);
     b.dacc = a.take<float>(W * H);
-    b.xq = a.take_bytes(act_slot(g));
-    b.hq = a.take_bytes(act_slot(g));
-    b.x8 = a.take_bytes(q8_slot(g));
-    wgemm_need(g, b.w8.partial_floats, b.w8.tickets_n);
+    b.xq = a.take_bytes(act_slot(card));
+    b.hq = a.take_bytes(act_slot(card));
+    b.x8 = a.take_bytes(q8_slot(card));
+    wgemm_need(card, b.w8.partial_floats, b.w8.tickets_n);
     b.w8.partial = a.take<float>(std::max<size_t>(b.w8.partial_floats, 1));
     b.w8.tickets = a.take<int32_t>(std::max<size_t>(b.w8.tickets_n, 1));   // zero: the arena is cleared below
-    b.z = a.take<float>(W * g.value_width());
+    b.z = a.take<float>(W * card.value_width());
     b.qfull = a.take<float>(W * 2 * AQ);
     b.k = a.take<float>(W * KV);
     b.v = a.take<float>(W * KV);
     b.qo = a.take<float>(W * AQ);
     b.ao = a.take<float>(W * AQ);
     b.ag = a.take<float>(W * AQ);
-    b.g = a.take<float>(W * g.n_ff);
-    b.u = a.take<float>(W * g.n_ff);
-    b.h = a.take<float>(W * g.n_ff);
-    if (g.attn_layers() > 0) b.attn = a.take<float>(kernels::gqa_decode_scratch_floats(o.max_context, kWindow, g.n_head));
+    b.g = a.take<float>(W * card.n_ff);
+    b.u = a.take<float>(W * card.n_ff);
+    b.h = a.take<float>(W * card.n_ff);
+    if (card.attn_layers() > 0)
+        b.attn = a.take<float>(kernels::gqa_decode_scratch_floats(o.max_context, kWindow, card.n_head));
     b.tok = a.take<int32_t>(W);
     b.pos = a.take<int32_t>(W * 3);
     b.cat = a.take<float>(W * 2 * H);
     b.lp_scratch = a.take<float>(kernels::row_logprobs_scratch_floats(kWindow, g.n_vocab));
-    if (o.drafter == Drafter::Block) {
+    if (o.drafter == Drafter::Block && m->owns_drafter()) {
         const BlockDrafter& bd = w.dflash;
         const size_t AQd = (size_t) bd.n_head * bd.head_dim, KVd = (size_t) bd.n_kv * bd.head_dim;
         b.bq = a.take<float>(W * AQd);
@@ -575,14 +598,14 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         b.bpos = a.take<int32_t>(W * 3);
         b.battn = a.take<float>(kernels::gqa_decode_scratch_floats(bd.window + 256, kWindow, bd.n_head, bd.head_dim));
     }
-    b.y = a.take<float>(W * g.value_width());
+    b.y = a.take<float>(W * card.value_width());
     b.hl = a.take<float>(W * (size_t) g.n_vocab);
     b.iota = a.take<int32_t>(W);
     b.bounds = a.take<int32_t>(2);
     b.pos0 = a.take<int32_t>(2);
-    if (g.gdn_layers() > 0) {
-        b.rq = a.take<float>(W * (size_t) g.conv_channels());
-        b.gab = a.take<float>(2 * W * (size_t) g.gdn_v_heads);
+    if (card.gdn_layers() > 0) {
+        b.rq = a.take<float>(W * (size_t) card.conv_channels());
+        b.gab = a.take<float>(2 * W * (size_t) card.gdn_v_heads);
         if (cudaStreamCreateWithFlags(&m->gate_side, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->gate_fork, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&m->gate_join, cudaEventDisableTiming) != cudaSuccess) {

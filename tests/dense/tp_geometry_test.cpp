@@ -4,6 +4,7 @@
 // adding back to the model's, each card's delta-net being gdn_head_split.hpp's smaller layer of its key-head group, and
 // a card's geometry still being one the shared kernels take.  Host only - no device, no pack.
 #include "basalt/dense/tp_geometry.hpp"
+#include "tp_test_model.hpp"
 
 #include <cstdio>
 #include <string>
@@ -20,29 +21,6 @@ void check(bool ok, const std::string& what) {
     if (!ok) ++failures;
 }
 
-// Qwen3.8-27B as its pack's metadata gives it
-Geometry model() {
-    Geometry g;
-    g.n_layers = 64;
-    g.n_embd = 5120;
-    g.n_ff = 17408;
-    g.n_vocab = 248320;
-    g.n_head = 24;
-    g.n_kv = 4;
-    g.head_dim = 256;
-    g.gdn_state = 128;
-    g.gdn_k_heads = 16;
-    g.gdn_v_heads = 48;
-    g.gdn_conv = 4;
-    g.rope.rot = 64;
-    g.rope.theta = 1.0e7f;
-    g.eps = 1e-6f;
-    g.kinds.assign((size_t) g.n_layers, basalt::dense::Mixer::Gdn);
-    for (int l = 3; l < g.n_layers; l += 4) g.kinds[(size_t) l] = basalt::dense::Mixer::Attention;
-    g.context_length = 262144;
-    return g;
-}
-
 // what Geometry::check() asks of the widths and head grouping, without the kernels' own tables (which the device test
 // covers): a card's geometry must keep passing these, or a card could not run the shared layer kernels.
 bool widths_ok(const Geometry& g) {
@@ -56,7 +34,7 @@ bool widths_ok(const Geometry& g) {
 }  // namespace
 
 int main() {
-    const Geometry g = model();
+    const Geometry g = basalt::dense::tp_test::qwen38_27b();
     std::string err;
 
     // one card holds the model as it is

@@ -154,7 +154,7 @@ void tp_hand_lower(TpHand& h);
 
 class Model {
 public:
-    Geometry g;
+    Geometry g;                                  // the model's own widths (what the pack describes)
     Weights w;
     Options o;
     Arena dec_arena, pre_arena;
@@ -189,6 +189,15 @@ public:
     std::vector<void*> owned;                    // device buffers the model allocated (Q8 plane copies, a wider workspace)
     void* enc_arena = nullptr;
     size_t enc_bytes = 0;
+    // The tensor-parallel pair.  Each card runs EVERY layer at `tp_cards`-th of the head and intermediate widths, so
+    // everything the card sizes for itself - its scratch, its K/V cells, its delta-net state, its products' rows - comes
+    // from `cg`, and the layer bodies read `cg` instead of `g` (`cg == g` with no pair).  The vocabulary keeps its full
+    // width in `cg`: the head's rows split out by `tp_head_rows`, and card 0's logits hold every row once the pair
+    // gathers them.  The block drafter belongs to card 0 alone (M1's placement), so only that card sizes for it.
+    Geometry cg;                                 // the widths THIS card runs (== g unless it is one card of a pair)
+    TpHand* tp_hand = nullptr;                   // the pair's row-block hand-off (null: no pair)
+    uint16_t* tp_partial = nullptr;              // a window row block's BF16 partials awaiting their exchange
+    bool owns_drafter() const { return o.tp_cards <= 1 || o.tp_rank == 0; }
     StagePtr line;                               // the prompt line: a second card reading long prompts' last layers (null: none)
     StagePtr split;                              // the layer split's second card: layers [le, n) (null: none)
     SplitHand* hand = nullptr;                   // the layer split's decode hand-off, on both cards' models (null: none)
