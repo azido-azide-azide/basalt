@@ -358,7 +358,7 @@ bool TpMailbox::exchange_f32(int rank, size_t slot, float* partial, uint16_t* bf
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_f32_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-        static_cast<Vec*>(partial), reinterpret_cast<uint2*>(bf16_out), s.payload[rank],
+        reinterpret_cast<Vec*>(partial), reinterpret_cast<uint2*>(bf16_out), s.payload[rank],
         s.flags[rank], s.payload[1 - rank], s.flags[1 - rank], s.epochs[rank], hang_,
         static_cast<int>(vecs));
     if (cudaGetLastError() != cudaSuccess) {
