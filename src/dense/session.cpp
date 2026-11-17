@@ -180,7 +180,7 @@ namespace {
 
 class Session final : public model::ModelSession {
 public:
-    explicit Session(Model& m) : m_(m), g_(m.g) {}
+    explicit Session(Model& m) : m_(m), g_(m.cg) {}  // the card's widths: a pair's session holds only its heads' cells
     ~Session() override {
         st_.peer.reset();
         free_state(st_);

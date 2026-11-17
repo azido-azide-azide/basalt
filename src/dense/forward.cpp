@@ -38,6 +38,9 @@ namespace wg = kernels::wgemm;
 // window's rows (up to kBatch) and which applies the tensor scale; others (the drafters' Q8_0) on MMQ with the tile of
 // kNarrow or kBatch rows whatever the window's rows (activations quantized for the whole tile, the bounds {0, T} saying
 // which rows are written), the scale applied after.  The window gemm's activations go to m.ws.xq, MMQ's to m.ws.x8.
+// A card of a tensor-parallel pair runs the SAME layer code at `tp_cards`-th of the head and intermediate widths, so every
+// width a kernel indexes its buffers with comes from m.cg - the widths THIS card runs (`cg == g` unless it is one of a pair;
+// cg keeps n_vocab and n_layers model-wide, since the pair gathers the vocabulary and cuts matrices, not layers).
 bool on_wg(int type) { return type == kTypeF8 || type == kTypeNvfp4Planes || type == kTypeQ8P; }
 // the scale the step after a prompt chunk product applies: an NVFP4 matrix's on MMQ (its product leaves it out), none after
 // F8 and NVFP4 planes (their products apply it)
@@ -46,7 +49,7 @@ int mmq_tile(int T) { return T <= kNarrow ? kNarrow : kBatch; }
 // the vocabulary rows the block drafter's head scores: the first kDraftVocab when the head is in planes or F8, else all
 int64_t draft_vocab(const Model& m) {
     const Linear& hd = m.w.head;
-    return (hd.type == kTypeNvfp4Planes || hd.type == kTypeF8) && hd.rows > kDraftVocab ? kDraftVocab : m.g.n_vocab;
+    return (hd.type == kTypeNvfp4Planes || hd.type == kTypeF8) && hd.rows > kDraftVocab ? kDraftVocab : m.cg.n_vocab;
 }
 
 // rows 0..T-1 of x readied for products of `type`
@@ -80,7 +83,7 @@ const void* wnorm(Model& m, const uint16_t* x, const float* w, float* xn, int ty
 }
 // the window's first rows: the embedding (BF16 in the pack) into the BF16 residual, exactly
 void embed_rows(Model& m, const int32_t* tok, int T, cudaStream_t s) {
-    const int H = m.g.n_embd;
+    const int H = m.cg.n_embd;
     kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, tok, T, H, m.ws.tmp, s);
     kernels::to_bf16(m.ws.tmp, m.ws.x, (int64_t) T * H, s);
 }
@@ -233,7 +236,7 @@ void text_positions(std::vector<int32_t>& p3, int T, int64_t pos, int64_t delta)
 // the gated attention output's product: gate, ready and add into the residual rows (on the window gemm the attention
 // merge left the gated bf16 rows in m.ws.xq)
 void win_attn_out(Model& m, const Layer& L, int T, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const void* yq;
     if (on_wg(L.o.type)) {
@@ -247,7 +250,7 @@ void win_attn_out(Model& m, const Layer& L, int T, cudaStream_t s) {
 
 // a GDN layer's recurrence arguments but its rows and state (the window's: the qkv rows, b.xn, b.z in, b.y out)
 kernels::DecRecArgs gdn_args(Model& m, const Layer& L) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
     kernels::DecRecArgs a;
@@ -273,7 +276,7 @@ kernels::DecRecArgs gdn_args(Model& m, const Layer& L) {
 
 void win_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
               kernels::KvInt8 q8 = {}, kernels::KvFar far_kv = {}) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, T, g.eps, s);
@@ -287,7 +290,7 @@ void win_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64
 }
 
 void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const int H = g.n_embd, C = g.conv_channels();
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.qkv.type, H, T, g.eps, s);
@@ -306,7 +309,7 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
 }
 
 void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
     const void* xq = wnorm(m, b.x, L.ffn_norm, b.xn, L.gate.type, H, T, g.eps, s);
@@ -368,7 +371,7 @@ void chunk_residual_fp4(Model& m, const Linear& l, const uint16_t* a, const floa
 void stage_rows(Model& m, const kernels::KvFar& far_kv, int64_t r0, int64_t r1, cudaStream_t s) {
     if (r1 <= r0) return;
     const kernels::KvFar& st = m.stage;
-    const size_t row = (size_t) m.g.n_kv * m.g.head_dim, o = (size_t) r0 * row, n = (size_t) (r1 - r0) * row;
+    const size_t row = (size_t) m.cg.n_kv * m.cg.head_dim, o = (size_t) r0 * row, n = (size_t) (r1 - r0) * row;
     if (far_kv.q8.k) {
         cudaMemcpyAsync(st.q8.k + o, far_kv.q8.k + o, n, cudaMemcpyHostToDevice, s);
         cudaMemcpyAsync(st.q8.v + o, far_kv.q8.v + o, n, cudaMemcpyHostToDevice, s);
@@ -403,7 +406,7 @@ kernels::KvFar stage_far(Model& m, const kernels::KvFar& far_kv, int64_t pos, in
 // streamed cache's far cells (the chunk's rows are written there and read from the stage; stage_prefetch has run).
 void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
                 kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far_kv = {}) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim;
     const bool f8 = all_f8({&L.q, &L.k, &L.v, &L.o}), nvfp4 = all_nvfp4({&L.q, &L.k, &L.v, &L.o});
@@ -478,7 +481,7 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
 }
 
 void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, VD = g.value_width(), HV = g.gdn_v_heads;
     float* state = st.gdn + (size_t) gi * st.gdn_floats;
@@ -525,7 +528,7 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
 
 
 void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
     if (L.gate.type == kTypeNvfp4Planes && L.up.type == kTypeNvfp4Planes && L.down.type == kTypeNvfp4Planes) {
@@ -560,7 +563,7 @@ kernels::RopeSpec block_rope(const BlockDrafter& bd) {
 
 // The drafter's input rows: cat[t] = [norm_e(embedding) | norm_h(hidden)] into x via fc (window or chunk scratch).
 void mtp_input(Model& m, const float* emb, const float* hid, float* cat, int n, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     const Mtp& d = m.w.mtp;
     const int H = g.n_embd;
     kernels::rms_norm_rows(emb, d.norm_e, cat, n, H, g.eps, s, 2 * H);
@@ -570,7 +573,7 @@ void mtp_input(Model& m, const float* emb, const float* hid, float* cat, int n, 
 }  // namespace
 
 void commit_window(Model& m, SessionState& st, int n, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     const int C = g.conv_channels();
     if (m.n_gdn == 0 || n <= 0) return;
     cudaMemcpyAsync(st.n_keep, &n, sizeof(int32_t), cudaMemcpyHostToDevice, s);
@@ -603,7 +606,7 @@ void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cud
         xq = wact(m, m.ws.tmp, fc.type, fc.cols, T, s);
     }
     prod(m, fc, xq, j == 0 ? dacc : m.ws.tmp, T, s);
-    if (j > 0) kernels::add_scaled(dacc, m.ws.tmp, nullptr, (int64_t) T * m.g.n_embd, s);
+    if (j > 0) kernels::add_scaled(dacc, m.ws.tmp, nullptr, (int64_t) T * m.cg.n_embd, s);
 }
 
 // A window's layers [m.lb, m.le) of `rows` rows in m.ws.x, the drafter's features of its target layers into `dacc`; on a layer
@@ -611,7 +614,7 @@ void win_tap(Model& m, size_t j, const uint16_t* rows16, float* dacc, int T, cud
 // card (the main card's), each card raising the other's flag (SplitHand).  `layer` runs one layer.
 template <class LayerFn>
 void window_layers(Model& m, int rows, float* dacc, LayerFn layer, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const SplitHand* h = m.hand;
     const int64_t half = (int64_t) rows * g.n_embd / 2;   // the rows' BF16 values, as floats for the mapped copies
@@ -647,7 +650,7 @@ void window_layers(Model& m, int rows, float* dacc, LayerFn layer, cudaStream_t 
 // The window's work on the device, all of it from device inputs (tokens, positions, rows, first cell), so it can be
 // captured once per row count and replayed at any position.
 void window_body(Model& m, SessionState& st, int T, int64_t pos) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     const Weights& w = m.w;
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
@@ -739,7 +742,7 @@ namespace {
 int32_t* batch_pos0(Model& m) { return reinterpret_cast<int32_t*>(reinterpret_cast<char*>(m.ws.btab) + offsetof(BatchTable, pos0)); }
 
 void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, int rows, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, rows, g.eps, s);
@@ -771,7 +774,7 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
 }
 
 void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, int rows, int max_n, cudaStream_t s) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const int H = g.n_embd, C = g.conv_channels();
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.qkv.type, H, rows, g.eps, s);
@@ -810,7 +813,7 @@ namespace {
 // The batch window's work on the device, all of it from device inputs (tokens, positions, the segment table), so it can be
 // captured once per composition (the sessions and their row counts) and replayed at any positions.
 void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     const Weights& w = m.w;
     WindowScratch& b = m.ws;
     const cudaStream_t s = segs[0].st->stream;
@@ -915,7 +918,7 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
 
 void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, const int32_t* pos3,
                  const int32_t* bounds) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     ChunkScratch& b = m.cs;
     const cudaStream_t s = st.stream;
     const int H = g.n_embd;
@@ -936,7 +939,7 @@ void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float*
 }
 
 void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     const Weights& w = m.w;
     const cudaStream_t s = st.stream;
     // A chunk gives no logits (a prompt's last token runs as a decode window), so the last layer's rows are read only by
@@ -979,7 +982,7 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
 void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j) {
     ChunkScratch& b = m.cs;
     const cudaStream_t s = st.stream;
-    const int H = m.g.n_embd;
+    const int H = m.cg.n_embd;
     const Linear& fc = taps.fc[j];
     kernels::to_f32(residual(b), b.xn, (int64_t) T * H, s);   // the target layer's rows for the drafter's fc
     chunk_act(m, b.xn, fc.type, H, T, s);
@@ -991,7 +994,7 @@ void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64
     const BlockDrafter& bd = m.w.dflash;
     ChunkScratch& b = m.cs;
     const cudaStream_t s = st.stream;
-    const int H = m.g.n_embd;
+    const int H = m.cg.n_embd;
     kernels::rms_norm_rows(dacc, bd.hidden_norm, b.xn, n, H, bd.eps, s);
     chunk_act(m, b.xn, bd.layers[0].k.type, H, n, s);
     std::vector<int32_t> p3;
@@ -1008,7 +1011,7 @@ void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64
 }
 
 bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& err) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     const Weights& w = m.w;
     ChunkScratch& b = m.cs;
     const cudaStream_t s = st.stream;
@@ -1033,7 +1036,7 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
     if (m.split) return split_chunk(m, st, tokens, rows, T, pos, pos3, err);
     if (!m.ensure_chunk(err)) return false;
     chunk_start(m, st, tokens, rows, T, pos3);
-    chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
+    chunk_layers(m, st, T, pos, 0, m.cg.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
     return chunk_finish(m, st, T, pos, err);
 }
 
@@ -1041,7 +1044,7 @@ bool block_ctx_window(Model& m, SessionState& st, int n, int64_t pos, std::strin
     const BlockDrafter& bd = m.bd_dec;
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
-    const int H = m.g.n_embd;
+    const int H = m.cg.n_embd;
     const int32_t bounds[2] = {0, n};
     cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
     std::vector<int32_t> p3;
@@ -1066,7 +1069,7 @@ bool block_draft(Model& m, SessionState& st, int32_t anchor, int64_t pos, int wi
 bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchors, const int64_t* pos, const int* widths, int S,
                        std::string& err, cudaStream_t stream) {
     const BlockDrafter& bd = m.bd_dec;
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     WindowScratch& b = m.ws;
     const cudaStream_t s = stream ? stream : sts[0]->stream;
     const int H = g.n_embd, AQ = bd.n_head * bd.head_dim, KV = bd.n_kv * bd.head_dim;
@@ -1178,7 +1181,7 @@ bool block_draft_batch(Model& m, SessionState* const* sts, const int32_t* anchor
 
 bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok, const float* emb, int n, int64_t c0,
                std::string& err) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     const Mtp& d = m.w.mtp;
     ChunkScratch& b = m.cs;
     const cudaStream_t s = st.stream;
@@ -1201,7 +1204,7 @@ bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok,
 
 bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok, int n, int64_t c0, float* out,
                 float* lp_row, std::string& err) {
-    const Geometry& g = m.g;
+    const Geometry& g = m.cg;
     const Mtp& d = m.w.mtp;
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
