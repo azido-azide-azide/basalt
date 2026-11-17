@@ -367,10 +367,13 @@ public:
             // The second card as a model of its own: its scratch, its prompt chunks, the hand-off its products write into, and
             // the door open both ways - so what this load has reserved is the pair's real footprint, not an estimate of it.
             if (!dense::attach_tp_pair(*model_, req.peer_devices.front(), peer_w, err)) return false;
-            // What still keeps it from serving is the prompt line: a chunk is kChunk rows and the hand-off's row blocks are
-            // kBatch, so the pair's prompt exchanges need those blocks reused across row groups. The decode window is wired.
-            err = "qwen35: the pair is up on both cards; a prompt's exchanges do not fit the hand-off's row blocks yet";
-            return false;
+            // What the pair runs, said at the boot instead of found mid-serve: a prompt's rows cross the hand-off one row
+            // group at a time (its ONE prompt block, refilled under the produce/consume counters), and a window is ONE
+            // session's - the batched window, several sessions' rows in a single launch, has no second-card launch yet and
+            // refuses there.
+            basalt::log::info("basalt qwen35",
+                              "tensor parallel %d: a prompt's rows cross the hand-off in row groups, and the pair runs one "
+                              "session's window at a time", tp_);
         }
         if (split_at_ > 0) return dense::attach_split(*model_, req.peer_devices.front(), split_at_, peer_w, err);
         if (!req.peer_devices.empty()) prompt_line(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);

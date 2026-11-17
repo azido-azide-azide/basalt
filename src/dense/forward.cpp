@@ -8,6 +8,7 @@
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/log.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
@@ -158,10 +159,19 @@ void prod_group(Model& m, const float* x, const void* xq, int type, std::initial
 // construction, and a captured window bakes them, which is what lets the waits be inside the graph).
 void prod_add(Model& m, const Linear& l, const void* yq, uint16_t* x, int T, cudaStream_t s) {
     if (m.tp_hand) {
+        // A row-parallel product of the pair: this card's partial of the rows, then the sum lands in the residual.  The
+        // window's rows (<= kBatch) go through their own block per exchange; a prompt chunk's cannot - kChunk rows of
+        // n_embd is 40 MiB and a chunk has two products per layer - so they cross one block, group by group, refilled
+        // under the hand-off's produce/consume counters.  `tmp` is the product's output either way: it is T x n_embd.
         float* part = m.ws.tmp;   // these products all have n_embd columns, which is what `tmp` is sized for
         prod(m, l, yq, part, T, s);
-        wg::pack(part, l.rows, l.rows, T, m.tp_partial, s);
-        tp_allreduce2_add(*m.tp_hand, m.o.tp_rank, m.tp_exchange++, m.tp_partial, x, T, s);
+        if (T <= kBatch) {
+            wg::pack(part, l.rows, l.rows, T, m.tp_partial, s);
+            tp_allreduce2_add(*m.tp_hand, m.o.tp_rank, m.tp_exchange++, m.tp_partial, x, T, s);
+        } else {
+            wg::pack(part, l.rows, l.rows, T, m.tp_chunk_partial, s);
+            tp_allreduce2_add_grouped(*m.tp_hand, m.o.tp_rank, m.tp_seq, m.tp_chunk_partial, x, T, kChunkGroup, s);
+        }
         return;
     }
     if (on_wg(l.type)) {
@@ -682,7 +692,26 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
         win_ffn(m, L, T, s);
     }, s);
     if (m.lb > 0) return;   // the second card of a split has no head
-    prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, T, g.eps, s), st.logits, T, s);
+    const void* const xnh = wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, T, g.eps, s);
+    if (m.tp_hand) {
+        // The pair's head: every card scores the vocabulary rows ITS shard holds, into a compact block of its own, and card
+        // 0 - which is where the sampler looks - assembles the row of both blocks.  The two scores run on two streams, so
+        // they meet on the flags first (the step's last exchange number); after that card 0 reads its peer's block across
+        // the door, which is what `tp_head_place` costs 34.7 us a row for sixteen rows.  A card whose door the driver
+        // refused would have to send that block through the hand-off's page-locked memory instead - the pair boots only with
+        // the door open (attach_tp_pair), so that fallback is not wired, and saying so here beats discovering it later.
+        prod(m, w.head, xnh, b.hl, T, s);
+        tp_meet(*m.tp_hand, m.o.tp_rank, m.tp_exchange++, s);
+        if (m.o.tp_rank) return;   // card 1 scored its shard; the row it belongs to is card 0's to assemble
+        std::string e;
+        const int64_t mine = m.w.head.rows, theirs = m.tp_model->w.head.rows;
+        TpHead own{st.logits, b.hl, (int) g.n_vocab, (int) mine, 0, (int) mine};
+        TpHead pr{st.logits, m.tp_model->ws.hl, (int) g.n_vocab, (int) theirs, (int) mine, (int) theirs};
+        if (!tp_head_place(own, T, s, e) || !tp_head_place(pr, T, s, e))
+            basalt::log::error("basalt dense", "pair head: %s", e.c_str());   // the refusals are for shapes this cannot make
+        return;
+    }
+    prod(m, w.head, xnh, st.logits, T, s);
     if (st.hid) cudaMemcpyAsync(st.hid, b.xn, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);   // the drafter's
 }
 
@@ -745,6 +774,22 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
         lower_flags(*m.hand);
         const core::OnDevice on(m.split_dev);
         if (!launch_window(*m.split_model, *st.peer, nullptr, T, pos, pos3, err)) return false;
+    }
+    if (m.tp_model && m.tp_hand) {
+        // The pair's second card, first: its graph's exchanges wait on the same flags as this card's, so the order the two
+        // cards queue in does not matter - but its lowering does.  One step numbers its exchanges from 1, and the flags come
+        // down here, the head of the step: the same point the layer split lowers its own at, and safe for the same reason -
+        // the step loop reads every step's token back before it asks for the next, so both cards are idle at this moment.
+        tp_hand_lower(*m.tp_hand);
+        for (Model* c : {&m, m.tp_model}) {
+            c->tp_exchange = 0;
+            c->tp_seq = 0;
+        }
+        // The tokens go to BOTH cards, unlike a layer split's second card (which gets the rows handed to it and never sees
+        // a token id): each card embeds the same ids, because the embedding table is page-locked host memory read once for
+        // both cards - the adapter's own words at its load - and each then runs its own heads over the same rows.
+        const core::OnDevice on(m.tp_dev);
+        if (!launch_window(*m.tp_model, *st.peer, tokens, T, pos, pos3, err)) return false;
     }
     return launch_window(m, st, tokens, T, pos, pos3, err);
 }
@@ -921,6 +966,10 @@ bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, 
 }  // namespace
 
 bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
+    if (m.tp_model && m.tp_hand) {   // the pair's window is one session's; see forward_window's second-card launch
+        err = "dense: a tensor-parallel pair cannot run a batched window of several sessions yet";
+        return false;
+    }
     if (m.split) {   // the second card's sessions, their graph first: it waits for the main card's rows
         lower_flags(*m.hand);
         std::vector<BatchSeg> ps((size_t) S);
@@ -1046,9 +1095,45 @@ bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& e
     return mtp_chunk(m, st, tail ? b.hn : b.hn + H, nullptr, tail ? b.cat : b.cat + H, n, tail ? pos - 1 : pos, err);
 }
 
+// A pair's prompt: both cards take the same token rows and the same positions, run every layer at their own widths, and
+// hand their row-parallel partials across the hand-off's ONE prompt block, group by group (`tp_allreduce2_add_grouped`).
+// Nothing else about a prompt changes: no card waits for the other between chunks, because the exchanges inside the layers
+// are what keep the two in step - so this launches the second card's whole chunk first, on its own stream, and the two
+// meet at every product.  The block drafter stays on card 0 (M1's placement), which is also why the peer's chunk_finish
+// has nothing to do with context rows.
+bool tp_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
+              const int32_t* pos3, std::string& err) {
+    Model& peer = *m.tp_model;
+    SessionState& ps = *st.peer;
+    tp_hand_lower(*m.tp_hand);   // the step's exchanges number from 1 again; see forward_window for why here is idle
+    for (Model* c : {&m, &peer}) {
+        c->tp_exchange = 0;
+        c->tp_seq = 0;
+    }
+    const int32_t bnd[2] = {0, T};
+    chunk_start(m, st, tokens, rows, T, pos3, bnd);
+    chunk_layers(m, st, T, pos, 0, m.cg.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
+    if (!chunk_finish(m, st, T, pos, err)) return false;
+    // The next chunk lowers the hand-off and numbers again from 1, and the session loop's sync after a chunk is only THIS
+    // card's stream: the peer's last work (its context rows, its tail) can still be queued there.  A pair's chunk therefore
+    // ends by draining its second card as well - at a chunk boundary, where a sync costs nothing next to 4096 rows.
+    {
+        const core::OnDevice on(m.tp_dev);
+        chunk_start(peer, ps, tokens, rows, T, pos3, bnd);
+        chunk_layers(peer, ps, T, pos, 0, peer.cg.n_layers, nullptr);
+        if (!chunk_finish(peer, ps, T, pos, err)) return false;
+        if (cudaStreamSynchronize(ps.stream) != cudaSuccess) {
+            err = "dense: the pair's second card did not finish its prompt chunk";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
                    const int32_t* pos3, std::string& err) {
     if (m.split) return split_chunk(m, st, tokens, rows, T, pos, pos3, err);
+    if (m.tp_model && m.tp_hand) return tp_chunk(m, st, tokens, rows, T, pos, pos3, err);
     if (!m.ensure_chunk(err)) return false;
     chunk_start(m, st, tokens, rows, T, pos3);
     chunk_layers(m, st, T, pos, 0, m.cg.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);

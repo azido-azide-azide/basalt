@@ -51,6 +51,8 @@ constexpr int kEmb = 5120;    // a dense model's row width, so the sizes are the
 constexpr int kExch = 8;      // exchanges per window here (a real window has two per layer)
 constexpr int kRows = 16;     // a full decode window; the narrow case runs one row
 constexpr int kNarrow = 1;
+constexpr int kChunkBlock = 64;   // the prompt block's rows (a real pair gets hundreds); the grouped case crosses it in groups
+constexpr int kChunkRows = 257;   // deliberately not a multiple of the block, so the last group is a partial one
 
 // The values the two cards start each exchange with, and the sum the exchange owes them, in TWO sets: set 1 shifts every
 // value by 8.  The replay loop below alternates them, and that is the point - a replay that reads the bytes it read last
@@ -336,6 +338,101 @@ bool run_add_case(const char* what, Cfg& c, int rows) {
 
 }  // namespace
 
+/// Values whose SUM the pair can hold exactly.  BF16 has eight mantissa bits, so an integer is exact only up to 256: the two
+/// cards' partials and the row they are added into stay under it together, and then an expected sum is an expected BIT and
+/// the test never has to model a rounding the kernel does not promise.  (It did at first, and the shifted set "failed" with
+/// both cards agreeing bit for bit - a rounding disagreement, which is how that reads, not a stale read.)
+uint16_t gp(int card, int shift, int64_t i) {
+    const int base[] = {2, 3};
+    return (uint16_t) (base[card] * (int) (i % 23) + (i / 23) % 13 + shift);   // card 0 to 56, card 1 to 82, shifted by 8
+}
+
+uint16_t gb(int64_t i) { return (uint16_t) (i % 7); }   // the row it lands in: to 6.  56 + 82 + 6 + 8 stays under 256
+
+/// the prompt line's exchange: rows through one block per direction, group by group, the block refilled under the
+/// produce/consume counter.  Checks the sums, that both cards end bit-identical, that the four counters ended where the
+/// groups are, and - the reason `seq` runs through the chunk - that a SECOND chunk after lowering the flags gets fresh data
+/// rather than the previous chunk's, which is the failure M4's write-through fix closed for single blocks.
+bool run_grouped_case(const char* what, Cfg& c, int rows, int group) {
+    const int64_t n = (int64_t) rows * kEmb;
+    uint16_t *p0 = nullptr, *p1 = nullptr, *x0 = nullptr, *x1 = nullptr;
+    for (int d : {c.dev0, c.dev1}) {
+        const core::OnDevice on(d);
+        uint16_t*& p = d == c.dev0 ? p0 : p1;
+        uint16_t*& x = d == c.dev0 ? x0 : x1;
+        if (cudaMalloc((void**) &p, (size_t) n * 2) != cudaSuccess || cudaMalloc((void**) &x, (size_t) n * 2) != cudaSuccess) {
+            check(false, std::string(what) + ": the card could not take the chunk's rows");
+            return false;
+        }
+    }
+    std::vector<uint16_t> hp0((size_t) n), hp1((size_t) n), hx((size_t) n);
+    bool up = true;
+    for (int set = 0; set < 2 && up; ++set) {   // two chunks, second with every value shifted: a stale answer is a wrong sum
+        const int shift = set * 8;
+        for (int64_t i = 0; i < n; ++i) {
+            hp0[(size_t) i] = gp(0, shift, i);
+            hp1[(size_t) i] = gp(1, shift, i);
+            hx[(size_t) i] = gb(i);
+        }
+        {
+            const core::OnDevice on(c.dev0);
+            up = up && cuda_ok(what, cudaMemcpyAsync(p0, hp0.data(), (size_t) n * 2, cudaMemcpyHostToDevice, c.s0));
+            up = up && cuda_ok(what, cudaMemcpyAsync(x0, hx.data(), (size_t) n * 2, cudaMemcpyHostToDevice, c.s0));
+        }
+        {
+            const core::OnDevice on(c.dev1);
+            up = up && cuda_ok(what, cudaMemcpyAsync(p1, hp1.data(), (size_t) n * 2, cudaMemcpyHostToDevice, c.s1));
+            up = up && cuda_ok(what, cudaMemcpyAsync(x1, hx.data(), (size_t) n * 2, cudaMemcpyHostToDevice, c.s1));
+        }
+        if (!up) break;
+        const int groups = (rows + group - 1) / group;
+        auto t0 = std::chrono::steady_clock::now();
+        int seq0 = 0, seq1 = 0;   // the running count the CALLER keeps for a chunk; one chunk, so it starts at zero here
+        dense::tp_allreduce2_add_grouped(*c.h, 0, seq0, p0, x0, rows, group, c.s0);
+        dense::tp_allreduce2_add_grouped(*c.h, 1, seq1, p1, x1, rows, group, c.s1);
+        if (!drain(c.s0, c.s1, *c.h, std::string(what) + (set ? ", second chunk" : ", first chunk"))) return false;
+        if (set == 0) {
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("#   %d rows in groups of %d: %.1f us for %d groups across the pair (%.1f us a group, %.1f GiB/s)\n",
+                        rows, group, us, groups, us / groups,
+                        (double) rows * kEmb * 2 * 2 / 1073741824.0 / (us / 1000000.0));
+            check(seq0 == groups && seq1 == groups, std::string(what) + ": both cards counted the same groups");
+            check(c.h->flag[0] == (uint32_t) groups && c.h->flag[1] == (uint32_t) groups && c.h->read[0] == (uint32_t) groups &&
+                      c.h->read[1] == (uint32_t) groups,
+                  std::string(what) + ": the put and read counters ended at the group count");
+        }
+        std::vector<uint16_t> g0((size_t) n), g1((size_t) n);
+        {
+            const core::OnDevice on(c.dev0);
+            up = up && cuda_ok(what, cudaMemcpy(g0.data(), x0, (size_t) n * 2, cudaMemcpyDeviceToHost));
+        }
+        {
+            const core::OnDevice on(c.dev1);
+            up = up && cuda_ok(what, cudaMemcpy(g1.data(), x1, (size_t) n * 2, cudaMemcpyDeviceToHost));
+        }
+        int wrong = 0, same = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const uint16_t want = (uint16_t)(hx[(size_t) i] + hp0[(size_t) i] + hp1[(size_t) i]);   // exact in BF16
+            if (g0[(size_t) i] != want || g1[(size_t) i] != want) ++wrong;
+            if (g0[(size_t) i] != g1[(size_t) i]) ++same;
+        }
+        check(wrong == 0, std::string(what) + (set ? " (shifted set): every row of the chunk holds both cards' partials"
+                                                   : ": every row of the chunk holds both cards' partials"));
+        check(same == 0, std::string(what) + (set ? " (shifted set): the two cards' chunk rows are identical"
+                                                  : ": the two cards' chunk rows are identical"));
+        dense::tp_hand_lower(*c.h);   // the discipline between chunks: both streams idle, then the flags go down
+    }
+    {
+        const core::OnDevice on(c.dev0);
+        cudaFree(p0); cudaFree(x0);
+    }
+    {
+        const core::OnDevice on(c.dev1);
+        cudaFree(p1); cudaFree(x1);
+    }
+    return up;
+}
+
 int main() {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 2) {
@@ -354,7 +451,7 @@ int main() {
     }
     std::string err;
     Cfg c;
-    c.h = dense::tp_hand_alloc(kEmb, kExch, err);
+    c.h = dense::tp_hand_alloc(kEmb, kExch, err, kChunkBlock);   // with a prompt block, so the grouped form has one to use
     if (!c.h) {
         std::printf("# %s\n", err.c_str());
         return 1;
@@ -377,6 +474,8 @@ int main() {
     run_case("a full window", c, kRows);
     run_case("a one-row window", c, kNarrow);
     run_add_case("added into the residual", c, kRows);
+    run_grouped_case("a prompt chunk through one block", c, kChunkRows, kChunkBlock);
+    run_grouped_case("the same chunk in groups of one", c, 32, 1);   // the tightest refill: every group is a handoff
     dense::tp_hand_free(c.h);
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;

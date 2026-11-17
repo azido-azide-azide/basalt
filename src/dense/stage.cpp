@@ -981,7 +981,7 @@ bool attach_tp_pair(Model& m, int dev, const Weights& w, std::string& err) {
     kernels::wgemm::plan_device(main_dev);   // back to the main card's plan for everything after this
     const int exchanges = 2 * g.n_layers;    // the attention and delta-net outputs, and the feed-forward's down, per layer
     std::string e;
-    TpHand* h = m.tp_hand ? m.tp_hand : tp_hand_alloc(g.n_embd, exchanges, e);
+    TpHand* h = m.tp_hand ? m.tp_hand : tp_hand_alloc(g.n_embd, exchanges, e, kChunkGroup);
     if (!h) return fail(e);
     m.tp_hand = h;
     m.tp_hand_owner = true;   // the peer points at the same hand-off and must not free it

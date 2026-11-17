@@ -26,6 +26,9 @@ constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 
 constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
 constexpr int kChunk = 4096;      // tokens a prompt chunk reads at once
+constexpr int kChunkGroup = 512;  // rows a pair exchanges at once through its prompt block: 5 MiB each way, so a chunk's 4096
+                                  // rows cross in eight handshakes instead of 256 - and the block one group wide means each
+                                  // handshake waits for the peer, which is what the two counters are for
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
 constexpr int kTypeQ8P = 108;     // Q8_0 in planes (window_gemm Format::Q8), made at load for the decode window
@@ -128,11 +131,17 @@ struct SplitHand {
 /// window, and this card's next window sits behind its own wait for that signal.  The flags hold the exchange's number, so
 /// the waits are fixed at capture and the host lowers both flags between windows - once both cards are past the previous
 /// window's last exchange, which is what keeps a raised flag of a window that has not run yet out of the next one's waits.
+/// The flags count ONE step: `tp_hand_lower` belongs at the pair driver's join of each step, where both cards' streams are
+/// known idle, and every exchange of the step after it numbers from 1 again.  A step whose waits were answered by the
+/// previous step's counters reads the previous step's bytes - M4's stale-read failure, in a form no single-window test sees.
 struct TpHand {
     uint32_t* flag = nullptr;      ///< [0]: the row blocks card 0 has put in; [1]: card 1's
+    uint32_t* read = nullptr;      ///< [0]/[1]: the row GROUPS card 0/1 has taken OUT of its peer's chunk block
     uint16_t* slot = nullptr;      ///< [2][exchanges][kBatch][n_embd] BF16: [r] is what card r wrote and the other reads
+    uint16_t* chunk = nullptr;     ///< [2][chunk_rows][n_embd] BF16: [r] is the block card r refills, group after group
     int n_embd = 0;                ///< the width of a row block
     int exchanges = 0;             ///< the row blocks of one window: two per layer the pair runs
+    int chunk_rows = 0;            ///< rows the chunk block holds; 0 = this hand-off never carries a prompt
     void* mem = nullptr;           ///< the page-locked allocation these point into (the host view lowers the flags)
 };
 
@@ -165,7 +174,9 @@ bool tp_head_place(const TpHead& h, int rows, void* s, std::string& err);
 
 /// The pair's hand-off for `exchanges` row blocks of `n_embd` (two per layer the pair runs), page-locked, mapped, zeroed.
 /// Null with `err` when the memory is not there.
-TpHand* tp_hand_alloc(int n_embd, int exchanges, std::string& err);
+/// `chunk_rows` > 0 adds the prompt line's block: one block of that many rows per direction, refilled group after group,
+/// instead of one block per exchange - which is what a window can afford and a 4096-row chunk cannot.
+TpHand* tp_hand_alloc(int n_embd, int exchanges, std::string& err, int chunk_rows = 0);
 void tp_hand_free(TpHand* h);
 /// One all-reduce of `rows` x `n_embd` BF16 partials across the pair, queued on `s` as card `rank`: this card's rows into the
 /// block its peer reads, its own flag raised to `e` + 1, the peer's awaited at that value, the peer's block added into this
@@ -176,6 +187,21 @@ void tp_allreduce2(const TpHand& h, int rank, int e, uint16_t* partial, int rows
 /// `x` gains both cards' partials (added as floats, rounded once), which is where a row-parallel product's result belongs
 /// when the next matrix it feeds is split along its inputs.  `partial` is left as it was; `x` and `partial` must differ.
 void tp_allreduce2_add(const TpHand& h, int rank, int e, const uint16_t* partial, uint16_t* x, int rows, void* s);
+
+/// The prompt line's form of the same sum: `rows` rows through ONE block per direction, `group` rows at a time, the block
+/// refilled only once its peer has taken the group that was in it.  `seq` is this card's count of the groups it has sent
+/// THIS CHUNK and the caller keeps it across the chunk's products and layers: a counter restarted per product would let the
+/// next product's wait be answered by the previous product's flag before its data is anywhere.  The caller lowers the flags
+/// between chunks, with both streams idle, exactly as between windows.
+void tp_allreduce2_add_grouped(const TpHand& h, int rank, int& seq, const uint16_t* partial, uint16_t* x, int rows,
+                               int group, void* s);
+
+/// Neither card passes this point until both have reached it - no bytes move, only the two flags.  It orders what the flags
+/// cannot otherwise: card 0 reads card 1's head block ACROSS THE DOOR, so that read must not start before the peer's head
+/// product is done, and the two products are on two streams the host never joins.  `e` is the step's next exchange number,
+/// so the meeting is just the step's last exchange - and like the others it is a kernel, which is what lets it live inside a
+/// captured window graph.
+void tp_meet(const TpHand& h, int rank, int e, void* s);
 /// Both flags lowered for the next window (both cards are past the last exchange's, as `TpHand` explains).
 void tp_hand_lower(TpHand& h);
 
@@ -228,6 +254,10 @@ public:
     Model* tp_model = nullptr;                   // the same, as a raw link for the drivers (null: no pair)
     int tp_dev = -1;                             // the device that second card runs on
     uint16_t* tp_partial = nullptr;              // a window row block's BF16 partials awaiting their exchange
+    uint16_t* tp_chunk_partial = nullptr;        // the same for a prompt chunk's rows, which no window block can hold
+    int tp_seq = 0;                              // groups this card has sent through the hand-off's prompt block, THIS step
+    //                                    (both this and tp_exchange number ONE step: the pair driver lowers the hand-off's
+    //                                    flags at each step's join, where both cards' streams are idle, and they restart)
     int tp_exchange = 0;                         // the exchange number the NEXT row-parallel product of this window is
 
     bool owns_drafter() const { return o.tp_cards <= 1 || o.tp_rank == 0; }

@@ -665,6 +665,15 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         }
         m->owned.push_back(p);
         m->tp_partial = (uint16_t*) p;
+        // and the prompt's, which is the same rows at kChunk width: a chunk's product partial cannot go through a window
+        // block, so it waits here for the grouped exchange to carry it across in groups
+        void* q = nullptr;
+        if (cudaMalloc(&q, (size_t) kChunk * m->cg.n_embd * sizeof(uint16_t)) != cudaSuccess) {
+            err = o.arch + ": out of device memory for the tensor-parallel prompt partials";
+            return nullptr;
+        }
+        m->owned.push_back(q);
+        m->tp_chunk_partial = (uint16_t*) q;
     }
     if (!decode_drafter(*m, err)) return nullptr;
     if (!m->ready_products(err) || cudaDeviceSynchronize() != cudaSuccess) {
