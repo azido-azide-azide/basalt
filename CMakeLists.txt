@@ -371,7 +371,7 @@ endif()
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
-                             src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp)
+                             src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp src/core/tp_mailbox.cu)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -520,6 +520,10 @@ if(BUILD_TESTING)
   basalt_embed_manifest(direct_upload_test)
   basalt_gpu_test(NAME direct_upload_test COMMAND direct_upload_test)
   set_tests_properties(direct_upload_test PROPERTIES TIMEOUT 60)
+  add_executable(tp_mailbox_test tests/core/tp_mailbox_test.cpp)
+  target_link_libraries(tp_mailbox_test PRIVATE core)
+  basalt_gpu_test(NAME tp_mailbox_test COMMAND tp_mailbox_test)
+  set_tests_properties(tp_mailbox_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
 endif()
 if(BASALT_MODEL_QWEN4EXP)
 # the learned expert profile (--expert-profile-save): its order and file format (CPU only)
