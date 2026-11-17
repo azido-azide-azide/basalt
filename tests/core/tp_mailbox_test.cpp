@@ -256,7 +256,8 @@ int main() {
             cudaStreamSynchronize(s0);
             cudaSetDevice(1);
             cudaStreamSynchronize(s1);
-            for (size_t i = 0; i < nbf; ++i) a[i] = b[i] = rn_bf16(to_f(a[i]) + to_f(b[i]));
+            for (int k = 0; k < 4; ++k)
+                for (size_t i = 0; i < nbf; ++i) a[i] = b[i] = rn_bf16(to_f(a[i]) + to_f(b[i]));
         }
         std::vector<uint16_t> r0(nbf), r1(nbf);
         cudaSetDevice(0);
