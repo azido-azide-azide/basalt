@@ -238,7 +238,9 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
     const size_t lanes = (slot_bytes_ / kVecBytes + 32 * static_cast<size_t>(kG) - 1) /
                          (32 * static_cast<size_t>(kG));
     line_bytes_ = lanes * 64;
-    const size_t slot_span = line_bytes_ + slot_bytes_;
+    // Two rank sections per slot: each card publishes only into its own bytes.
+    const size_t rank_span = line_bytes_ + slot_bytes_;
+    const size_t slot_span = 2 * rank_span;
     const size_t total = slot_span * slots + 256;
     void* pinned = nullptr;
     if (cudaHostAlloc(&pinned, total, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
@@ -255,10 +257,13 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
     dev1_ = rank1_dev;
     for (size_t s = 0; s < slots; ++s) {
         uint8_t* at = block_ + slot_span * s;
-        // Under unified addressing one mapped pointer names the bytes on both cards.
-        slot_views_[s].flags[0] = slot_views_[s].flags[1] = reinterpret_cast<uint32_t*>(at);
-        slot_views_[s].payload[0] = slot_views_[s].payload[1] =
-            reinterpret_cast<Vec*>(at + line_bytes_);
+        // Under unified addressing one mapped pointer names the bytes on both cards; rank r's
+        // published bytes live in the slot's r-th section.
+        for (int rank = 0; rank < 2; ++rank) {
+            uint8_t* sec = at + rank * (line_bytes_ + slot_bytes_);
+            slot_views_[s].flags[rank] = reinterpret_cast<uint32_t*>(sec);
+            slot_views_[s].payload[rank] = reinterpret_cast<Vec*>(sec + line_bytes_);
+        }
     }
     for (int rank = 0; rank < 2; ++rank) {
         const OnDevice on(rank == 0 ? rank0_dev : rank1_dev);
