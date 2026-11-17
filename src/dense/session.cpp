@@ -495,7 +495,7 @@ public:
     static constexpr size_t kHeadBytes = 4 * sizeof(int64_t);
     size_t block_ring_bytes() const { return (size_t) st_.dctx_cap * m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
     size_t running_bytes() const override {
-        return kHeadBytes + (size_t) (m_.n_gdn + (st_.peer ? m_.split_model->n_gdn : 0)) * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
+        return kHeadBytes + (size_t) (m_.n_gdn + (st_.peer ? peer_model(m_)->n_gdn : 0)) * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
                (block_ ? st_.dk.size() * 2 * block_ring_bytes() : 0);
     }
 
@@ -520,9 +520,9 @@ public:
         s.stream = st_.stream;
         s.peer_regions.clear();
         if (st_.peer) {   // the second card's layers' state
-            if (const size_t n = (size_t) m_.split_model->n_gdn * st_.gdn_floats * 4) s.peer_regions.push_back({st_.peer->gdn, n});
+            if (const size_t n = (size_t) peer_model(m_)->n_gdn * st_.gdn_floats * 4) s.peer_regions.push_back({st_.peer->gdn, n});
             s.peer_stream = st_.peer->stream;
-            s.peer_device = m_.split_dev;
+            s.peer_device = peer_dev(m_);
         }
         return {};
     }
@@ -582,7 +582,7 @@ public:
             const bool mtp = i == kv_layers();
             size_t j = i;
             const SessionState& ls = mtp ? st_ : kv_state(j);
-            const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
+            const core::OnDevice on(&ls == &st_ ? -1 : peer_dev(m_));
             const bool int8 = !mtp && m_.o.kv_int8;
             core::ConversationKv k;
             k.format = int8 ? 2 : 1;
@@ -623,7 +623,7 @@ public:
             const bool mtp = i == kv_layers();
             size_t j = i;
             const SessionState& ls = mtp ? st_ : kv_state(j);
-            const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
+            const core::OnDevice on(&ls == &st_ ? -1 : peer_dev(m_));
             const bool int8 = !mtp && m_.o.kv_int8;
             const core::ConversationKv& k = kv[i];
             if (k.format != (int8 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
@@ -709,8 +709,8 @@ private:
     void join_commit() {
         if (!commit_pending_) return;
         if (m_.n_gdn) cudaStreamWaitEvent(st_.stream, st_.join, 0);
-        if (st_.peer && m_.split_model->n_gdn) {
-            const core::OnDevice on(m_.split_dev);
+        if (st_.peer && peer_model(m_)->n_gdn) {
+            const core::OnDevice on(peer_dev(m_));
             cudaStreamWaitEvent(st_.peer->stream, st_.peer->join, 0);
         }
         commit_pending_ = false;
@@ -728,9 +728,9 @@ private:
                 cudaMemsetAsync(st_.gdn, 0, (size_t) m_.n_gdn * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
             if (SessionState* p = st_.peer.get()) {
-                const core::OnDevice on(m_.split_dev);
+                const core::OnDevice on(peer_dev(m_));
                 p->alt_ready = false;
-                if (cudaMemsetAsync(p->gdn, 0, (size_t) m_.split_model->n_gdn * p->gdn_floats * 4, p->stream) != cudaSuccess)
+                if (cudaMemsetAsync(p->gdn, 0, (size_t) peer_model(m_)->n_gdn * p->gdn_floats * 4, p->stream) != cudaSuccess)
                     return fail("clearing the recurrent state failed");
             }
             return {};
@@ -763,8 +763,8 @@ private:
             };
             commit(m_, st_);
             if (st_.peer) {
-                const core::OnDevice on(m_.split_dev);
-                commit(*m_.split_model, *st_.peer);
+                const core::OnDevice on(peer_dev(m_));
+                commit(*peer_model(m_), *st_.peer);
             }
             if (!defer) join_commit();
         }

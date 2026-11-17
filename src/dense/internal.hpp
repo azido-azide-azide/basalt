@@ -276,6 +276,14 @@ public:
     void vision_detach();
 };
 
+// A session has ONE peer state (`st.peer`), whether the card pair is a layer split or a tensor-parallel pair - and the two
+// keep the model on the other card in different fields.  Every site that reaches across wrote `m.split_model` and
+// `m.split_dev` outright, which is how the pair segfaulted in `Session::settle`: a peer state existed, the split pointer was
+// null, and the recurrent state's commit dereferenced it.  Ask the question the code is actually answering.
+inline Model* peer_model(Model& m) { return m.tp_model ? m.tp_model : m.split_model; }
+inline int peer_dev(Model& m) { return m.tp_model ? m.tp_dev : m.split_dev; }
+
+
 struct SessionState;
 struct PeerStateDeleter {
     void operator()(SessionState* s) const;

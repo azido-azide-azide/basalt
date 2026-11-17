@@ -1,6 +1,8 @@
 // src/dense/forward.cpp - the layer loop of a decode window and of a prompt chunk, and the drafter's passes.
 #include "internal.hpp"
 
+#include <chrono>
+
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -694,17 +696,26 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
     if (m.lb > 0) return;   // the second card of a split has no head
     const void* const xnh = wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, T, g.eps, s);
     if (m.tp_hand) {
-        // The pair's head: every card scores the vocabulary rows ITS shard holds, into a compact block of its own, and card
-        // 0 - which is where the sampler looks - assembles the row of both blocks.  The two scores run on two streams, so
-        // they meet on the flags first (the step's last exchange number); after that card 0 reads its peer's block across
-        // the door, which is what `tp_head_place` costs 34.7 us a row for sixteen rows.  A card whose door the driver
-        // refused would have to send that block through the hand-off's page-locked memory instead - the pair boots only with
-        // the door open (attach_tp_pair), so that fallback is not wired, and saying so here beats discovering it later.
+        // The pair's head.  Today's loader hands BOTH cards the whole head (`linear(gg, "output", g.n_vocab, ...)` in the
+        // qwen35 adapter, twice - `tp_head_rows` is written and never called), so card 0 scores it exactly as a single card
+        // would - same rows, same order, same epilogue - and card 1 does not score it at all.  Assuming instead that each
+        // card held half the vocabulary is how this pair first segfaulted: the peer's "block" was a full row of logits and
+        // placing it at column n_vocab wrote a second vocabulary past the end of every row.  The split IS the plan (it
+        // halves the head's weight reads per card and the pair's last serial step); when the loader cuts the rows, the
+        // branch below takes over on its own, since it asks the weights rather than believing the plan.
+        const int64_t mine = m.w.head.rows, theirs = m.tp_model->w.head.rows;
+        const bool sharded = mine != g.n_vocab && mine + theirs == g.n_vocab;
+        if (!sharded) {
+            if (!m.o.tp_rank) prod(m, w.head, xnh, st.logits, T, s);   // card 1's window ends with its last layer
+            return;
+        }
+        // Both halves: score this card's vocabulary rows into a compact block, meet on the flags (the two scores are on two
+        // streams the host never joins), then card 0 reads its peer's block across the door and places it beside its own -
+        // the shape `tp_head_place` measured at 34.7 us per window row, 13.34 GiB/s.
         prod(m, w.head, xnh, b.hl, T, s);
         tp_meet(*m.tp_hand, m.o.tp_rank, m.tp_exchange++, s);
-        if (m.o.tp_rank) return;   // card 1 scored its shard; the row it belongs to is card 0's to assemble
+        if (m.o.tp_rank) return;
         std::string e;
-        const int64_t mine = m.w.head.rows, theirs = m.tp_model->w.head.rows;
         TpHead own{st.logits, b.hl, (int) g.n_vocab, (int) mine, 0, (int) mine};
         TpHead pr{st.logits, m.tp_model->ws.hl, (int) g.n_vocab, (int) theirs, (int) mine, (int) theirs};
         if (!tp_head_place(own, T, s, e) || !tp_head_place(pr, T, s, e))
@@ -791,7 +802,7 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
         const core::OnDevice on(m.tp_dev);
         if (!launch_window(*m.tp_model, *st.peer, tokens, T, pos, pos3, err)) return false;
     }
-    return launch_window(m, st, tokens, T, pos, pos3, err);
+    return launch_window(m, st, tokens, T, pos, pos3, err);   // the pair's own timing: see Session's step line
 }
 
 namespace {
@@ -1110,23 +1121,55 @@ bool tp_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* ro
         c->tp_exchange = 0;
         c->tp_seq = 0;
     }
+    // `forward_chunk` takes a card's prompt workspaces before its chunk; a pair dispatches past that line, so the pair takes
+    // them here for BOTH cards - and says so rather than writing through a null the first time one is missing.
+    if (!m.ensure_chunk(err)) return false;
+    if (!peer.ensure_chunk(err)) return false;
+    if (!m.cs.x || !peer.cs.x || !m.ws.hl || !peer.ws.hl) {
+        err = "dense: the pair's prompt workspaces or head rows are missing";
+        return false;
+    }
     const int32_t bnd[2] = {0, T};
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool trace = m.o.tp_cards > 1;  // the pair's phases, on the way out: where a first run stops is the answer one wants
+    const auto step = [&](const char* what) {
+        if (trace)
+            basalt::log::info("basalt dense", "tp pair step: %s at %.1f ms", what,
+                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    };
+    step("both cards' workspaces taken");
     chunk_start(m, st, tokens, rows, T, pos3, bnd);
+    step("main chunk_start");
     chunk_layers(m, st, T, pos, 0, m.cg.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
+    step("main chunk_layers launched");
     if (!chunk_finish(m, st, T, pos, err)) return false;
+    step("main chunk_finish");
     // The next chunk lowers the hand-off and numbers again from 1, and the session loop's sync after a chunk is only THIS
     // card's stream: the peer's last work (its context rows, its tail) can still be queued there.  A pair's chunk therefore
     // ends by draining its second card as well - at a chunk boundary, where a sync costs nothing next to 4096 rows.
     {
         const core::OnDevice on(m.tp_dev);
         chunk_start(peer, ps, tokens, rows, T, pos3, bnd);
+        step("peer chunk_start");
         chunk_layers(peer, ps, T, pos, 0, peer.cg.n_layers, nullptr);
+        step("peer chunk_layers launched");
         if (!chunk_finish(peer, ps, T, pos, err)) return false;
+        step("peer chunk_finish");
         if (cudaStreamSynchronize(ps.stream) != cudaSuccess) {
             err = "dense: the pair's second card did not finish its prompt chunk";
             return false;
         }
     }
+    step("both streams drained");
+    if (cudaStreamSynchronize(st.stream) != cudaSuccess) {
+        err = "dense: the pair's main card did not finish its prompt chunk";
+        return false;
+    }
+    // one line per chunk: whether the two cards met at every product, and what the chunk cost with the exchange in it
+    basalt::log::info("basalt dense",
+                      "tensor parallel chunk: %d rows, %d group exchanges per product on each card, %.1f ms", T,
+                      (T + kChunkGroup - 1) / kChunkGroup * 2 * m.cg.n_layers,
+                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return true;
 }
 

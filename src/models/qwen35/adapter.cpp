@@ -361,6 +361,21 @@ public:
                   std::to_string((unsigned long long) (free_b >> 20)) + " MiB are free; lower --max-context or --parallel";
             return false;
         }
+        if (tp_ > 0 && (o.drafter != dense::Drafter::None || o.draft)) {
+            // A pair runs without a drafter.  The block drafter's matrices are one card's WHOLE matrices (M1 placed them
+            // there because they are small), so their row-parallel products are not halves of anything - and `prod_add`
+            // exchanges every row-parallel product a pair runs.  Left alone, card 0 would wait at products card 1 never
+            // reaches.  Splitting the drafter's feed-forward is the way to have it back (it also balances the cards); that
+            // is its own change, not this one.
+            basalt::log::info("basalt qwen35",
+                              "tensor parallel %d: the drafter is off - its matrices are one card's whole matrices, and a "
+                              "pair exchanges every row-parallel product it runs", tp_);
+            o.drafter = dense::Drafter::None;
+            o.draft = false;
+            o.spec = 0;
+            w.dflash = {};
+            w.mtp = {};
+        }
         model_ = dense::make_model(g, w, o, err);
         if (!model_) return false;
         if (tp_ > 0) {
