@@ -192,7 +192,7 @@ public:
         drafter_ = m_.o.drafter == Drafter::Mtp;
         block_ = m_.o.drafter == Drafter::Block;
         if (!init_state(m_, st_, err)) return false;
-        if (m_.split && !split_session(m_, st_, err)) return false;
+        if ((m_.split || m_.tp_model) && !split_session(m_, st_, err)) return false;
         if (cudaHostAlloc((void**) &h_picks_, kWindow * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess) {
             err = "out of page-locked memory";
             return false;

@@ -2,6 +2,7 @@
 #include "internal.hpp"
 
 #include "basalt/dense/tp_geometry.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/gdn_prompt.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
@@ -363,6 +364,11 @@ Model::~Model() {
     if (stage_free) cudaEventDestroy(stage_free);
     if (stage_ready) cudaEventDestroy(stage_ready);
     for (void* p : owned) cudaFree(p);
+    if (tp_peer_model) {   // the second card's buffers belong to its device, so it goes while that device is current
+        const core::OnDevice on(tp_dev);
+        tp_peer_model.reset();
+    }
+    if (tp_hand_owner && tp_hand) tp_hand_free(tp_hand);   // one hand-off, freed by the card that allocated it
     vision_detach();
 }
 

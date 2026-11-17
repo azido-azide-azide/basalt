@@ -223,6 +223,10 @@ public:
     // gathers them.  The block drafter belongs to card 0 alone (M1's placement), so only that card sizes for it.
     Geometry cg;                                 // the widths THIS card runs (== g unless it is one card of a pair)
     TpHand* tp_hand = nullptr;                   // the pair's row-block hand-off (null: no pair)
+    bool tp_hand_owner = false;                  // card 0 allocated it and frees it; the peer only points at it
+    ModelPtr tp_peer_model;                    // the pair's second card's model, built on its own device (card 0 holds it)
+    Model* tp_model = nullptr;                   // the same, as a raw link for the drivers (null: no pair)
+    int tp_dev = -1;                             // the device that second card runs on
     uint16_t* tp_partial = nullptr;              // a window row block's BF16 partials awaiting their exchange
     int tp_exchange = 0;                         // the exchange number the NEXT row-parallel product of this window is
 

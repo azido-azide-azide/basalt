@@ -938,10 +938,62 @@ bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err
 }
 
 bool split_session(Model& m, SessionState& st, std::string& err) {
+    // One place for "this session's peer card", whether the pair splits layers or splits every matrix: the state is the peer
+    // model's own, sized from the widths THAT card runs, taken while its device is current.
+    Model& peer = m.tp_model ? *m.tp_model : *m.split_model;
+    const int dev = m.tp_model ? m.tp_dev : m.split_dev;
     st.peer.reset(new SessionState());
-    st.peer->dev = m.split_dev;
-    const core::OnDevice on(m.split_dev);
-    return init_state(*m.split_model, *st.peer, err);
+    st.peer->dev = dev;
+    const core::OnDevice on(dev);
+    return init_state(peer, *st.peer, err);
+}
+
+bool attach_tp_pair(Model& m, int dev, const Weights& w, std::string& err) {
+    const Geometry& g = m.g;
+    int main_dev = 0;
+    cudaGetDevice(&main_dev);
+    const auto fail = [&](const std::string& what) {
+        err = m.o.arch + ": the tensor-parallel pair on CUDA" + std::to_string(dev) + ": " + what;
+        return false;
+    };
+    // The pair's door first: a driver that refuses it is the fallback, not a refusal of the pair.
+    if (!tp_peer_enable(main_dev, dev, err)) return fail(err);
+    // Its window products plan as the main card's, so the same rows round the same way on both cards.
+    kernels::wgemm::plan_device(main_dev);
+    ModelPtr peer;
+    {
+        const core::OnDevice on(dev);
+        Options o = m.o;
+        o.tp_rank = 1;               // make_model narrows cg to THIS card's heads, key-head group and intermediate width
+        o.draft = false;             // the block drafter is card 0's alone (M1's placement), so card 1 never sizes for it
+        o.drafter = Drafter::None;
+        o.spec = 0;
+        o.vision = false;            // one encoder, on the card that owns the pictures
+        o.mmproj = {};
+        Weights pw = w;
+        pw.dflash = {};
+        pw.mtp = {};
+        peer = ModelPtr(make_model(g, pw, o, err));
+        if (!peer) return fail(err);
+        if (!peer->ensure_chunk(err)) return fail(err);   // its prompt chunks, at its own widths
+        peer->tp_hand = m.tp_hand;   // both cards point at the one hand-off
+    }
+    kernels::wgemm::plan_device(main_dev);   // back to the main card's plan for everything after this
+    const int exchanges = 2 * g.n_layers;    // the attention and delta-net outputs, and the feed-forward's down, per layer
+    std::string e;
+    TpHand* h = m.tp_hand ? m.tp_hand : tp_hand_alloc(g.n_embd, exchanges, e);
+    if (!h) return fail(e);
+    m.tp_hand = h;
+    m.tp_hand_owner = true;   // the peer points at the same hand-off and must not free it
+    peer->tp_hand = h;
+    m.tp_model = peer.get();
+    m.tp_dev = dev;
+    m.tp_peer_model = std::move(peer);
+    basalt::log::info("basalt dense",
+                      "tensor parallel pair: CUDA%d runs every layer at %d of %d query heads and %d of %d intermediate columns "
+                      "beside CUDA%d; %d row-block exchanges per window", dev, m.tp_model->cg.n_head, g.n_head,
+                      m.tp_model->cg.n_ff, g.n_ff, main_dev, exchanges);
+    return true;
 }
 
 bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos, const int32_t* pos3,

@@ -159,6 +159,11 @@ bool attach_prompt_line(Model& m, int dev, int l_min, const Weights& w, std::str
 /// [0, cut).  The second card plans its products as the main card, so the output is the main card's alone to the bit.
 /// Called with the main card current, before any session is made.
 bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err);
+
+/// The tensor-parallel pair's second card: a model of its own on `dev`, holding its shards of every matrix (`w`), at
+/// `Options::tp_cards`-th of the head and intermediate widths, beside the hand-off its row-parallel products write into.
+/// Both cards then run EVERY layer; what they hand each other are partials, not layers - which is why this is not a split.
+bool attach_tp_pair(Model& m, int dev, const Weights& w, std::string& err);
 /// Main-card bytes a second card's stage keeps (its hand-off buffers and the drafter features it holds back).
 uint64_t stage_main_bytes(const Geometry& g, const BlockDrafter& drafter);
 /// Main-card bytes a prompt line keeps (its hand-off buffers and the drafter features it holds back); 0 when a context of

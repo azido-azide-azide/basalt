@@ -182,6 +182,11 @@ public:
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
         if (!req.peer_devices.empty() && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
+        // The pair's width belongs to the engine's Options, not only to the adapter's: it is what make_model narrows the
+        // card's geometry by and what every buffer on both cards is sized from. Left at 0, both cards run the MODEL's heads
+        // and intermediate width and call it a pair - which is what this file's first boot test caught.
+        o.tp_cards = tp_;
+        o.tp_rank = 0;   // this Model; attach_tp_pair builds the other one with rank 1
         fd_ = platform::open_fd_utf8(path);
         if (fd_ < 0) {
             err = "cannot open " + path;
@@ -325,14 +330,10 @@ public:
         if (split_at_ > 0)
             basalt::log::info("basalt qwen35", "layer split: %.2f GiB of layers %d-%d on CUDA%d", (double) peer_bytes_ / 1073741824.0, split_at_,
                               g.n_layers - 1, req.peer_devices.front());
-        if (tp_ > 0) {
+        if (tp_ > 0)
             basalt::log::info("basalt qwen35", "tensor parallel %d: %.2f GiB on CUDA0, %.2f GiB on CUDA%d (half of every matrix, the "
                               "delta-net by key-head group)", tp_, (double) dev_bytes_ / 1073741824.0,
                               (double) peer_bytes_ / 1073741824.0, req.peer_devices.front());
-            // The plan and both cards' bytes are in place; no product crosses the pair yet, so this load cannot serve.
-            err = "qwen35: tensor parallel places both cards' shards, but the layers do not run split between the cards";
-            return false;
-        }
         o.host_embedding_bytes = tensor_payload_bytes(*te);
         o.gpu_weight_bytes = dev_bytes_ + peer_bytes_;
         o.layer_end = split_at_;
@@ -362,6 +363,15 @@ public:
         }
         model_ = dense::make_model(g, w, o, err);
         if (!model_) return false;
+        if (tp_ > 0) {
+            // The second card as a model of its own: its scratch, its prompt chunks, the hand-off its products write into, and
+            // the door open both ways - so what this load has reserved is the pair's real footprint, not an estimate of it.
+            if (!dense::attach_tp_pair(*model_, req.peer_devices.front(), peer_w, err)) return false;
+            // What still keeps it from serving is the prompt line: a chunk is kChunk rows and the hand-off's row blocks are
+            // kBatch, so the pair's prompt exchanges need those blocks reused across row groups. The decode window is wired.
+            err = "qwen35: the pair is up on both cards; a prompt's exchanges do not fit the hand-off's row blocks yet";
+            return false;
+        }
         if (split_at_ > 0) return dense::attach_split(*model_, req.peer_devices.front(), split_at_, peer_w, err);
         if (!req.peer_devices.empty()) prompt_line(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
         return true;
