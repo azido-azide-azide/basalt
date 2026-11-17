@@ -136,6 +136,33 @@ struct TpHand {
     void* mem = nullptr;           ///< the page-locked allocation these point into (the host view lowers the flags)
 };
 
+/// The pair's head, in one move.  The head's product writes `rows` by the matrix's own out_features CONTIGUOUS - so a
+/// card's vocabulary shard leaves it a compact block, at a pitch of its own column count, wherever the product was told
+/// to put it, and the logits the sampler reads are the model's whole vocabulary wide.  Assembling a row is therefore a
+/// pitched copy even for the card's own half: its block into its own columns, and the peer's block - read across the
+/// pair's door - into the columns that follow.  Measured on a two-card pair over a Gen4 x8 link: a flat crossing of the
+/// shape this makes costs 34.7 us per window row (7.58 MiB for sixteen rows at 13.34 GiB/s), a quarter of one percent of
+/// a token.  A pair whose driver refuses the door sends the peer's block through the hand-off's page-locked memory
+/// instead (measured: 1195 us for the same sixteen rows, still under one percent), at the cost of one more hop the peer
+/// pays - see the blueprint's head section for that shape, which tp_hand.cpp's flags already know how to do.
+struct TpHead {
+    float* dst = nullptr;      ///< the logits being assembled, [rows][dst_pitch]
+    const float* src = nullptr;  ///< a head block: the card's own, or the peer's across the door
+    int dst_pitch = 0;         ///< the logits' row stride, in values (the model's vocabulary)
+    int src_pitch = 0;         ///< the block's row stride, in values (its own column count)
+    int dst_col0 = 0;          ///< the column of the logits this block belongs at
+    int cols = 0;              ///< the block's columns (tp_head_rows of the model's vocabulary)
+};
+
+/// the pair's door, opened once per card pair at boot: each card's kernels and copies then reach the other's memory
+/// directly.  Already-open is success; a driver that refuses it is the pair's fallback, not an error.
+bool tp_peer_enable(int a, int b, std::string& err);
+
+/// `rows` of one vocabulary block into the logits, one queued copy.  The card's own block and the peer's go through the
+/// same call - which half is whose is `src`'s address, which the door makes legal to read.  Queued on `s`; nothing reads
+/// the logits until the sampler does, and the sampler runs after this on the same stream.
+bool tp_head_place(const TpHead& h, int rows, void* s, std::string& err);
+
 /// The pair's hand-off for `exchanges` row blocks of `n_embd` (two per layer the pair runs), page-locked, mapped, zeroed.
 /// Null with `err` when the memory is not there.
 TpHand* tp_hand_alloc(int n_embd, int exchanges, std::string& err);

@@ -96,6 +96,52 @@ void tp_allreduce2_add(const TpHand& h, int rank, int e, const uint16_t* partial
     kernels::add_pair_bf16(x, partial, tp_block(h, 1 - rank, e), values, s);   // the residual gains both partials
 }
 
+bool tp_peer_enable(int a, int b, std::string& err) {
+    if (a == b) {
+        err = "dense: a pair needs two different cards";
+        return false;
+    }
+    int can = 0;
+    if (cudaDeviceCanAccessPeer(&can, a, b) != cudaSuccess || !can) {
+        err = "dense: CUDA" + std::to_string(a) + " cannot reach CUDA" + std::to_string(b) + " directly";
+        return false;
+    }
+    if (cudaSetDevice(a) != cudaSuccess) {
+        err = "dense: cannot select CUDA" + std::to_string(a) + " to open the pair's door";
+        return false;
+    }
+    const cudaError_t e = cudaDeviceEnablePeerAccess(b, 0);
+    (void) cudaSetDevice(0);
+    if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+        (void) cudaGetLastError();
+        err = "dense: CUDA" + std::to_string(a) + " cannot reach CUDA" + std::to_string(b) + " directly: " + cudaGetErrorString(e);
+        return false;
+    }
+    (void) cudaGetLastError();   // an already-open door leaves the error to clear, like any refused call
+    return true;
+}
+
+bool tp_head_place(const TpHead& h, int rows, void* s, std::string& err) {
+    // A block that would write past the row, or read past its own, is refused rather than handed to the driver: the
+    // vocabulary's width comes from the pack, so getting this wrong is a wrong number somewhere upstream, and the
+    // sampler reading a row that was never filled is the kind of failure that shows up as a strange token weeks later.
+    if (rows <= 0 || h.cols <= 0 || h.dst_col0 < 0 || !h.dst || !h.src || h.src_pitch < h.cols || h.dst_pitch < h.cols ||
+        h.dst_col0 + h.cols > h.dst_pitch) {
+        err = "dense: a head block of " + std::to_string(rows) + " rows x " + std::to_string(h.cols) + " columns at column " +
+              std::to_string(h.dst_col0) + " of a " + std::to_string(h.dst_pitch) + "-wide row does not fit the logits";
+        return false;
+    }
+    const cudaError_t e =
+        cudaMemcpy2DAsync(h.dst + h.dst_col0, (size_t) h.dst_pitch * sizeof(float), h.src, (size_t) h.src_pitch * sizeof(float),
+                          (size_t) h.cols * sizeof(float), (size_t) rows, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
+    if (e != cudaSuccess) {
+        err = std::string("dense: the head block copy failed: ") + cudaGetErrorString(e);
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 void tp_hand_lower(TpHand& h) {
     volatile uint32_t* f = h.flag;
     f[0] = 0;

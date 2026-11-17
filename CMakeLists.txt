@@ -251,6 +251,15 @@ if(BUILD_TESTING)
   target_link_libraries(dense_tp_sizing_test PRIVATE dense warnings ${_gpu_runtime_target})
   basalt_gpu_test(NAME dense_tp_sizing_test COMMAND dense_tp_sizing_test)
   set_tests_properties(dense_tp_sizing_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # the pair's head: a card's vocabulary shard being placed into the whole-vocabulary logits row, its peer's across the
+  # pair's door - content exact row by row, and the crossing timed per window row, since that price is what the head's
+  # design is judged on (two GPUs; skipped without)
+  add_executable(dense_tp_head_test tests/dense/tp_head_test.cpp)
+  target_include_directories(dense_tp_head_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dense
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests/dense ${_gpu_include_directories})
+  target_link_libraries(dense_tp_head_test PRIVATE dense warnings ${_gpu_runtime_target})
+  basalt_gpu_test(NAME dense_tp_head_test COMMAND dense_tp_head_test)
+  set_tests_properties(dense_tp_head_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the pair's half of every matrix: the heads that divide, a rule for every tensor of the pack, and the two cards' byte
   # spans cutting it in two, read against the pack's own scale tiles (host only; the byte checks need a pack)
   add_executable(qwen35_tp_shard_test tests/models/qwen35/tp_shard_test.cpp src/dense/weight_shard.cpp)
