@@ -297,12 +297,41 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     check_launch("copy_from_mapped");
 }
 
+__global__ void copy_to_mapped_wt_kernel(float4* __restrict__ dst, const float4* __restrict__ src, int64_t n4) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        const float4 v = src[i];
+        asm volatile("st.global.wt.v4.f32 [%0], {%1,%2,%3,%4};" ::"l"(dst + i), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
+    }
+}
+
+void copy_to_mapped_wt(float* dst, const float* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        basalt::log::error("basalt", "copy_to_mapped_wt: n must be a multiple of 4 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    const int64_t n4 = n / 4;
+    const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+    copy_to_mapped_wt_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const float4*) src, n4);
+    check_launch("copy_to_mapped_wt");
+}
+
 // eight BF16 values to a 16-byte block on both sides: the card's own partial from device memory, the peer's from the mapped
 // slot it wrote.  Summed as floats and rounded once, so the pair's two halves of a row cost one rounding between them.
-__global__ void add_from_mapped_bf16_kernel(uint16_t* __restrict__ x, const volatile uint16_t* y, int64_t n8) {
+// the peer's half of a row block, fetched as it stands in memory rather than as this card last saw it.  A `volatile`
+// parameter does not achieve this: both kernels below load through a `uint4*`, which drops the qualifier.  Cost: nothing
+// measurable (30.36 vs 30.53 us for a 16-row x 5120 exchange) - the fetch is bound by the bus, not by the cache.
+__device__ __forceinline__ uint4 ld_peer4(const uint4* p, int64_t i) {
+    uint4 v;
+    asm volatile("ld.global.cv.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p + i));
+    return v;
+}
+
+__global__ void add_from_mapped_bf16_kernel(uint16_t* __restrict__ x, const uint16_t* y, int64_t n8) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += (int64_t) gridDim.x * blockDim.x) {
         uint4 a = ((const uint4*) x)[i];
-        const uint4 b = ((const uint4*) y)[i];   // the peer wrote it behind its flag, and this kernel sits behind the wait
+        const uint4 b = ld_peer4((const uint4*) y, i);   // the peer wrote it behind its flag; this kernel sits behind the wait
         const uint16_t* from = (const uint16_t*) &a;
         const uint16_t* add = (const uint16_t*) &b;
         uint16_t* into = (uint16_t*) &a;
@@ -329,7 +358,7 @@ __global__ void add_pair_bf16_kernel(uint16_t* __restrict__ x, const uint16_t* _
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += (int64_t) gridDim.x * blockDim.x) {
         uint4 a = ((const uint4*) x)[i];
         const uint4 o = ((const uint4*) own)[i];
-        const uint4 b = ((const uint4*) peer)[i];   // the peer wrote it behind its flag, and this kernel sits behind the wait
+        const uint4 b = ld_peer4((const uint4*) peer, i);   // the peer's block: fetched, not remembered
         const uint16_t* res = (const uint16_t*) &a;
         const uint16_t* one = (const uint16_t*) &o;
         const uint16_t* two = (const uint16_t*) &b;

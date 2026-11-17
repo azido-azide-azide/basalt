@@ -101,6 +101,17 @@ void signal_flag(uint32_t* flag, uint32_t value, void* stream);
 /// operation, which is submitted separately and costs a flush per node).
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 
+/// The write-through twin, for when the DESTINATION is MAPPED PINNED HOST MEMORY that a PEER will read.  Same shape and
+/// the same grid, but the stores are told not to stop in this card's caches.  That is not a micro-optimisation: with plain
+/// stores a card can retire a 160 KB block into a mapped slot "in 6.3 us" - 104 GB/s, which host DRAM cannot absorb - and
+/// the peer then reads the previous window's bytes.  Measured on a two-card pair over a Gen4 x8 link: the wrong sums arrive with a FASTER
+/// window, `signal_flag`'s `__threadfence_system()` does not cover them (it orders the fencing thread's own stores, not
+/// bytes the memory system is still holding), a fused put-and-release does not either, and reading the peer's block with
+/// `ld.global.cv` does not either - the bytes were simply not there yet.  With these stores the exchange costs what the
+/// bus costs, at any grid shape (30.6 vs 30.3 us for a 16-row x 5120 BF16 block on that link).  Where the destination is a card's own
+/// device memory use `copy_from_mapped`: write-through there would cost real bandwidth.
+void copy_to_mapped_wt(float* dst_mapped, const float* src, int64_t n, void* stream);
+
 /// `x[i] += y[i]` over `n` BF16 values, `y` read from MAPPED pinned host memory: the two cards' partial sums of the SAME
 /// rows, adding up to their sum on the card that reads the slot.  The values are summed as floats and rounded to BF16 ONCE,
 /// so a row block crosses the pair with one rounding rather than two.  `n` a multiple of 8 and both pointers 16-byte

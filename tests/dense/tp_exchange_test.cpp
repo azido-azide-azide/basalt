@@ -11,6 +11,8 @@
 // The other form - the sum landing added into the running residual rows - is the pair's other half of the proof: both
 // cards must end with rows identical to the bit, because the residual is the stream the pair keeps replicated.
 // The flags are lowered between windows only after both cards' streams are idle, which is the discipline `TpHand` states.
+// The replays ALTERNATE two sets of partials, so a card that answered from bytes the memory system never delivered shows
+// up as a wrong sum instead of as a suspiciously fast window - the failure `copy_to_mapped_wt` exists to close.
 //
 // GPU, synthetic, no model.  Needs two cards with some free memory; skips (77) without them.
 #include "internal.hpp"
@@ -50,11 +52,19 @@ constexpr int kExch = 8;      // exchanges per window here (a real window has tw
 constexpr int kRows = 16;     // a full decode window; the narrow case runs one row
 constexpr int kNarrow = 1;
 
-// the values the two cards start each exchange with, and the sum the exchange owes them
-uint16_t part_a(int e, int64_t i) { return kernels::bf16_from_f32(0.5f + (float) (i % 13) + 0.25f * (float) e); }
-uint16_t part_b(int e, int64_t i) { return kernels::bf16_from_f32(-0.125f + (float) ((i * 7) % 11) - 0.5f * (float) e); }
-uint16_t want(int e, int64_t i) {
-    return kernels::bf16_from_f32(kernels::f32_from_bf16(part_a(e, i)) + kernels::f32_from_bf16(part_b(e, i)));
+// The values the two cards start each exchange with, and the sum the exchange owes them, in TWO sets: set 1 shifts every
+// value by 8.  The replay loop below alternates them, and that is the point - a replay that reads the bytes it read last
+// time cannot tell a fresh answer from one the memory system never delivered, and a hand-off that answers from stale bytes
+// fails in exactly that direction: measured on a two-card pair, the stale answer came back with WRONG DATA, THE RIGHT SUMS
+// FOR THE OTHER SET'S NEIGHBOURS, and a FASTER window than the honest one.  Alternating sets turns that into a mismatch.
+uint16_t part_a(int set, int e, int64_t i) {
+    return kernels::bf16_from_f32((set ? 8.f : 0.f) + 0.5f + (float) (i % 13) + 0.25f * (float) e);
+}
+uint16_t part_b(int set, int e, int64_t i) {
+    return kernels::bf16_from_f32((set ? 8.f : 0.f) - 0.125f + (float) ((i * 7) % 11) - 0.5f * (float) e);
+}
+uint16_t want(int set, int e, int64_t i) {
+    return kernels::bf16_from_f32(kernels::f32_from_bf16(part_a(set, e, i)) + kernels::f32_from_bf16(part_b(set, e, i)));
 }
 
 // one card's buffer: `exchanges` fresh partials, one per exchange, at the offsets the exchanges read
@@ -69,11 +79,11 @@ bool fill(int dev, uint16_t* x, const std::vector<uint16_t>& host, int rows) {
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
-std::vector<uint16_t> host_partials(int rank, int rows) {
+std::vector<uint16_t> host_partials(int rank, int rows, int set) {
     std::vector<uint16_t> h((size_t) kExch * rows * kEmb);
     for (int e = 0; e < kExch; ++e)
         for (int64_t i = 0; i < (int64_t) rows * kEmb; ++i)
-            h[(size_t) e * rows * kEmb + i] = rank == 0 ? part_a(e, i) : part_b(e, i);
+            h[(size_t) e * rows * kEmb + i] = rank == 0 ? part_a(set, e, i) : part_b(set, e, i);
     return h;
 }
 
@@ -113,7 +123,8 @@ bool drain(cudaStream_t s0, cudaStream_t s1, TpHand& h, const std::string& at) {
 }
 
 // the sums the pair owes, on both cards, for every exchange
-bool check_sums(int dev0, int dev1, const uint16_t* x0, const uint16_t* x1, int rows, const std::string& at) {
+bool check_sums(int dev0, int dev1, const uint16_t* x0, const uint16_t* x1, int rows, const std::string& at, int set = 0,
+                bool quiet = false) {
     const int64_t block = (int64_t) rows * kEmb;
     std::vector<uint16_t> got0((size_t) kExch * block), got1((size_t) kExch * block);
     bool read_ok = true;
@@ -130,22 +141,26 @@ bool check_sums(int dev0, int dev1, const uint16_t* x0, const uint16_t* x1, int 
     int64_t first0 = -1, first1 = -1;
     for (int e = 0; e < kExch; ++e)
         for (int64_t i = 0; i < block; ++i) {
-            const uint16_t w = want(e, i);
+            const uint16_t w = want(set, e, i);
             if (got0[(size_t) e * block + i] != w) { ++wrong0; if (first0 < 0) first0 = ((int64_t) e << 40) | i; }
             if (got1[(size_t) e * block + i] != w) { ++wrong1; if (first1 < 0) first1 = ((int64_t) e << 40) | i; }
         }
-    if (wrong0 || wrong1) {   // the first difference on each card, spelled out
-        const int e0 = (int) (first0 >> 40);
-        const int64_t i0 = first0 & ((1ll << 40) - 1);
-        const int e1 = (int) (first1 >> 40);
-        const int64_t i1 = first1 & ((1ll << 40) - 1);
-        std::printf("#   card 0: %d wrong (first exchange %d value %lld: %.6f, wants %.6f)\n", wrong0, e0, (long long) i0,
-                    wrong0 ? kernels::f32_from_bf16(got0[(size_t) e0 * block + i0]) : 0.0f, kernels::f32_from_bf16(want(e0, i0)));
-        std::printf("#   card 1: %d wrong (first exchange %d value %lld: %.6f, wants %.6f)\n", wrong1, e1, (long long) i1,
-                    wrong1 ? kernels::f32_from_bf16(got1[(size_t) e1 * block + i1]) : 0.0f, kernels::f32_from_bf16(want(e1, i1)));
+    if (!quiet) {
+        if (wrong0 || wrong1) {   // the first difference on each card, spelled out
+            const int e0 = (int) (first0 >> 40);
+            const int64_t i0 = first0 & ((1ll << 40) - 1);
+            const int e1 = (int) (first1 >> 40);
+            const int64_t i1 = first1 & ((1ll << 40) - 1);
+            std::printf("#   card 0: %d wrong (first exchange %d value %lld: %.6f, wants %.6f)\n", wrong0, e0,
+                        (long long) i0, wrong0 ? kernels::f32_from_bf16(got0[(size_t) e0 * block + i0]) : 0.0f,
+                        kernels::f32_from_bf16(want(set, e0, i0)));
+            std::printf("#   card 1: %d wrong (first exchange %d value %lld: %.6f, wants %.6f)\n", wrong1, e1,
+                        (long long) i1, wrong1 ? kernels::f32_from_bf16(got1[(size_t) e1 * block + i1]) : 0.0f,
+                        kernels::f32_from_bf16(want(set, e1, i1)));
+        }
+        check(wrong0 == 0, at + ": card 0's every exchange holds the two cards' sum");
+        check(wrong1 == 0, at + ": card 1's every exchange holds the two cards' sum");
     }
-    check(wrong0 == 0, at + ": card 0's every exchange holds the two cards' sum");
-    check(wrong1 == 0, at + ": card 1's every exchange holds the two cards' sum");
     return wrong0 == 0 && wrong1 == 0;
 }
 
@@ -154,18 +169,20 @@ struct Cfg {
     TpHand* h = nullptr;
     uint16_t *x0 = nullptr, *x1 = nullptr;
     cudaStream_t s0 = nullptr, s1 = nullptr;
-    std::vector<uint16_t> hp0, hp1;
+    std::vector<uint16_t> hp0, hp1, hp0b, hp1b;   // sets 0 and 1, the replays alternate them
     int rows = kRows;
 
-    bool reset() {   // the exchanges' partials again, both cards idle
-        return fill(dev0, x0, hp0, rows) && fill(dev1, x1, hp1, rows);
+    bool reset(int set = 0) {   // the exchanges' partials again, both cards idle
+        return fill(dev0, x0, set ? hp0b : hp0, rows) && fill(dev1, x1, set ? hp1b : hp1, rows);
     }
 };
 
 bool run_case(const char* what, Cfg& c, int rows) {
     c.rows = rows;
-    c.hp0 = host_partials(0, rows);
-    c.hp1 = host_partials(1, rows);
+    c.hp0 = host_partials(0, rows, 0);
+    c.hp1 = host_partials(1, rows, 0);
+    c.hp0b = host_partials(0, rows, 1);
+    c.hp1b = host_partials(1, rows, 1);
     if (!c.reset()) return check(false, std::string(what) + ": the partials did not reach the cards"), false;
     // as launched
     run_window(*c.h, 0, c.s0, c.x0, rows);
@@ -196,29 +213,39 @@ bool run_case(const char* what, Cfg& c, int rows) {
     constexpr int kReplays = 30;
     const auto t0 = std::chrono::steady_clock::now();
     int bad = 0;
+    // The timed loop stays clean: a readback and a host comparison inside it would be measured as the pair's exchange
+    // (measured: 30.5 -> 469 us per exchange for two 160 KB readbacks and one pass over the rows).
     for (int r = 0; r < kReplays; ++r) {
-        if (!c.reset()) return check(false, std::string(what) + ": a replay's partials did not reach the cards"), false;
+        if (!c.reset(r % 2)) return check(false, std::string(what) + ": a replay's partials did not reach the cards"), false;
         if (cudaGraphLaunch(g1, c.s1) != cudaSuccess || cudaGraphLaunch(g0, c.s0) != cudaSuccess) {
             check(false, std::string(what) + ": a replay did not launch");
             return false;
         }
         if (!drain(c.s0, c.s1, *c.h, std::string(what) + ": replay " + std::to_string(r))) return false;
         dense::tp_hand_lower(*c.h);
-        if (r == 0 || r == kReplays - 1) {
-            const int64_t block = (int64_t) rows * kEmb;
-            std::vector<uint16_t> got((size_t) kExch * block);
-            (void) cudaSetDevice(c.dev0);
-            if (cudaMemcpy(got.data(), c.x0, got.size() * 2, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-            for (int e = 0; r == 0 && e < kExch; ++e)
-                for (int64_t i = 0; i < block; ++i)
-                    if (got[(size_t) e * block + i] != want(e, i)) { ++bad; break; }
-            if (bad) break;
-        }
     }
     const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
-    check(bad == 0, std::string(what) + ": every replay of the captured window gave the sums again");
+    check(bad == 0, std::string(what) + ": every replay of the captured window gave the sums it owes, on alternating partials");
     std::printf("# %s: %d replays of %d exchanges in %d rows: %.1f us per window, %.2f us per exchange\n", what, kReplays, kExch,
                 rows, us / kReplays, us / (kReplays * (double) kExch));
+    // the same captured windows again, untimed, verified one by one on alternating partials: the replay above cannot see a
+    // stale answer, this one can (see the note on part_a/part_b)
+    int stale = 0;
+    constexpr int kChecks = 12;
+    for (int r = 0; r < kChecks; ++r) {
+        const int set = r % 2;
+        if (!c.reset(set)) return check(false, std::string(what) + ": a checked replay's partials did not reach the cards"), false;
+        if (cudaGraphLaunch(g1, c.s1) != cudaSuccess || cudaGraphLaunch(g0, c.s0) != cudaSuccess) {
+            check(false, std::string(what) + ": a checked replay did not launch");
+            return false;
+        }
+        if (!drain(c.s0, c.s1, *c.h, std::string(what) + ": checked replay " + std::to_string(r))) return false;
+        dense::tp_hand_lower(*c.h);
+        if (!check_sums(c.dev0, c.dev1, c.x0, c.x1, rows, std::string(what) + ": checked replay " + std::to_string(r), set,
+                        /*quiet=*/r >= 3)) ++stale;
+    }
+    bad += stale;
+    std::printf("# %s: %d checked replays on alternating partials, %d wrong\n", what, kChecks, stale);
     cudaGraphExecDestroy(g0);
     cudaGraphExecDestroy(g1);
     return bad == 0;
@@ -229,8 +256,8 @@ uint16_t resid(int64_t i) { return kernels::bf16_from_f32(1.25f + 0.5f * (float)
 
 // one exchange added into the residual: its own rounding, in the order the pair runs the exchanges
 uint16_t step_resid(uint16_t from, int e, int64_t i) {
-    return kernels::bf16_from_f32(kernels::f32_from_bf16(from) + kernels::f32_from_bf16(part_a(e, i)) +
-                                  kernels::f32_from_bf16(part_b(e, i)));
+    return kernels::bf16_from_f32(kernels::f32_from_bf16(from) + kernels::f32_from_bf16(part_a(0, e, i)) +
+                                  kernels::f32_from_bf16(part_b(0, e, i)));
 }
 
 // The other form the forward uses: every exchange's sum landing ADDED INTO the running residual rows, which both cards
@@ -247,8 +274,10 @@ bool run_add_case(const char* what, Cfg& c, int rows) {
         }
     }
     c.rows = rows;
-    c.hp0 = host_partials(0, rows);
-    c.hp1 = host_partials(1, rows);
+    c.hp0 = host_partials(0, rows, 0);
+    c.hp1 = host_partials(1, rows, 0);
+    c.hp0b = c.hp0;   // the residual case runs one window; the alternating sets belong to the replay loop
+    c.hp1b = c.hp1;
     if (!c.reset()) return check(false, std::string(what) + ": the partials did not reach the cards"), false;
     std::vector<uint16_t> hr((size_t) block);
     for (int64_t i = 0; i < block; ++i) hr[(size_t) i] = resid(i);

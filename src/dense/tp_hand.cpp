@@ -73,7 +73,9 @@ void tp_check(const TpHand& h, int e, int rows) {
 /// card `rank`'s half of exchange `e`: its rows into the block its peer reads, its own flag raised to `e` + 1, then the
 /// wait for the peer's flag at that value.  Everything queued after it on `s` reads the peer's block of `e`.
 void tp_send_wait(const TpHand& h, int rank, int e, const uint16_t* partial, int64_t values, void* s) {
-    kernels::copy_from_mapped((float*) tp_block(h, rank, e), (const float*) partial, values / 2, s);   // the bytes, as floats
+    // the bytes, as floats, written THROUGH this card's caches: a slot the peer reads must hold them by the time the
+    // kernel that put them is done, and a plain store only promises they left the thread (see copy_to_mapped_wt)
+    kernels::copy_to_mapped_wt((float*) tp_block(h, rank, e), (const float*) partial, values / 2, s);
     kernels::signal_flag(h.flag + rank, (uint32_t) e + 1, s);
     kernels::wait_flag_ge(h.flag + (1 - rank), (uint32_t) e + 1, s);
 }
