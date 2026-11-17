@@ -75,15 +75,6 @@ uint8_t lcg(uint32_t& x) {
 
 // ---- independent layout models: the source byte of a slice element, from the formats' own formulas ----
 
-// NVFP4_PLANES: codes [rows][K/2] at 0; scales at rows*K/2, byte (row, group) at
-// ((row/128)*(K/64) + group/4)*512 + (row%32)*16 + ((row%128)/32)*4 + group%4
-uint64_t nvfp4_src(int64_t rows, int64_t K, int64_t r, int64_t v) {   // v: value column of the full matrix
-    return (uint64_t) r * K / 2 + (uint64_t) v / 2;
-}
-uint64_t nvfp4_scale_src(int64_t rows, int64_t K, int64_t r, int64_t g) {
-    return (uint64_t) rows * K / 2 + ((uint64_t) (r / 128) * (K / 64) + g / 4) * 512 + (r % 32) * 16 + ((r % 128) / 32) * 4 + g % 4;
-}
-
 // gather the slice and check every byte against the layout model.  col_axis false: whole rows (in run order);
 // true: the columns of every row.  Only whole-nibble pairs and whole scale groups are addressed: runs keep them.
 void check_nvfp4(int64_t rows, int64_t K, const std::vector<GdnRun>& runs, bool col_axis, const std::string& tag) {
@@ -100,6 +91,7 @@ void check_nvfp4(int64_t rows, int64_t K, const std::vector<GdnRun>& runs, bool 
     dense::tp::gather_payload(full.data(), frags, slice.data());
     // the model: walk the slice's own address space and ask the layout where each byte came from
     const int64_t K2 = len_sum(runs), R2 = col_axis ? rows : len_sum(runs);
+    (void) R2;
     std::vector<uint64_t> expect;   // source byte of each code byte and scale byte of the slice, in slice order
     if (!col_axis) {
         int64_t rr = 0;
@@ -154,11 +146,9 @@ void check_q8(int64_t rows, int64_t K, const std::vector<GdnRun>& runs, bool col
     std::vector<Frag> frags = dense::tp::payload_fragments(dense::tp::kQ8_0, rows, K, runs, col_axis);
     check(!frags.empty(), tag + ": fragments produced");
     if (frags.empty()) return;
-    std::vector<uint8_t> slice(frags.empty() ? 0 : [& {
-        uint64_t n = 0;
-        for (const Frag& f : frags) n += f.len;
-        return n;
-    }());
+    uint64_t sn = 0;
+    for (const Frag& f : frags) sn += f.len;
+    std::vector<uint8_t> slice(sn);
     dense::tp::gather_payload(full.data(), frags, slice.data());
     // model: the slice's blocks, in slice order, are the runs' source blocks in slice order (each block 34 bytes whole)
     std::vector<uint64_t> expect;
@@ -216,7 +206,7 @@ int main() {
               p0.geom.gdn_v_heads == 24 && p0.geom.conv_channels() == 5120 && p0.geom.value_width() == 3072,
           "the card geometry halves heads, FFN and GDN (12q/2kv, 8704, 8k/24v, C 5120, V 3072)");
     check(p0.geom.n_embd == g.n_embd && p0.geom.head_dim == g.head_dim && p0.geom.gdn_state == g.gdn_state &&
-              p0.geom.kinds == g.kinds && p0.rope.theta == g.rope.theta,
+              p0.geom.kinds == g.kinds && p0.geom.rope.theta == g.rope.theta,
           "width, head size, state, layer kinds and rope carry over whole");
     check(p0.k0() == 0 && p1.k0() == 8 && p0.nk() == 8 && p0.nv() == 24, "key ranges [0,8) and [8,16), 24 value heads each");
 

@@ -72,20 +72,20 @@ std::vector<Frag> payload_fragments(uint32_t type, int64_t rows, int64_t cols, c
     const int64_t axis = col_axis ? cols : rows;
     if (rows <= 0 || cols <= 0 || !in_runs(axis, runs)) return {};
     std::vector<Frag> f;
-    int64_t at = 0;   // bytes written so far (fragments come back in ascending dst order)
+    uint64_t at = 0;   // bytes written so far (fragments come back in ascending dst order)
 
     if (!col_axis) {
         switch (type) {
             case kF32:
             case kBf16: {
                 const uint64_t rb = (uint64_t) cols * (type == kF32 ? 4 : 2);
-                for (const core::GdnRun& r : runs) f.push_back({(uint64_t) r.start * rb, at, (uint64_t) r.len * rb}), at += r.len * rb;
+                for (const core::GdnRun& r : runs) f.push_back({(uint64_t) r.start * rb, at, (uint64_t) r.len * rb}), at += (uint64_t) r.len * rb;
                 break;
             }
             case kQ8_0: {
                 if (cols % 32) return {};
-                const int64_t rb = cols / 32 * 34;
-                for (const core::GdnRun& r : runs) f.push_back({(uint64_t) r.start * rb, at, (uint64_t) r.len * rb}), at += r.len * rb;
+                const uint64_t rb = (uint64_t) cols / 32 * 34;
+                for (const core::GdnRun& r : runs) f.push_back({(uint64_t) r.start * rb, at, (uint64_t) r.len * rb}), at += (uint64_t) r.len * rb;
                 break;
             }
             case kNvfp4Planes: {
@@ -93,7 +93,7 @@ std::vector<Frag> payload_fragments(uint32_t type, int64_t rows, int64_t cols, c
                 for (const core::GdnRun& r : runs)
                     if (r.start % 128 || r.len % 128) return {};   // whole 128-row scale tiles
                 const int64_t G = cols / 64;
-                for (const core::GdnRun& r : runs) f.push_back({(uint64_t) r.start * cols / 2, at, (uint64_t) r.len * cols / 2}), at += r.len * cols / 2;
+                for (const core::GdnRun& r : runs) f.push_back({(uint64_t) r.start * cols / 2, at, (uint64_t) r.len * cols / 2}), at += (uint64_t) r.len * cols / 2;
                 const uint64_t so = (uint64_t) rows * cols / 2;
                 at = so;
                 for (const core::GdnRun& r : runs) {
@@ -139,7 +139,7 @@ std::vector<Frag> payload_fragments(uint32_t type, int64_t rows, int64_t cols, c
             break;
         }
         case kNvfp4Planes: {
-            if (!nvfp4_rows_cols(rows, cols)) return {};
+            if (!kernels::nvfp4p::fits(rows, cols)) return {};
             for (const core::GdnRun& k : runs)
                 if (k.start % 64 || k.len % 64) return {};   // whole 4-group scale tiles
             const int64_t G = cols / 64, G2 = K2 / 64;
