@@ -60,8 +60,22 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
             o.peer_gbps.push_back(c.mem_gbps);
         }
     }
+    // A tensor-parallel pair runs the *same* layers on every card, so the cards past the first are peers even though no expert
+    // tier, prompt line or layer stage was chosen for them. Without this the adapter is never told a second card exists and
+    // reserves the whole model on the main one - which is exactly how a pair's width never reaches the plan.
+    const bool tp_pair = o.diag_tp > 1;
+    if (tp_pair) {
+        for (size_t d = 1; d < roles.size(); ++d) {
+            if (std::find(o.peer_devices.begin(), o.peer_devices.end(), (int) d) != o.peer_devices.end()) continue;
+            o.peer_devices.push_back((int) d);
+            o.peer_gbps.push_back(d < ri.cards.size() ? ri.cards[d].mem_gbps : 0.0);
+        }
+    }
     basalt::log::info("basalt", "gpus: %s", line.c_str());
-    if (std::count(roles.begin(), roles.end(), bp::GpuRole::Idle) > 0)
+    if (tp_pair && roles.size() < (size_t) o.diag_tp)
+        basalt::log::warn("basalt", "tensor parallel %d asked for, %zu cards chosen: the pair cannot be that wide",
+                          o.diag_tp, roles.size());
+    if (!tp_pair && std::count(roles.begin(), roles.end(), bp::GpuRole::Idle) > 0)
         basalt::log::warn("basalt", "%s",
                           (ri.layer_stage ? std::string("one card runs the later layers beside the main card; later cards idle")
                            : prompt_line  ? std::string("one card reads prompts beside the main card; later cards idle")
