@@ -38,6 +38,10 @@ struct IndexRow {
     int scales_fp16 = 0;
     int act_kind = 0;
     bool raw16 = false;   ///< already 16-bit in the file (kinds 4/5)
+    // Row slices (see WeightTable::RowSlices): the stored planes' byte spans, relative to `src_off`, in
+    // (codes, scales, offsets) plane units with each span's length in FILE bytes.  Empty = the full tensor.
+    // After a slice is applied the plane fields above and ne1/dst_bytes describe the STORED (card's) tensor.
+    std::vector<std::pair<uint64_t, uint64_t>> c_spans, s_spans, o_spans;
 };
 
 /// How a segment's bytes must be transformed on the way from the pack to the arena.
@@ -89,8 +93,75 @@ PackFiles PackFiles::from(const ModelSources& s) {
     return p;
 }
 
+namespace {
+
+bool plane_per_row(uint64_t plane_bytes, int64_t ne1, uint64_t& per_row) {
+    if (plane_bytes == 0) { per_row = 0; return true; }
+    if (ne1 <= 0 || plane_bytes % static_cast<uint64_t>(ne1) != 0) return false;
+    per_row = plane_bytes / static_cast<uint64_t>(ne1);
+    return true;
+}
+
+int64_t runs_total(const std::vector<std::pair<int64_t, int64_t>>& runs) {
+    int64_t t = 0;
+    for (const auto& r : runs) t += r.second;
+    return t;
+}
+
+// The stored arena bytes for a row's planes under `runs` (dst units), or false with a reason.
+bool sliced_dst_bytes(const char* name, int code_bits, int64_t ne1, uint64_t dst_bytes,
+                      uint64_t codes_bytes, uint64_t scales_bytes, uint64_t offset_bytes,
+                      const std::vector<std::pair<int64_t, int64_t>>& runs, uint64_t& out, std::string& err) {
+    const int64_t total = runs_total(runs);
+    if (total <= 0 || total > ne1) {
+        err = std::string(name) + ": the row slice covers more rows than the tensor (or none)";
+        return false;
+    }
+    if (code_bits != 0) {
+        uint64_t pc = 0, ps = 0, po = 0;
+        if (!plane_per_row(codes_bytes, ne1, pc) || !plane_per_row(scales_bytes, ne1, ps) ||
+            !plane_per_row(offset_bytes, ne1, po)) {
+            err = std::string(name) + ": the plane bytes are not row-uniform, no row slice exists";
+            return false;
+        }
+        out = static_cast<uint64_t>(total) * (pc + ps + po);
+        return true;
+    }
+    uint64_t pdst = 0;
+    if (!plane_per_row(dst_bytes, ne1, pdst)) {
+        err = std::string(name) + ": the row bytes are not uniform, no row slice exists";
+        return false;
+    }
+    out = static_cast<uint64_t>(total) * pdst;
+    return true;
+}
+
+/// One index line's stored bytes under `runs`, parsing the full 19-field row the same way `load` does.
+bool line_sliced_dst(const char* line, const std::vector<std::pair<int64_t, int64_t>>& runs, uint64_t& out,
+                     std::string& err) {
+    char name[256] = {0};
+    int kind = 0, i1 = 0;
+    long long ne0 = 0, ne1 = 0;
+    int code_bits = 0, code_bias = 0, group_elems = 0, codebook = 0, has_offset = 0, scales_fp16 = 0, act_kind = 0;
+    unsigned long long src_off = 0, src_bytes = 0, dst_off = 0, dst_bytes = 0;
+    unsigned long long codes_bytes = 0, scales_bytes = 0, offset_bytes = 0;
+    const int n = std::sscanf(line,
+                              "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+                              name, &i1, &kind, &src_off, &src_bytes, &dst_off, &dst_bytes, &ne0, &ne1,
+                              &code_bits, &code_bias, &group_elems, &codebook, &has_offset, &codes_bytes,
+                              &scales_bytes, &offset_bytes, &scales_fp16, &act_kind);
+    if (n != 19) {
+        err = std::string("row slice: could not parse an index row (") + std::to_string(n) + " of 19 fields)";
+        return false;
+    }
+    return sliced_dst_bytes(name, code_bits, static_cast<int64_t>(ne1), dst_bytes, codes_bytes, scales_bytes,
+                            offset_bytes, runs, out, err);
+}
+
+}  // namespace
+
 bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& err,
-                             const std::set<std::string>* skip) {
+                             const std::set<std::string>* skip, const RowSlices* slices) {
     const std::string path = pack.index.path;
     IndexText f;
     if (!f.open(pack.index, err)) { err = "cannot open " + path + (err.empty() ? "" : " (" + err + ")"); return false; }
@@ -113,6 +184,12 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
             continue;
         if (skip->count(name)) continue;
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
+        if (slices != nullptr && slices->count(name)) {
+            uint64_t sbytes = 0;
+            if (!line_sliced_dst(line, (*slices)[name], sbytes, err)) return false;
+            compact += (sbytes + a - 1) / a * a;
+            continue;
+        }
         compact += (dst_bytes + a - 1) / a * a;
     }
     if (pool == 0) { err = "no '# align ... pool ...' header in " + path; return false; }
@@ -121,7 +198,8 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
 }
 
 bool WeightTable::pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, std::vector<uint64_t>& per_layer,
-                                      uint64_t& shared, std::string& err, const std::set<std::string>* skip) {
+                                      uint64_t& shared, std::string& err, const std::set<std::string>* skip,
+                                      const RowSlices* slices) {
     IndexText f;
     if (!f.open(pack.index, err)) { err = "cannot open " + pack.index.path + (err.empty() ? "" : " (" + err + ")"); return false; }
     per_layer.assign((size_t) n_layers, 0);
@@ -142,7 +220,11 @@ bool WeightTable::pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, s
             continue;
         if (skip != nullptr && skip->count(name)) continue;
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
-        const uint64_t bytes = (dst_bytes + a - 1) / a * a;
+        uint64_t eff_dst = dst_bytes;
+        if (slices != nullptr && slices->count(name)) {
+            if (!line_sliced_dst(line, (*slices)[name], eff_dst, err)) return false;
+        }
+        const uint64_t bytes = (eff_dst + a - 1) / a * a;
         const long l = std::strncmp(name, "blk.", 4) == 0 ? std::strtol(name + 4, nullptr, 10) : -1;
         if (l >= 0 && l < n_layers) per_layer[(size_t) l] += bytes;
         else shared += bytes;
@@ -172,7 +254,7 @@ bool WeightTable::index_code_bits(const PackFiles& pack, const std::string& name
 }
 
 bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_bytes, std::string& err,
-                       const std::set<std::string>* skip, bool report_progress) {
+                       const std::set<std::string>* skip, bool report_progress, const RowSlices* slices) {
     IndexText idx;
     if (!idx.open(pack.index, err)) { err = "cannot open " + pack.index.path; return false; }
 
@@ -217,6 +299,72 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
     }
 
     if (pool == 0 || rows.empty()) { err = "the dense index has no header or no rows"; return false; }
+
+    // Row slices: rewrite the named rows to their stored spans BEFORE any sizing or placement decision, so
+    // compaction, verification and the published WeightRefs all describe the card's tensor.
+    if (slices != nullptr) {
+        std::set<std::string> seen;
+        for (auto& r : rows) {
+            const auto it = slices->find(r.name);
+            if (it == slices->end()) continue;
+            seen.insert(r.name);
+            if (it->second.empty() || runs_total(it->second) > r.ne1) {
+                err = r.name + ": the row slice covers more rows than the tensor (or none)";
+                return false;
+            }
+            uint64_t stored_dst = 0;
+            if (r.code_bits != 0) {
+                uint64_t pc = 0, ps = 0, po = 0;
+                if (!plane_per_row(r.codes_bytes, r.ne1, pc) || !plane_per_row(r.scales_bytes, r.ne1, ps) ||
+                    !plane_per_row(r.offset_bytes, r.ne1, po)) {
+                    err = r.name + ": the plane bytes are not row-uniform, no row slice exists";
+                    return false;
+                }
+                const uint64_t scale_src_pr = r.scales_fp16 ? ps / 2 : ps;
+                const uint64_t scale_src_base = r.codes_bytes;
+                const uint64_t offset_src_base = r.codes_bytes + (r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes);
+                for (const auto& run : it->second) {
+                    if (run.first < 0 || run.second <= 0) { err = r.name + ": a bad row-slice run"; return false; }
+                    if (pc) r.c_spans.push_back({static_cast<uint64_t>(run.first) * pc, static_cast<uint64_t>(run.second) * pc});
+                    if (ps)
+                        r.s_spans.push_back({scale_src_base + static_cast<uint64_t>(run.first) * scale_src_pr,
+                                             static_cast<uint64_t>(run.second) * scale_src_pr});
+                    if (po)
+                        r.o_spans.push_back({offset_src_base + static_cast<uint64_t>(run.first) * po,
+                                             static_cast<uint64_t>(run.second) * po});
+                }
+                r.codes_bytes = static_cast<uint64_t>(runs_total(it->second)) * pc;
+                r.scales_bytes = static_cast<uint64_t>(runs_total(it->second)) * ps;
+                r.offset_bytes = static_cast<uint64_t>(runs_total(it->second)) * po;
+                uint64_t src = 0;
+                for (const auto& sp : r.c_spans) src += sp.second;
+                for (const auto& sp : r.s_spans) src += sp.second;
+                for (const auto& sp : r.o_spans) src += sp.second;
+                r.src_bytes = src;
+                stored_dst = r.codes_bytes + r.scales_bytes + r.offset_bytes;
+            } else {
+                uint64_t psrc = 0, pdst = 0;
+                if (!plane_per_row(r.src_bytes, r.ne1, psrc) || !plane_per_row(r.dst_bytes, r.ne1, pdst)) {
+                    err = r.name + ": the row bytes are not uniform, no row slice exists";
+                    return false;
+                }
+                for (const auto& run : it->second) {
+                    if (run.first < 0 || run.second <= 0) { err = r.name + ": a bad row-slice run"; return false; }
+                    r.c_spans.push_back({static_cast<uint64_t>(run.first) * psrc, static_cast<uint64_t>(run.second) * psrc});
+                }
+                r.src_bytes = static_cast<uint64_t>(runs_total(it->second)) * psrc;
+                stored_dst = static_cast<uint64_t>(runs_total(it->second)) * pdst;
+            }
+            r.dst_bytes = stored_dst;
+            r.ne1 = runs_total(it->second);
+        }
+        for (const auto& s : *slices)
+            if (!seen.count(s.first)) {
+                err = "row slice names " + s.first + ", which the index does not have";
+                return false;
+            }
+    }
+
     // Plan v0.3 P1: a skip set compacts the arena.  Kept rows are re-placed in index order at the index's
     // alignment; skipped rows keep their metadata and get no bytes.
     std::vector<bool> skipped(rows.size(), false);
@@ -316,27 +464,49 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         }
 
         // ---- the segment list: what this tensor's bytes are, plane by plane, in both forms
-        Seg segs[3];
-        int n_segs = 0;
+        std::vector<Seg> segs;
         bool bad = false;
         uint64_t sum_src = 0, sum_dst = 0;
-        if (r.codes_bytes != 0) {
+        // A sliced row: the spans, plane by plane, become the segments directly (the plane fields already
+        // hold the stored sizes; the spans hold the file offsets and lengths, relative to src_off).
+        const bool sliced_row = !r.c_spans.empty() || !r.s_spans.empty() || !r.o_spans.empty();
+        if (sliced_row && r.code_bits != 0) {
+            for (const auto& sp : r.c_spans) segs.push_back(Seg{sp.first, sp.second, 0, sp.second, Conv::Copy});
+            for (const auto& sp : r.s_spans)
+                segs.push_back(Seg{sp.first, sp.second, r.codes_bytes, sp.second * (r.scales_fp16 ? 2 : 1),
+                                   r.scales_fp16 ? Conv::WidenF16 : Conv::Copy});
+            for (const auto& sp : r.o_spans)
+                segs.push_back(Seg{sp.first, sp.second, r.codes_bytes + r.scales_bytes, sp.second, Conv::Copy});
+        } else if (sliced_row) {
+            const uint64_t dst_per_src = r.src_bytes > 0 ? r.dst_bytes * 1000 / r.src_bytes : 1000;
+            uint64_t at = 0;
+            for (const auto& sp : r.c_spans) {
+                const uint64_t dlen = sp.second * dst_per_src / 1000;
+                Conv c = Conv::Copy;
+                if (!r.raw16) {
+                    if (r.kind == WeightKind::Bf16InF32) c = Conv::Bf16High;
+                    else if (r.kind == WeightKind::F16InF32) c = Conv::ToF16;
+                }
+                segs.push_back(Seg{sp.first, sp.second, at, dlen, c});
+                at += dlen;
+            }
+        } else if (r.codes_bytes != 0) {
             // A quantized tensor: codes, then scales, then the optional offset plane, each contiguous in the
             // source span in that order (the converter verifies the contiguity and refuses otherwise).
-            segs[n_segs++] = Seg{0, r.codes_bytes, 0, r.codes_bytes, Conv::Copy};
+            segs.push_back(Seg{0, r.codes_bytes, 0, r.codes_bytes, Conv::Copy});
             if (r.scales_bytes) {
                 const uint64_t src_scale_bytes = r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes;
                 if (r.scales_fp16 && (r.scales_bytes % 2 || src_scale_bytes * 2 != r.scales_bytes)) {
                     err = r.name + ": an fp16 scale plane of an odd byte count";
                     bad = true;
                 }
-                segs[n_segs++] = Seg{r.codes_bytes, src_scale_bytes, r.codes_bytes, r.scales_bytes,
-                                     r.scales_fp16 ? Conv::WidenF16 : Conv::Copy};
+                segs.push_back(Seg{r.codes_bytes, src_scale_bytes, r.codes_bytes, r.scales_bytes,
+                                   r.scales_fp16 ? Conv::WidenF16 : Conv::Copy});
             }
             if (r.offset_bytes) {
                 const uint64_t after = r.codes_bytes + (r.scales_fp16 ? r.scales_bytes / 2 : r.scales_bytes);
-                segs[n_segs++] = Seg{after, r.offset_bytes, r.codes_bytes + r.scales_bytes, r.offset_bytes,
-                                     Conv::Copy};
+                segs.push_back(Seg{after, r.offset_bytes, r.codes_bytes + r.scales_bytes, r.offset_bytes,
+                                   Conv::Copy});
             }
         } else {
             // Everything else is one run whose transform is the row's kind.  The two promoted types shrink
@@ -359,9 +529,9 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
                 err = buf;
                 bad = true;
             }
-            segs[n_segs++] = Seg{0, r.src_bytes, 0, r.dst_bytes, c};
+            segs.push_back(Seg{0, r.src_bytes, 0, r.dst_bytes, c});
         }
-        for (int i = 0; i < n_segs; ++i) { sum_src += segs[i].src_bytes; sum_dst += segs[i].dst_bytes; }
+        for (size_t i = 0; i < segs.size(); ++i) { sum_src += segs[i].src_bytes; sum_dst += segs[i].dst_bytes; }
         // The segment list is this loop's own idea of the layout, and it is the ONLY thing standing between a
         // mis-sized plane and a wrong byte offset.  It is checked against both recorded totals, not trusted.
         if (!bad && (sum_src != r.src_bytes || sum_dst != r.dst_bytes)) {
@@ -376,7 +546,7 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         }
         if (bad) { cudaFreeHost(stage_out); return false; }
 
-        for (int si = 0; si < n_segs; ++si) {
+        for (size_t si = 0; si < segs.size(); ++si) {
             const Seg& s = segs[si];
             const bool widening = (s.conv == Conv::WidenF16);
             if (widening && (s.src_bytes & 1ull)) {

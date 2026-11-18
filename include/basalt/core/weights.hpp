@@ -114,16 +114,26 @@ struct PackFiles {
 
 class WeightTable {
 public:
+    /// Row slices per tensor: full index name -> the row runs (start, len) that THIS card's tensor holds.
+    /// A sliced tensor loads as exactly those rows, its planes packed in run order (the row-major block order
+    /// makes every plane subrange contiguous); a run list must cover at most `ne1` rows, and each plane's
+    /// bytes per row must be uniform (true for every stored form: rows are whole quant blocks).
+    /// The loader rewrites the row's shapes to the stored sizes, so sizing, compaction and WeightRef all see
+    /// the card's tensor.  Names not in the map load whole.
+    using RowSlices = std::map<std::string, std::vector<std::pair<int64_t, int64_t>>>;
+
     /// The arena size the index asks for, readable WITHOUT loading anything - so a caller can size its
     /// `DeviceArena` before committing to the load, and a plan that cannot fit is refused at startup rather
     /// than halfway through a 5 GB upload.
     /// With `skip`, the size of the compacted arena that holds every tensor EXCEPT the named ones.
+    /// With `slices`, the named tensors contribute their sliced sizes instead (see RowSlices).
     static bool pool_bytes(const PackFiles& pack, uint64_t& out, std::string& err,
-                           const std::set<std::string>* skip = nullptr);
+                           const std::set<std::string>* skip = nullptr, const RowSlices* slices = nullptr);
     /// The compacted arena of `pool_bytes` split by block: `per_layer[l]` is the bytes of the `blk.<l>.` tensors that
     /// are not in `skip`, `shared` those of every other tensor.
     static bool pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, std::vector<uint64_t>& per_layer,
-                                    uint64_t& shared, std::string& err, const std::set<std::string>* skip = nullptr);
+                                    uint64_t& shared, std::string& err, const std::set<std::string>* skip = nullptr,
+                                    const RowSlices* slices = nullptr);
 
     /// The `code_bits` field of one row of the dense index, readable WITHOUT loading anything (0 = the
     /// file stores the tensor unquantized; -1 = no such row).  The loader needs this
@@ -137,8 +147,11 @@ public:
     /// With `skip`, the named tensors are not read: their rows keep their metadata with `data == nullptr` and
     /// `resident == false`, and the other tensors are packed into the compacted arena `pool_bytes` sized.
     /// `report_progress == false` keeps a temporary load out of the startup progress lines.
+    /// With `slices`, the named tensors load only their row runs (see RowSlices); a misaligned or over-large
+    /// run list is a hard error.
     bool load(const PackFiles& pack, void* arena_base, uint64_t arena_bytes, std::string& err,
-              const std::set<std::string>* skip = nullptr, bool report_progress = true);
+              const std::set<std::string>* skip = nullptr, bool report_progress = true,
+              const RowSlices* slices = nullptr);
 
     const WeightRef* find(const std::string& name) const;
     /// Point a row at another device form that stands for the tensor (an 8-bit copy keyed by its own address,
