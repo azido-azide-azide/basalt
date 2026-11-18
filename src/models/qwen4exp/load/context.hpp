@@ -47,6 +47,10 @@ struct Context {
     std::function<void (int64_t, int64_t, std::set<std::string> &)> add_foreign;
     std::set<std::string>* hc8_names = nullptr;
     uint64_t* pool_bytes = nullptr;
+    // tensor parallel (qwen4exp --tp 2): the card's row-slice map and the card's own geometry (what the
+    // layout check expects of a half-wide tensor); null when the card runs the whole model
+    const basalt::core::WeightTable::RowSlices* fn_tp_slices = nullptr;
+    const basalt::core::ModelGeometry* fn_tp_card = nullptr;
     uint64_t* model_bytes = nullptr;
     uint64_t* expert_total_bytes = nullptr;
     uint64_t* cuda0_fixed_bytes = nullptr;
