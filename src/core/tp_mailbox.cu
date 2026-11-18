@@ -246,6 +246,23 @@ struct TpMailbox::Slot {
 
 TpMailbox::~TpMailbox() { close(); }
 
+// One warp, one block: wait for the driver's release count to reach this step's token. A nanosleep spin on a
+// host word - one SM, no timeout: the stall-watchdog is the safety net, and the point is precisely that this
+// wait must survive however long the host takes to finish queueing the pair.
+__global__ void tp_gate_kernel(volatile uint32_t* word, uint32_t token) {
+    while (*word < token) __nanosleep(200);
+}
+
+uint32_t TpMailbox::gate_raise() { return ++gate_seq_; }
+void TpMailbox::gate_release() {
+    if (gate_) __atomic_store_n(gate_, gate_seq_, __ATOMIC_RELEASE);
+}
+void TpMailbox::post_gate(uint32_t token, void* stream) {
+    if (!gate_) return;
+    tp_gate_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<volatile uint32_t*>(gate_), token);
+}
+
 bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_bytes, std::string& err) {
     close();
     if (rank0_dev == rank1_dev || slots == 0 || max_bytes == 0) {
@@ -270,6 +287,9 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
     std::memset(pinned, 0, total);
     block_ = static_cast<uint8_t*>(pinned);
     hang_ = reinterpret_cast<uint32_t*>(block_ + slot_span * slots);
+    gate_ = reinterpret_cast<uint32_t*>(block_ + slot_span * slots + 64);
+    gate_seq_ = 0;
+    *gate_ = 0;
     slot_views_ = new Slot[slots];
     n_slots_ = slots;
     dev0_ = rank0_dev;

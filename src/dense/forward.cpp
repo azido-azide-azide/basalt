@@ -800,19 +800,22 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
             err = "dense tp: an earlier exchange diverged; the pair's results have split";
             return false;
         }
+        const uint32_t token = m.tp->mb.gate_raise();
         {
             const core::OnDevice on(m.tp->peer_dev);
+            m.tp->mb.post_gate(token, st.peer->stream);   // the peer's step waits for this step's release below
             m.tp->epi = 0;
             if (!launch_window(*m.tp->peer, *st.peer, tokens, T, pos, pos3, err, false)) return false;
         }
         const size_t peer_epi = m.tp->epi;
         m.tp->epi = 0;
         if (!launch_window(m, st, tokens, T, pos, pos3, err, false)) return false;
+        m.tp->mb.gate_release();
         if (peer_epi != m.tp->epi)
             basalt::log::error("dense tp", "window T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
                                (long long) pos, (int) peer_epi, (int) m.tp->epi);
         {
-            // both cards' graphs exist: queue them back to back (rank 1 first, its exchanges wait for rank 0's flags)
+            // both cards' graphs exist and both hosts finished queueing: release the gate and queue back to back
             const core::OnDevice on(m.tp->peer_dev);
             if (cudaGraphLaunch(*window_graph(*m.tp->peer, *st.peer, T), st.peer->stream) != cudaSuccess)
                 return cuda_ok("dense tp peer window graph", err) && false;
@@ -1018,14 +1021,17 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
         std::vector<BatchSeg> ps((size_t) S);
         cudaStream_t s0 = segs[0].st->stream;
         for (int k = 0; k < S; ++k) ps[(size_t) k] = {segs[k].st->peer.get(), segs[k].T, segs[k].pos};
+        const uint32_t token = m.tp->mb.gate_raise();
         {
             const core::OnDevice on(m.tp->peer_dev);
+            m.tp->mb.post_gate(token, segs[0].st->peer->stream);
             m.tp->epi = 0;
             if (!launch_batch(*m.tp->peer, ps.data(), S, tokens, pos3, err, false)) return false;
         }
         const size_t peer_epi = m.tp->epi;
         m.tp->epi = 0;
         if (!launch_batch(m, segs, S, tokens, pos3, err, false)) return false;
+        m.tp->mb.gate_release();
         if (peer_epi != m.tp->epi)
             basalt::log::error("dense tp", "batch S=%d: cards queued %d and %d exchanges (not lockstep)", S,
                                (int) peer_epi, (int) m.tp->epi);
@@ -1177,9 +1183,11 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
             if (!m.tp->peer->ensure_chunk(err)) return false;
         }
         if (!m.ensure_chunk(err)) return false;
+        const uint32_t token = m.tp->mb.gate_raise();
         m.tp->epi = 0;
         {
             const core::OnDevice on(m.tp->peer_dev);
+            m.tp->mb.post_gate(token, st.peer->stream);
             chunk_start(*m.tp->peer, *st.peer, tokens, rows, T, pos3);
             chunk_layers(*m.tp->peer, *st.peer, T, pos, 0, m.g.n_layers, nullptr);
         }
@@ -1189,6 +1197,7 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
         m.tp->epi = 0;
         chunk_start(m, st, tokens, rows, T, pos3);
         chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
+        m.tp->mb.gate_release();
         basalt::log::info("dense tp", "chunk T=%d pos=%lld: card 0's %d exchanges enqueued", T, (long long) pos,
                           (int) m.tp->epi);
         if (peer_epi != m.tp->epi)
