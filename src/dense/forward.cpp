@@ -1185,9 +1185,13 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
             chunk_layers(*m.tp->peer, *st.peer, T, pos, 0, m.g.n_layers, nullptr);
         }
         const size_t peer_epi = m.tp->epi;
+        basalt::log::info("dense tp", "chunk T=%d pos=%lld: card 1's %d exchanges enqueued", T, (long long) pos,
+                          (int) peer_epi);
         m.tp->epi = 0;
         chunk_start(m, st, tokens, rows, T, pos3);
         chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
+        basalt::log::info("dense tp", "chunk T=%d pos=%lld: card 0's %d exchanges enqueued", T, (long long) pos,
+                          (int) m.tp->epi);
         if (peer_epi != m.tp->epi)
             basalt::log::error("dense tp", "chunk T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
                                (long long) pos, (int) peer_epi, (int) m.tp->epi);
