@@ -161,7 +161,7 @@ void prod_add(Model& m, const Linear& l, const void* yq, uint16_t* x, int T, cud
             if (l.scale) kernels::scale_values(part, l.scale, (int64_t) T * l.rows, s);
         }
         std::string e;
-        if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi++ & 1, part, x, (size_t) T * l.rows, s, e))
+        if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, x, (size_t) T * l.rows, s, e))
             basalt::log::error("dense tp", "%s", e.c_str());
         return;
     }
@@ -357,7 +357,7 @@ uint16_t* bf(float* p) { return reinterpret_cast<uint16_t*>(p); }
 void tp_chunk_add(Model& m, float* part, int64_t n, int T, cudaStream_t s) {
     (void) T;
     std::string e;
-    if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi++ & 1, part, residual(m.cs), (size_t) n, s, e))
+    if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, residual(m.cs), (size_t) n, s, e))
         basalt::log::error("dense tp", "%s", e.c_str());
 }
 
@@ -800,22 +800,15 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
             err = "dense tp: an earlier exchange diverged; the pair's results have split";
             return false;
         }
-        const uint32_t token = m.tp->mb.gate_raise();
+        m.tp->epi[0] = m.tp->epi[1] = 0;
         {
             const core::OnDevice on(m.tp->peer_dev);
-            m.tp->mb.post_gate(token, st.peer->stream);   // the peer's step waits for this step's release below
-            m.tp->epi = 0;
             if (!launch_window(*m.tp->peer, *st.peer, tokens, T, pos, pos3, err, false)) return false;
         }
-        const size_t peer_epi = m.tp->epi;
-        m.tp->epi = 0;
-        m.tp->mb.post_gate(token, st.stream);   // gated on both sides: either card's queue may fill while the host
-                                                // is still queueing the other, and a gated stream never blocks it
         if (!launch_window(m, st, tokens, T, pos, pos3, err, false)) return false;
-        m.tp->mb.gate_release();
-        if (peer_epi != m.tp->epi)
+        if (m.tp->epi[0] != m.tp->epi[1])
             basalt::log::error("dense tp", "window T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
-                               (long long) pos, (int) peer_epi, (int) m.tp->epi);
+                               (long long) pos, (int) m.tp->epi[1], (int) m.tp->epi[0]);
         {
             // both cards' graphs exist and both hosts finished queueing: release the gate and queue back to back
             const core::OnDevice on(m.tp->peer_dev);
@@ -1023,21 +1016,15 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
         std::vector<BatchSeg> ps((size_t) S);
         cudaStream_t s0 = segs[0].st->stream;
         for (int k = 0; k < S; ++k) ps[(size_t) k] = {segs[k].st->peer.get(), segs[k].T, segs[k].pos};
-        const uint32_t token = m.tp->mb.gate_raise();
+        m.tp->epi[0] = m.tp->epi[1] = 0;
         {
             const core::OnDevice on(m.tp->peer_dev);
-            m.tp->mb.post_gate(token, segs[0].st->peer->stream);
-            m.tp->epi = 0;
             if (!launch_batch(*m.tp->peer, ps.data(), S, tokens, pos3, err, false)) return false;
         }
-        const size_t peer_epi = m.tp->epi;
-        m.tp->epi = 0;
-        m.tp->mb.post_gate(token, s0);
         if (!launch_batch(m, segs, S, tokens, pos3, err, false)) return false;
-        m.tp->mb.gate_release();
-        if (peer_epi != m.tp->epi)
+        if (m.tp->epi[0] != m.tp->epi[1])
             basalt::log::error("dense tp", "batch S=%d: cards queued %d and %d exchanges (not lockstep)", S,
-                               (int) peer_epi, (int) m.tp->epi);
+                               (int) m.tp->epi[1], (int) m.tp->epi[0]);
         {
             const core::OnDevice on(m.tp->peer_dev);
             if (cudaGraphLaunch(*batch_graph(*m.tp->peer, ps.data(), S), ps[0].st->stream) != cudaSuccess)
@@ -1186,27 +1173,29 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
             if (!m.tp->peer->ensure_chunk(err)) return false;
         }
         if (!m.ensure_chunk(err)) return false;
-        const uint32_t token = m.tp->mb.gate_raise();
-        m.tp->epi = 0;
+        m.tp->epi[0] = m.tp->epi[1] = 0;
         {
             const core::OnDevice on(m.tp->peer_dev);
-            m.tp->mb.post_gate(token, st.peer->stream);
             chunk_start(*m.tp->peer, *st.peer, tokens, rows, T, pos3);
-            chunk_layers(*m.tp->peer, *st.peer, T, pos, 0, m.g.n_layers, nullptr);
         }
-        const size_t peer_epi = m.tp->epi;
-        basalt::log::info("dense tp", "chunk T=%d pos=%lld: card 1's %d exchanges enqueued", T, (long long) pos,
-                          (int) peer_epi);
-        m.tp->mb.post_gate(token, st.stream);
-        m.tp->epi = 0;
         chunk_start(m, st, tokens, rows, T, pos3);
-        chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
-        m.tp->mb.gate_release();
-        basalt::log::info("dense tp", "chunk T=%d pos=%lld: card 0's %d exchanges enqueued", T, (long long) pos,
-                          (int) m.tp->epi);
-        if (peer_epi != m.tp->epi)
+        // the layer bodies interleave across the cards: a card's queue only ever holds one layer's kernels, so the
+        // enqueue thread cannot block on a full stream while its peer's matching exchange still waits to be queued
+        // (a stream's pending-launch capacity is finite; a whole eager chunk's body exceeds it)
+        const bool block = m.o.drafter == Drafter::Block;
+        for (int il = 0; il < m.g.n_layers; ++il) {
+            {
+                const core::OnDevice on(m.tp->peer_dev);
+                chunk_layers(*m.tp->peer, *st.peer, T, pos, il, il + 1, nullptr);
+            }
+            chunk_layers(m, st, T, pos, il, il + 1, block ? &m.w.dflash : nullptr);
+        }
+        if (m.tp->epi[0] != m.tp->epi[1])
             basalt::log::error("dense tp", "chunk T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
-                               (long long) pos, (int) peer_epi, (int) m.tp->epi);
+                               (long long) pos, (int) m.tp->epi[1], (int) m.tp->epi[0]);
+        if (m.tp->epi[0] != m.tp->epi[1])
+            basalt::log::error("dense tp", "chunk T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
+                               (long long) pos, (int) m.tp->epi[1], (int) m.tp->epi[0]);
         if (!cuda_ok("dense tp chunk", err)) return false;
         return true;
     }

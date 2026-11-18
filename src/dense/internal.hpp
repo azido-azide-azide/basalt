@@ -130,7 +130,9 @@ struct TpHand {
     ModelPtr peer_model;        ///< owns it: the model running the layers half-wide on the other card
     Model* peer = nullptr;      ///< peer_model.get()
     int peer_dev = -1;          ///< its CUDA device
-    size_t epi = 0;             ///< exchanges so far this body (both bodies start it at 0; slots alternate by it)
+    // per-rank exchange counters: the k-th exchange of card 0 pairs with the k-th of card 1 and they must pick
+    // the same slot, which a shared counter would break the moment the drivers interleave the cards' enqueues
+    size_t epi[2] = {0, 0};     ///< exchanges so far, per body (each body's step starts its own at 0; slots alternate by it)
     ~TpHand();
 };
 
