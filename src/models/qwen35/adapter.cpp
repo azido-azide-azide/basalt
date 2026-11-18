@@ -212,26 +212,30 @@ public:
             return false;
         }
         uint64_t total = 0;
-        if (tp) {   // the bytes the load will read: each card's slices
+        uint64_t main_plan = 0;   // what the main card's progress plans (the split: total minus the peer's share; TP: rank 0's own)
+        if (tp) {   // the bytes the load will read: each card's slices (disjoint sets, each whole on its card)
             for (const TensorInfo& t : gg.tensors())
-                if (on_card_tp(t.name, o, 0)) total += tp_slice_bytes(t, *plan0);
-            total = total / 256 * 256;   // progress counts payloads, the blocks align; the rounding is noise
-        } else
+                if (on_card_tp(t.name, o, 0)) main_plan += tp_slice_bytes(t, *plan0);
+            for (const TensorInfo& t : gg.tensors())
+                if (on_card_tp(t.name, o, 1)) total += tp_slice_bytes(t, *plan1);
+            total += main_plan;
+        } else {
             for (const TensorInfo& t : gg.tensors())
                 if (!t.name.starts_with("mtp.")) total += tensor_payload_bytes(t);
+            main_plan = total;
+        }
         // a layer split's later layers count on the second card
         uint64_t peer_total = 0;
         if (tp) {
-            for (const TensorInfo& t : gg.tensors())
-                if (on_card_tp(t.name, o, 1)) peer_total += tp_slice_bytes(t, *plan1);
+            peer_total = total - main_plan;
         } else
             for (const TensorInfo& t : gg.tensors())
                 if (split_at_ > 0 && t.name.starts_with("blk.") && std::atoi(t.name.c_str() + 4) >= split_at_) peer_total += tensor_payload_bytes(t);
         core::LoadProgress::announce_total(total);
         const int prog_peer = tp ? tp_dev1 : (req.peer_devices.empty() ? 0 : req.peer_devices.front());
-        core::LoadProgress::plan(core::LoadProgress::cuda(0), total - peer_total);
+        core::LoadProgress::plan(core::LoadProgress::cuda(0), tp ? main_plan : total - peer_total);
         if (peer_total) core::LoadProgress::plan(core::LoadProgress::cuda(prog_peer), peer_total);
-        core::LoadProgress progress(core::LoadProgress::cuda(0), total - peer_total);
+        core::LoadProgress progress(core::LoadProgress::cuda(0), tp ? main_plan : total - peer_total);
         std::optional<core::LoadProgress> peer_progress;
         if (peer_total) peer_progress.emplace(core::LoadProgress::cuda(prog_peer), peer_total);
         progress_ = &progress;
