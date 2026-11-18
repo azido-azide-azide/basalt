@@ -733,7 +733,8 @@ namespace {
 
 // One card's window: its inputs uploaded, then its graph for T rows (the first window of T rows runs as launched, then is
 // captured for the next ones).  `tokens` null: the card takes its rows from the other (a split's second card).
-bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3, std::string& err) {
+bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3, std::string& err,
+                   bool launch = true) {
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
     const int32_t bounds[2] = {0, T}, first[2] = {(int32_t) pos, 0};
@@ -745,7 +746,7 @@ bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int
     st.alt_ready = T == 1 && st.gdn_alt != nullptr;
     cudaGraphExec_t& wg = st.wg[st.gdn != st.gdn_first ? 1 : 0][T];
     if (wg) {
-        if (cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
+        if (launch && cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
         return cuda_ok("dense window", err);
     }
     // The first window of T rows runs as launched, then is captured for the next ones.  A layer split's window waits on the
@@ -765,8 +766,16 @@ bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int
         return cuda_ok("dense window capture", err);
     }
     cudaGraphDestroy(graph);
-    if (split && cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
+    if (split && launch && cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
     return cuda_ok("dense window", err);
+}
+
+// A pair's cached window graph for this row count (null when launch_window has not captured one yet). The TP
+// driver captures both cards' graphs before launching either: an exchange spins for its peer, and capturing the
+// second card's graph while the first one's already runs would hold that spin for the whole capture.
+cudaGraphExec_t* window_graph(Model& m, SessionState& st, int T) {
+    cudaGraphExec_t& wg = st.wg[st.gdn != st.gdn_first ? 1 : 0][T];
+    return wg ? &wg : nullptr;
 }
 
 // The split's flags lowered for the next window: both cards are past the last one's (the main card's stream has met the
@@ -791,10 +800,18 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
         {
             const core::OnDevice on(m.tp->peer_dev);
             m.tp->epi = 0;
-            if (!launch_window(*m.tp->peer, *st.peer, tokens, T, pos, pos3, err)) return false;
+            if (!launch_window(*m.tp->peer, *st.peer, tokens, T, pos, pos3, err, false)) return false;
         }
         m.tp->epi = 0;
-        if (!launch_window(m, st, tokens, T, pos, pos3, err)) return false;
+        if (!launch_window(m, st, tokens, T, pos, pos3, err, false)) return false;
+        {
+            // both cards' graphs exist: queue them back to back (rank 1 first, its exchanges wait for rank 0's flags)
+            const core::OnDevice on(m.tp->peer_dev);
+            if (cudaGraphLaunch(*window_graph(*m.tp->peer, *st.peer, T), st.peer->stream) != cudaSuccess)
+                return cuda_ok("dense tp peer window graph", err) && false;
+        }
+        if (cudaGraphLaunch(*window_graph(m, st, T), st.stream) != cudaSuccess)
+            return cuda_ok("dense tp window graph", err) && false;
         cudaEventRecord(m.tp->join_ev, st.peer->stream);
         cudaStreamWaitEvent(st.stream, m.tp->join_ev, 0);
         return true;
@@ -920,7 +937,8 @@ void batch_body(Model& m, const BatchSeg* segs, int S, int rows, int max_n) {
 namespace {
 
 // One card's batch window (forward_batch); `tokens` null on a split's second card.
-bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
+bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err,
+                  bool launch = true) {
     WindowScratch& b = m.ws;
     const cudaStream_t s = segs[0].st->stream;
     int rows = 0, max_n = 1;
@@ -945,7 +963,7 @@ bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, 
     for (Model::BatchGraph& bg : m.batch_graphs)
         if (bg.key == key) {
             bg.used = ++m.batch_clock;
-            if (cudaGraphLaunch(bg.exec, s) != cudaSuccess) return cuda_ok("dense batch graph", err) && false;
+            if (launch && cudaGraphLaunch(bg.exec, s) != cudaSuccess) return cuda_ok("dense batch graph", err) && false;
             return cuda_ok("dense batch window", err);
         }
     // a composition's first window runs as launched, then is captured for the next ones (a layer split's: only captured, as
@@ -971,8 +989,17 @@ bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, 
         m.batch_graphs.erase(old);
     }
     m.batch_graphs.push_back({std::move(key), exec, ++m.batch_clock});
-    if (split && cudaGraphLaunch(exec, s) != cudaSuccess) return cuda_ok("dense batch graph", err) && false;
+    if (split && launch && cudaGraphLaunch(exec, s) != cudaSuccess) return cuda_ok("dense batch graph", err) && false;
     return cuda_ok("dense batch window", err);
+}
+
+// A pair's cached batch graph for this composition (see window_graph for why the pair captures before launching).
+cudaGraphExec_t* batch_graph(Model& m, const BatchSeg* segs, int S) {
+    Model::BatchKey key;
+    for (int k = 0; k < S; ++k) key.emplace_back(segs[k].st, segs[k].T);
+    for (Model::BatchGraph& bg : m.batch_graphs)
+        if (bg.key == key) return &bg.exec;
+    return nullptr;
 }
 
 }  // namespace
@@ -989,10 +1016,17 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
         {
             const core::OnDevice on(m.tp->peer_dev);
             m.tp->epi = 0;
-            if (!launch_batch(*m.tp->peer, ps.data(), S, tokens, pos3, err)) return false;
+            if (!launch_batch(*m.tp->peer, ps.data(), S, tokens, pos3, err, false)) return false;
         }
         m.tp->epi = 0;
-        if (!launch_batch(m, segs, S, tokens, pos3, err)) return false;
+        if (!launch_batch(m, segs, S, tokens, pos3, err, false)) return false;
+        {
+            const core::OnDevice on(m.tp->peer_dev);
+            if (cudaGraphLaunch(*batch_graph(*m.tp->peer, ps.data(), S), ps[0].st->stream) != cudaSuccess)
+                return cuda_ok("dense tp peer batch graph", err) && false;
+        }
+        if (cudaGraphLaunch(*batch_graph(m, segs, S), s0) != cudaSuccess)
+            return cuda_ok("dense tp batch graph", err) && false;
         cudaEventRecord(m.tp->join_ev, segs[0].st->peer->stream);
         cudaStreamWaitEvent(s0, m.tp->join_ev, 0);
         return true;

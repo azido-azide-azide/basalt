@@ -12,9 +12,12 @@
 namespace basalt::core {
 namespace {
 
-// One probe sleeps this long; the spin limit below bounds a warp's wait for its peer's epoch.
+// One probe sleeps this long; the spin limit below bounds a warp's wait for its peer's epoch. The budget must
+// cover the pair's cold start: the first steps pay lazy module loading on each card separately (CUDA keeps it
+// per-process, but the cards' first touches land seconds apart under capture and instantiate queues), and a
+// legitimately late peer must never be read as a divergence. A truly diverged pair burns this before hang_reported.
 constexpr unsigned kPollSleepNs = 100;
-constexpr unsigned kSpinLimit = 1000000;
+constexpr unsigned kSpinLimit = 20000000u;
 // Words between two warps' release lines: one host cache line per lane.
 constexpr int kFlagStride = 16;
 // Threads per exchange block: two warps, each warp an independent lane of the protocol.
