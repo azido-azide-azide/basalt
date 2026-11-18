@@ -548,7 +548,7 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
         kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s, g.gdn_k_heads, HV);
         if (f8) {
             kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
-                                         (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD), g.gdn_k_heads, HV);
+                                         (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD), nullptr, nullptr, g.gdn_k_heads, HV);
             chunk_residual_f8(m, L.out, T, s);
             return;
         }
