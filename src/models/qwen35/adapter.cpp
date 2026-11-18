@@ -193,10 +193,9 @@ public:
                 err = "qwen35: --tp and --diag-split-at do not mix (a layer split and a card split are different cuts)";
                 return false;
             }
-            if (want_block || want_mtp) {
-                err = "qwen35: --tp does not run a drafter yet (its head lives on rank 0 alone, unwired)";
-                return false;
-            }
+            // the drafter runs on rank 0 alone (its weights are rank-0 tensors and its kernels post no
+            // exchanges); the pair's verify windows carry its candidates through both cards' bodies
+
             if (o.vision) {
                 err = "qwen35: --tp does not run --vision yet";
                 return false;
