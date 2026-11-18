@@ -6,6 +6,7 @@
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/model_file.hpp"
+#include "basalt/dense/tp.hpp"
 #include "basalt/model/flags.hpp"
 #include "basalt/model/rope_flags.hpp"
 #include "basalt/program/options.hpp"
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <optional>
 
@@ -64,6 +66,14 @@ bool on_card(const std::string& name, const dense::Options& o, int lo, int hi) {
     }
     return lo == 0 && (name.starts_with("output") || (o.drafter == dense::Drafter::Block && name.starts_with("dflash.")) ||
                        (o.drafter == dense::Drafter::Mtp && name.starts_with("mtp.")));
+}
+
+// Whether a tensor-parallel card holds `name`: every card holds a slice of every layer; rank 0 alone holds the head,
+// the final norm and the drafter (the card that samples).
+bool on_card_tp(const std::string& name, const dense::Options& o, int rank) {
+    if (name.starts_with("blk.")) return true;
+    return rank == 0 && (name.starts_with("output") || (o.drafter == dense::Drafter::Block && name.starts_with("dflash.")) ||
+                         (o.drafter == dense::Drafter::Mtp && name.starts_with("mtp.")));
 }
 
 // The dense stack's options for a run of these flags (the drafter the pack carries, when drafting).
@@ -170,32 +180,77 @@ public:
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
-        if (!req.peer_devices.empty() && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
+        // tensor parallel: both cards hold every layer, a slice wide; rank 1 runs on the first peer device (CUDA1 by default)
+        const int tp = req.tp == 2 ? 2 : 0;
+        if (req.tp > 1 && !tp) {
+            err = "qwen35: --tp " + std::to_string(req.tp) + " is not a card count this model runs";
+            return false;
+        }
+        std::optional<dense::tp::RankPlan> plan0, plan1;
+        int tp_dev1 = 0;
+        if (tp) {
+            if (req.diag_split_at) {
+                err = "qwen35: --tp and --diag-split-at do not mix (a layer split and a card split are different cuts)";
+                return false;
+            }
+            if (const std::string tperr = dense::tp::check(g, 2); !tperr.empty()) {
+                err = "qwen35: " + tperr;
+                return false;
+            }
+            plan0 = dense::tp::rank_plan(g, 2, 0, err);
+            if (!err.empty()) return false;
+            plan1 = dense::tp::rank_plan(g, 2, 1, err);
+            if (!err.empty()) return false;
+            tp_dev1 = req.peer_devices.empty() ? 1 : req.peer_devices.front();
+        }
+        g_full_ = &g;
+        plan_ = tp ? &*plan0 : nullptr;
+        if (!tp && !req.peer_devices.empty() && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
         fd_ = platform::open_fd_utf8(path);
         if (fd_ < 0) {
             err = "cannot open " + path;
             return false;
         }
         uint64_t total = 0;
-        for (const TensorInfo& t : gg.tensors())
-            if (!t.name.starts_with("mtp.")) total += tensor_payload_bytes(t);
+        uint64_t main_plan = 0;   // what the main card's progress plans (the split: total minus the peer's share; TP: rank 0's own)
+        if (tp) {   // the bytes the load will read: each card's slices (disjoint sets, each whole on its card)
+            for (const TensorInfo& t : gg.tensors())
+                if (on_card_tp(t.name, o, 0)) main_plan += tp_slice_bytes(t, *plan0);
+            for (const TensorInfo& t : gg.tensors())
+                if (on_card_tp(t.name, o, 1)) total += tp_slice_bytes(t, *plan1);
+            total += main_plan;
+        } else {
+            for (const TensorInfo& t : gg.tensors())
+                if (!t.name.starts_with("mtp.")) total += tensor_payload_bytes(t);
+            main_plan = total;
+        }
         // a layer split's later layers count on the second card
         uint64_t peer_total = 0;
-        for (const TensorInfo& t : gg.tensors())
-            if (split_at_ > 0 && t.name.starts_with("blk.") && std::atoi(t.name.c_str() + 4) >= split_at_) peer_total += tensor_payload_bytes(t);
+        if (tp) {
+            peer_total = total - main_plan;
+        } else
+            for (const TensorInfo& t : gg.tensors())
+                if (split_at_ > 0 && t.name.starts_with("blk.") && std::atoi(t.name.c_str() + 4) >= split_at_) peer_total += tensor_payload_bytes(t);
         core::LoadProgress::announce_total(total);
-        core::LoadProgress::plan(core::LoadProgress::cuda(0), total - peer_total);
-        if (peer_total) core::LoadProgress::plan(core::LoadProgress::cuda(req.peer_devices.front()), peer_total);
-        core::LoadProgress progress(core::LoadProgress::cuda(0), total - peer_total);
+        const int prog_peer = tp ? tp_dev1 : (req.peer_devices.empty() ? 0 : req.peer_devices.front());
+        core::LoadProgress::plan(core::LoadProgress::cuda(0), tp ? main_plan : total - peer_total);
+        if (peer_total) core::LoadProgress::plan(core::LoadProgress::cuda(prog_peer), peer_total);
+        core::LoadProgress progress(core::LoadProgress::cuda(0), tp ? main_plan : total - peer_total);
         std::optional<core::LoadProgress> peer_progress;
-        if (peer_total) peer_progress.emplace(core::LoadProgress::cuda(req.peer_devices.front()), peer_total);
+        if (peer_total) peer_progress.emplace(core::LoadProgress::cuda(prog_peer), peer_total);
         progress_ = &progress;
         {   // each card's weights in one block: the main card's, and a split's later layers on the second card
             const int end = split_at_ > 0 ? split_at_ : g.n_layers;
-            if (!reserve_block(gg, o, 0, end, err)) return false;
-            if (split_at_ > 0) {
-                const core::OnDevice on(req.peer_devices.front());
-                if (!reserve_block(gg, o, split_at_, g.n_layers, err)) return false;
+            if (tp) {
+                if (!reserve_block_tp(gg, o, 0, *plan0, err)) return false;
+                const core::OnDevice on(tp_dev1);
+                if (!reserve_block_tp(gg, o, 1, *plan1, err)) return false;
+            } else {
+                if (!reserve_block(gg, o, 0, end, err)) return false;
+                if (split_at_ > 0) {
+                    const core::OnDevice on(req.peer_devices.front());
+                    if (!reserve_block(gg, o, split_at_, g.n_layers, err)) return false;
+                }
             }
         }
         dense::Weights w;
@@ -238,6 +293,27 @@ public:
             w.layers.push_back(L);
             peer_w.layers.push_back(P);
         }
+        if (tp) {   // rank 1's slices of every layer, on its own card
+            const uint64_t before = dev_bytes_;
+            bool ok = true;
+            {
+                const core::OnDevice on(tp_dev1);
+                const dense::tp::RankPlan* keep = plan_;
+                plan_ = &*plan1;
+                progress_ = &*peer_progress;
+                for (int il = 0; ok && il < g.n_layers; ++il) {
+                    dense::Layer P;
+                    P.kind = g.kinds[(size_t) il];
+                    ok = layer(gg, g, il, P, err);
+                    if (ok) peer_w.layers[(size_t) il] = P;
+                }
+                plan_ = keep;
+                progress_ = &progress;
+            }
+            if (!ok) return false;
+            peer_bytes_ = dev_bytes_ - before;
+            dev_bytes_ = before;
+        }
         if (want_block && !block_drafter(gg, w.dflash, H, err)) return false;
         if (want_mtp) {   // the pack's drafter layer, for --spec
             dense::Mtp& d = w.mtp;
@@ -269,6 +345,14 @@ public:
         if (split_at_ > 0)
             basalt::log::info("basalt qwen35", "layer split: %.2f GiB of layers %d-%d on CUDA%d", (double) peer_bytes_ / 1073741824.0, split_at_,
                               g.n_layers - 1, req.peer_devices.front());
+        if (tp) {
+            basalt::log::info("basalt qwen35", "tensor parallel: rank0 %.2f GiB on CUDA0, rank1 %.2f GiB on CUDA%d (both hold all %d layers, half wide)",
+                              (double) dev_bytes_ / 1073741824.0, (double) peer_bytes_ / 1073741824.0, tp_dev1, g.n_layers);
+            err = "qwen35: tensor-parallel weights loaded, rank0 " + std::to_string((long long) (dev_bytes_ >> 20)) +
+                  " MiB on CUDA0 and rank1 " + std::to_string((long long) (peer_bytes_ >> 20)) + " MiB on CUDA" +
+                  std::to_string(tp_dev1) + "; the tensor-parallel step is not wired yet";
+            return false;
+        }
         o.host_embedding_bytes = tensor_payload_bytes(*te);
         o.gpu_weight_bytes = dev_bytes_ + peer_bytes_;
         o.layer_end = split_at_;
@@ -463,6 +547,59 @@ private:
         uint64_t bytes = 0;
         for (const TensorInfo& t : gg.tensors())
             if (on_card(t.name, o, lo, hi)) bytes += weight_bytes(t);
+        return carve_block(gg, bytes, err);
+    }
+
+    // ---- tensor parallel: a card's slice of a pack tensor ------------------------------------------------
+    //
+    // The row-parallel matrices (qkv/conv, z, the per-head scalars, q, k, v, gate, up) take whole runs of output
+    // rows; the column-parallel ones (o, ssm_out, down) take runs of their K columns, repacked per block.  The
+    // runs are the dense::tp plan's; payload_fragments turns one into the byte spans of THIS tensor's type.
+
+    struct TpSlice {
+        std::vector<core::GdnRun> runs;
+        bool cols = false;                ///< the runs are over the column (K) axis, not the row axis
+        int64_t rows = 0, n_cols = 0;     ///< the full tensor's dimensions, kernels' order
+    };
+
+    static std::optional<TpSlice> tp_slice_for(const std::string& name, const dense::tp::RankPlan& p, const dense::Geometry& g) {
+        if (!name.starts_with("blk.")) return {};
+        const int64_t H = g.n_embd, AQ = (int64_t) g.n_head * g.head_dim, KV = (int64_t) g.n_kv * g.head_dim;
+        const int64_t C = g.conv_channels(), VD = g.value_width(), HV = g.gdn_v_heads, FF = g.n_ff;
+        const auto suf = [&](const char* e) { return name.size() >= strlen(e) && name.compare(name.size() - strlen(e), strlen(e), e) == 0; };
+        if (suf("attn_qkv.weight")) return TpSlice{p.qkv_rows(), false, C, H};
+        if (suf("ssm_conv1d.weight")) return TpSlice{p.qkv_rows(), false, C, g.gdn_conv};
+        if (suf("attn_gate.weight")) return TpSlice{p.v_rows(g.gdn_state), false, VD, H};
+        if (suf("ssm_alpha.weight") || suf("ssm_beta.weight")) return TpSlice{p.v_rows(1), false, HV, H};
+        if (suf("ssm_dt.bias") || suf("ssm_a")) return TpSlice{p.v_rows(1), false, HV, 1};
+        if (suf("ssm_out.weight")) return TpSlice{p.out_cols(), true, H, VD};
+        if (suf("attn_q.weight")) return TpSlice{p.q_rows(), false, 2 * AQ, H};
+        if (suf("attn_k.weight") || suf("attn_v.weight")) return TpSlice{p.kv_rows(), false, KV, H};
+        if (suf("attn_output.weight")) return TpSlice{p.o_cols(), true, H, AQ};
+        if (suf("ffn_gate.weight") || suf("ffn_up.weight")) return TpSlice{p.ffn_rows(), false, FF, H};
+        if (suf("ffn_down.weight")) return TpSlice{p.ffn_cols(), true, H, FF};
+        return {};
+    }
+
+    // the bytes a card's slice of `t` takes, 256-byte aligned as weight_bytes does (an uncuttable shape counts
+    // whole: the reserve is generous and the upload's error is the honest one)
+    uint64_t tp_slice_bytes(const TensorInfo& t, const dense::tp::RankPlan& p) const {
+        const auto sl = tp_slice_for(t.name, p, *g_full_);
+        if (!sl) return weight_bytes(t);
+        const auto frags = dense::tp::payload_fragments(t.type, sl->rows, sl->n_cols, sl->runs, sl->cols);
+        if (frags.empty()) return weight_bytes(t);
+        return (dense::tp::shard_bytes(frags) + 255) & ~(uint64_t) 255;
+    }
+
+    // One allocation on the current device for every tensor this card holds, slices counted (on_card_tp's).
+    bool reserve_block_tp(const GgufFile& gg, const dense::Options& o, int rank, const dense::tp::RankPlan& p, std::string& err) {
+        uint64_t bytes = 0;
+        for (const TensorInfo& t : gg.tensors())
+            if (on_card_tp(t.name, o, rank)) bytes += tp_slice_bytes(t, p);
+        return carve_block(gg, bytes, err);
+    }
+
+    bool carve_block(const GgufFile&, uint64_t bytes, std::string& err) {
         int dev = 0;
         cudaGetDevice(&dev);
         Block& b = blocks_[dev];
@@ -476,6 +613,53 @@ private:
         b.size = bytes;
         return true;
     }
+
+    // copy a tensor's fragments from the pack (`base`: where its payload starts in the file) into `dst`
+    // (the slice's payload), reading only the needed spans
+    bool copy_frags(const TensorInfo& t, const std::vector<dense::tp::Frag>& frags, uint64_t base, char* dst, std::string& err) {
+        for (const auto& f : frags) {
+            staging_.resize((size_t) f.len);
+            if (!platform::pread_all(fd_, staging_.data(), f.len, base + f.src) ||
+                cudaMemcpy(dst + f.dst, staging_.data(), f.len, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "qwen35: reading " + t.name + "'s card slice failed";
+                return false;
+            }
+            if (progress_) progress_->add(f.len);
+        }
+        return true;
+    }
+
+    // a tensor's card slice on the current device
+    void* upload_slice(const GgufFile& gg, const TensorInfo& t, const TpSlice& sl, std::string& err) {
+        const auto frags = dense::tp::payload_fragments(t.type, sl.rows, sl.n_cols, sl.runs, sl.cols);
+        if (frags.empty()) {
+            err = "qwen35: " + t.name + " is not a shape a card slice can cut";
+            return nullptr;
+        }
+        const uint64_t total = dense::tp::shard_bytes(frags);
+        void* d = take(total, t.name, err);
+        if (!d) return nullptr;
+        if (!copy_frags(t, frags, gg.data_start() + t.offset, (char*) d, err)) return nullptr;
+        dev_bytes_ += total;
+        return d;
+    }
+
+    // two BF16 tensors' card slices in one buffer, the first then the second
+    const uint16_t* bf16_pair_slice(const GgufFile& gg, const TensorInfo& ta, const TensorInfo& tb, const TpSlice& sl, std::string& err) {
+        const auto frags = dense::tp::payload_fragments(kTypeBf16, sl.rows, sl.n_cols, sl.runs, sl.cols);
+        if (frags.empty()) {
+            err = "qwen35: " + ta.name + " is not a shape a card slice can cut";
+            return nullptr;
+        }
+        const uint64_t half = dense::tp::shard_bytes(frags);
+        void* d = take(2 * half, ta.name, err);
+        if (!d) return nullptr;
+        for (const TensorInfo* t : {&ta, &tb})
+            if (!copy_frags(*t, frags, gg.data_start() + t->offset, (char*) d + (t == &tb ? half : 0), err)) return nullptr;
+        dev_bytes_ += 2 * half;
+        return (const uint16_t*) d;
+    }
+
     // `bytes` of the current device's block (256-byte aligned)
     void* take(uint64_t bytes, const std::string& name, std::string& err) {
         int dev = 0;
@@ -512,7 +696,11 @@ private:
 
     const float* floats(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err) {
         const TensorInfo* t = need(gg, name, kTypeF32, elems, err);
-        return t ? (const float*) upload(gg, *t, err) : nullptr;
+        if (!t) return nullptr;
+        if (plan_) {
+            if (auto sl = tp_slice_for(name, *plan_, *g_full_)) return (const float*) upload_slice(gg, *t, *sl, err);
+        }
+        return (const float*) upload(gg, *t, err);
     }
 
     // two BF16 tensors in one buffer, the first then the second
@@ -520,6 +708,9 @@ private:
         const TensorInfo* ta = need(gg, a, kTypeBf16, elems, err);
         const TensorInfo* tb = ta ? need(gg, b, kTypeBf16, elems, err) : nullptr;
         if (!tb) return nullptr;
+        if (plan_) {
+            if (auto sl = tp_slice_for(a, *plan_, *g_full_)) return bf16_pair_slice(gg, *ta, *tb, *sl, err);
+        }
         void* d = take(tensor_payload_bytes(*ta) + tensor_payload_bytes(*tb), a, err);
         if (!d) return nullptr;
         uint64_t at = 0;
@@ -555,8 +746,22 @@ private:
         l.type = type;
         l.rows = rows;
         l.cols = cols;
-        l.w = upload(gg, *t, err);
-        if (!l.w) return false;
+        if (plan_) {
+            if (auto sl = tp_slice_for(base + ".weight", *plan_, *g_full_)) {   // the card's slice, repacked
+                l.w = upload_slice(gg, *t, *sl, err);
+                if (!l.w) return false;
+                int64_t keep = 0;
+                for (const core::GdnRun& r : sl->runs) keep += r.len;
+                if (sl->cols) l.cols = keep;
+                else l.rows = keep;
+            } else {
+                l.w = upload(gg, *t, err);   // a shared matrix (there are none below blk.): whole on each card
+                if (!l.w) return false;
+            }
+        } else {
+            l.w = upload(gg, *t, err);
+            if (!l.w) return false;
+        }
         if (type == kTypeNvfp4Planes || type == kTypeF8) {
             auto sc = tensors_.find(base + ".scale");
             if (type == kTypeF8 && base == "output" && sc != tensors_.end() && (int64_t) sc->second.elements() == rows && rows > 1) {
@@ -577,6 +782,8 @@ private:
         uint64_t size = 0, used = 0;
     };
     std::map<int, Block> blocks_;        // per CUDA device: its weights, one allocation
+    const dense::Geometry* g_full_ = nullptr;      // the pack's geometry, for the tensor-parallel slice dimensions
+    const dense::tp::RankPlan* plan_ = nullptr;    // set while a tensor-parallel card's weights load
     size_t n_tensors_ = 0;
     uint64_t dev_bytes_ = 0;
     void* embd_ = nullptr;
@@ -632,6 +839,7 @@ public:
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
         else if (a == "--diag-split-at") o.diag_split_at = std::atoi(args.next("--diag-split-at"));
+        else if (a == "--tp") o.tp = std::atoi(args.next("--tp"));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
@@ -653,6 +861,14 @@ public:
         if (o.kv_resident < 0) {
             basalt::log::error("basalt qwen35", "--kv-resident %lld: cells per attention layer kept in VRAM, or 0 (all)",
                                (long long) o.kv_resident);
+            return 2;
+        }
+        if (o.tp > 1 && o.tp != 2) {
+            basalt::log::error("basalt qwen35", "--tp %d: 0/1 (off) or 2 cards", o.tp);
+            return 2;
+        }
+        if (o.tp == 2 && o.diag_split_at > 0) {
+            basalt::log::error("basalt qwen35", "--tp and --diag-split-at do not mix (a card slice and a layer cut)");
             return 2;
         }
         if (o.spec_given && (o.spec < 0 || o.spec > 16)) {
