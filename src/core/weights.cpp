@@ -176,13 +176,13 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
             if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &tensors) == 3) { pool = p; align = a; }
             continue;
         }
-        if (skip == nullptr) continue;
+        if (skip == nullptr && slices == nullptr) continue;
         char name[256] = {0};
         unsigned long long dst_bytes = 0, dummy = 0;
         int i1 = 0, i2 = 0;
         if (std::sscanf(line, "%255s %d %d %llu %llu %llu %llu", name, &i1, &i2, &dummy, &dummy, &dummy, &dst_bytes) != 7)
             continue;
-        if (skip->count(name)) continue;
+        if (skip != nullptr && skip->count(name)) continue;
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
         if (slices != nullptr && slices->count(name)) {
             uint64_t sbytes = 0;
@@ -193,7 +193,7 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
         compact += (dst_bytes + a - 1) / a * a;
     }
     if (pool == 0) { err = "no '# align ... pool ...' header in " + path; return false; }
-    out = skip ? compact : pool;
+    out = (skip != nullptr || slices != nullptr) ? compact : pool;
     return true;
 }
 
@@ -368,11 +368,11 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
     // Plan v0.3 P1: a skip set compacts the arena.  Kept rows are re-placed in index order at the index's
     // alignment; skipped rows keep their metadata and get no bytes.
     std::vector<bool> skipped(rows.size(), false);
-    if (skip != nullptr) {
+    if (skip != nullptr || slices != nullptr) {
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
         uint64_t at = 0;
         for (size_t i = 0; i < rows.size(); ++i) {
-            if (skip->count(rows[i].name)) { skipped[i] = true; continue; }
+            if (skip != nullptr && skip->count(rows[i].name)) { skipped[i] = true; continue; }
             rows[i].dst_off = at;
             at += (rows[i].dst_bytes + a - 1) / a * a;
         }
