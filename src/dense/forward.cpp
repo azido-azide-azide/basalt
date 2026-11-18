@@ -1066,7 +1066,8 @@ void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float*
     if (st.mtp_kc != nullptr) cudaMemcpyAsync(b.cat, b.tmp, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
 }
 
-void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last) {
+void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last,
+                    int scan_l1) {
     const Geometry& g = m.g;
     const Weights& w = m.w;
     const cudaStream_t s = st.stream;
@@ -1078,9 +1079,11 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
                            (taps && std::find(taps->target_layers.begin(), taps->target_layers.end(), g.n_layers - 1) !=
                                         taps->target_layers.end());
     // K/V streaming: the next attention layer that attends gets its earlier far cells staged meanwhile
+    const int scan_end = scan_l1 > 0 ? scan_l1 : l1;   // the pair's drivers slice the layers but staging prefetch must
+                                                       // still see the chunk's whole layer span
     const auto prefetch_from = [&](int il0) {
         if (m.stage.at >= pos) return;
-        for (int j = il0; j < l1; ++j)
+        for (int j = il0; j < scan_end; ++j)
             if (w.layers[(size_t) j].kind == Mixer::Attention) {
                 if (j < g.n_layers - 1 || last_read) stage_prefetch(m, st.far_kv[(size_t) m.attn_index[(size_t) j]], pos, s);
                 return;
@@ -1186,13 +1189,10 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
         for (int il = 0; il < m.g.n_layers; ++il) {
             {
                 const core::OnDevice on(m.tp->peer_dev);
-                chunk_layers(*m.tp->peer, *st.peer, T, pos, il, il + 1, nullptr);
+                chunk_layers(*m.tp->peer, *st.peer, T, pos, il, il + 1, nullptr, false, m.g.n_layers);
             }
-            chunk_layers(m, st, T, pos, il, il + 1, block ? &m.w.dflash : nullptr);
+            chunk_layers(m, st, T, pos, il, il + 1, block ? &m.w.dflash : nullptr, false, m.g.n_layers);
         }
-        if (m.tp->epi[0] != m.tp->epi[1])
-            basalt::log::error("dense tp", "chunk T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
-                               (long long) pos, (int) m.tp->epi[1], (int) m.tp->epi[0]);
         if (m.tp->epi[0] != m.tp->epi[1])
             basalt::log::error("dense tp", "chunk T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
                                (long long) pos, (int) m.tp->epi[1], (int) m.tp->epi[0]);
