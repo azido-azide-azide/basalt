@@ -131,7 +131,6 @@ struct TpHand {
     Model* peer = nullptr;      ///< peer_model.get()
     int peer_dev = -1;          ///< its CUDA device
     size_t epi = 0;             ///< exchanges so far this body (both bodies start it at 0; slots alternate by it)
-    cudaEvent_t join_ev = nullptr;   ///< created on the peer card: rank 1's step end, waited for on rank 0
     ~TpHand();
 };
 

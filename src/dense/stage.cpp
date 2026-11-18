@@ -946,7 +946,6 @@ bool split_session(Model& m, SessionState& st, std::string& err) {
 
 TpHand::~TpHand() {
     const core::OnDevice on(peer_dev);
-    if (join_ev) cudaEventDestroy(join_ev);
     mb.close();
     peer_model.reset();
 }
@@ -964,13 +963,6 @@ bool attach_tp(Model& m, ModelPtr peer, int dev, int64_t chunk_tokens, std::stri
     if (!h->mb.open(main_dev, dev, 2, slot_bytes, err)) {
         err = m.o.arch + ": tensor pair: " + err;
         return false;
-    }
-    {
-        const core::OnDevice on(dev);
-        if (cudaEventCreateWithFlags(&h->join_ev, cudaEventDisableTiming) != cudaSuccess) {
-            err = m.o.arch + ": tensor pair: cannot create its join event";
-            return false;
-        }
     }
     h->peer->tp = h.get();
     h->peer->tp_rank = 1;

@@ -789,6 +789,9 @@ void lower_flags(SplitHand& h) {
 
 }  // namespace
 
+// The pair's drivers queue each card's step on its own stream and never join them with an event: the mailbox's
+// per-round waits are the pair's only true dependencies (a card's exchange kernel cannot pass its peer's round), and
+// an event would have to live on one card's context while recorded on the other's - which CUDA refuses.
 bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
                     std::string& err) {
     if (m.tp) {   // the pair runs the same window half-wide on each card; the products' sums meet over the mailbox.
@@ -816,8 +819,6 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
         }
         if (cudaGraphLaunch(*window_graph(m, st, T), st.stream) != cudaSuccess)
             return cuda_ok("dense tp window graph", err) && false;
-        cudaEventRecord(m.tp->join_ev, st.peer->stream);
-        cudaStreamWaitEvent(st.stream, m.tp->join_ev, 0);
         return true;
     }
     if (m.split) {   // the second card's graph first: it waits for the main card's rows
@@ -1035,8 +1036,6 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
         }
         if (cudaGraphLaunch(*batch_graph(m, segs, S), s0) != cudaSuccess)
             return cuda_ok("dense tp batch graph", err) && false;
-        cudaEventRecord(m.tp->join_ev, segs[0].st->peer->stream);
-        cudaStreamWaitEvent(s0, m.tp->join_ev, 0);
         return true;
     }
     if (m.split) {   // the second card's sessions, their graph first: it waits for the main card's rows
@@ -1196,8 +1195,6 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
             basalt::log::error("dense tp", "chunk T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
                                (long long) pos, (int) peer_epi, (int) m.tp->epi);
         if (!cuda_ok("dense tp chunk", err)) return false;
-        cudaEventRecord(m.tp->join_ev, st.peer->stream);
-        cudaStreamWaitEvent(st.stream, m.tp->join_ev, 0);
         return true;
     }
     if (!m.ensure_chunk(err)) return false;
