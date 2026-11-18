@@ -99,10 +99,12 @@ void check_nvfp4(int64_t rows, int64_t K, const std::vector<GdnRun>& runs, bool 
         for (const GdnRun& r : runs)
             for (int64_t i = 0; i < r.len; ++i)
                 for (int64_t cb = 0; cb < K / 2; ++cb) expect.push_back((uint64_t) (r.start + i) * K / 2 + cb);
-        for (const GdnRun& r : runs)   // slice bands follow the runs' source bands, in run order
-            for (int64_t band = r.start / 128; band < (r.start + r.len) / 128; ++band)
-                for (int64_t tg = 0; tg < K / 64; ++tg)   // one whole 128-row x 4-group tile, relabelled
-                    expect.push_back((uint64_t) rows * K / 2 + ((uint64_t) band * (K / 64) + tg) * 512);
+        int64_t band = 0;
+        for (const GdnRun& r : runs) {   // slice bands renumber from 0 in run order; each source band is copied whole
+            for (int64_t srcb = r.start / 128, e = (r.start + r.len) / 128; srcb < e; ++srcb, ++band)
+                for (int64_t tg = 0; tg < K / 64; ++tg)   // one whole 128-row x 4-group tile (512 bytes), relabelled
+                    for (uint64_t i = 0; i < 512; ++i) expect.push_back((uint64_t) rows * K / 2 + (((uint64_t) srcb * (K / 64) + tg) * 512 + i));
+        }
     } else {
         for (int64_t r = 0; r < rows; ++r)
             for (const GdnRun& k : runs)
