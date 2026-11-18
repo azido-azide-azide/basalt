@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace basalt::core {
 
@@ -69,6 +70,15 @@ public:
     /// True when an exchange gave up waiting for its peer (sticky). Call after the round's stream work.
     bool hang_reported() const;
 
+    /// The pair's step gate: a card's queued step must not start spinning for its peer while the peer's host
+    /// thread is still enqueueing (module loading and graph instantiation can take seconds; the exchange's wait
+    /// budget must not depend on that). `post_gate` queues a one-warp kernel that waits for `gate_release`'s
+    /// count; the driver raises the count once both cards' steps are fully queued. The returned token is the
+    /// count this gate waits for.
+    uint32_t gate_raise();                       ///< the host's plan-to-release: a new step token
+    void gate_release();                         ///< the host's release: both cards' work is enqueued
+    void post_gate(uint32_t token, void* stream); ///< the queued wait, at a card stream's head
+
 private:
     struct Slot;
     int dev0_ = -1, dev1_ = -1;
@@ -77,7 +87,12 @@ private:
     size_t n_slots_ = 0;
     uint8_t* block_ = nullptr;   // the whole pinned block (slots' lines, then slots' payloads, then the hang word)
     uint32_t* hang_ = nullptr;   // the hang word (host view)
+    uint32_t* gate_ = nullptr;   // the step gate's release count (host view; the mapped pointer names it on cards too)
+    uint32_t gate_seq_ = 0;      // the host's issued step tokens
     Slot* slot_views_ = nullptr; // per slot: payload/flag pointers per rank and the per-rank device epochs
+    // debug (TP bring-up): the value count the pair's rank 1 last carried per slot, for the enqueue-time
+    // agreement check that the two cards' exchanges say the same size (a mismatch wedges the round forever)
+    std::vector<size_t> last_n_;
 };
 
 }  // namespace basalt::core

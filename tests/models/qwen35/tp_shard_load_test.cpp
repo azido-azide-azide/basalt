@@ -1,9 +1,10 @@
 // tests/models/qwen35/tp_shard_load_test.cpp - the tensor-parallel load of the real 27B pack: the adapter slices
 // every layer tensor per card (rank 0 and rank 1 together hold each payload exactly once - the fragments of both
-// cards, scattered back to their source offsets, rebuild the pack byte for byte), rank 0 alone holds the head,
-// embedding and drafter, and the bytes the load reports match what the tensor table says they must.  A load with
-// --tp and --diag-split-at together refuses.  Needs a 27B pack (argument or BASALT_QWEN35_PACK) and two GPUs
-// (the load puts a card's slices on each); exits 77 without them.
+// cards, scattered back to their source offsets, rebuild the pack byte for byte), rank 0 alone holds the head and
+// embedding, the load builds and pairs both card models, and each card's freed memory matches what the tensor
+// table says its slices must take.  A load that asks for the drafter on a pair refuses, as does --tp together
+// with --diag-split-at.  Needs a 27B pack (argument or BASALT_QWEN35_PACK) and two GPUs (the load puts a card's
+// slices on each); exits 77 without them.
 #include "basalt/core/model_file.hpp"
 #include "basalt/dense/tp.hpp"
 #include "basalt/model/adapter.hpp"
@@ -111,7 +112,17 @@ bool on_card_like(const std::string& name, dense::Drafter drafter, int rank) {
     return rank == 0 && (name.starts_with("output") || (drafter == dense::Drafter::Block && name.starts_with("dflash.")));
 }
 
-// run one load, check the reported bytes and both cards' fragment coverage of every layer tensor
+// one card's free device memory
+long long card_free(int dev) {
+    size_t free_b = 0, total_b = 0;
+    cudaSetDevice(dev);
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return -1;
+    cudaSetDevice(0);
+    return (long long) free_b;
+}
+
+// run one load: the no-drafter load must build and pair both card models, taking (within the scratch on top) what
+// the tensor table says; the drafter on a pair refuses; and both cards' fragment coverage of every layer tensor
 void try_load(const model::ModelAdapter& a, const std::string& pack, bool draft) {
     model::LoadRequest req;
     req.paths = {pack};
@@ -121,26 +132,13 @@ void try_load(const model::ModelAdapter& a, const std::string& pack, bool draft)
     req.draft = draft;
     req.spec = draft ? 16 : 0;
     std::unique_ptr<model::LoadedModel> loaded;
-    const model::Result r = a.load(req, loaded);
     const std::string tag = draft ? " with the block drafter" : "";
-    if (r.ok()) {
-        check(false, "a --tp 2 load stops where the step ends (not wired yet)" + tag);
+    if (draft) {
+        const model::Result rd = a.load(req, loaded);
+        check(!rd.ok() && rd.message.find("drafter") != std::string::npos,
+              "a --tp 2 load with the drafter refuses" + tag + ": " + rd.message);
         return;
     }
-    const bool got = r.message.find("tensor-parallel weights loaded") != std::string::npos;
-    check(got, "the --tp 2 load placed both cards and reported it" + tag + " (" + r.message + ")");
-    if (!got) return;
-    // rank0 MiB and rank1 MiB out of the message
-    const auto dig = [&](const std::string& key) -> long long {
-        size_t at = r.message.find(key);
-        if (at == std::string::npos) return -1;
-        at += key.size();
-        size_t b = r.message.find_first_of("0123456789", at);
-        size_t e = r.message.find(" MiB", b);
-        return b == std::string::npos || e == std::string::npos ? -1 : std::atoll(r.message.substr(b, e - b).c_str());
-    };
-    const long long rep0 = dig("rank0 "), rep1 = dig("rank1 ");
-    check(rep0 > 0 && rep1 > 0, "the message carries both ranks' MiB (" + std::to_string(rep0) + ", " + std::to_string(rep1) + ")");
 
     // expected bytes from the tensor table, and the two cards' fragments per tensor
     std::string err;
@@ -188,11 +186,22 @@ void try_load(const model::ModelAdapter& a, const std::string& pack, bool draft)
     platform::close_fd(fd);
     const int want_slices = g.gdn_layers() * 11 + g.attn_layers() * 7;   // per mixer kind, the slice classes
     check(sliced_tensors == want_slices, std::to_string(sliced_tensors) + " layer tensors sliced, the table holds " + std::to_string(want_slices));
-    check(rep0 >= (long long) (want0 >> 20) - 2 && rep0 <= (long long) (want0 >> 20) + 2,
-          "rank 0 reported " + std::to_string(rep0) + " MiB, the table says " + std::to_string(want0 >> 20));
-    check(rep1 >= (long long) (want1 >> 20) - 2 && rep1 <= (long long) (want1 >> 20) + 2,
-          "rank 1 reported " + std::to_string(rep1) + " MiB, the table says " + std::to_string(want1 >> 20));
-    check(want1 * 2 > want0 && want1 * 2 < want0 * 5, "rank 1 holds about half of rank 0 minus the head and drafter");
+    // the real load: both card models build and pair, and each card's free memory drops by (at least, and not
+    // unreasonably more than) the bytes its slices take - the pair's scratch and arenas ride on top of the weights
+    const long long free0 = card_free(0), free1 = card_free(1);
+    const model::Result r = a.load(req, loaded);
+    check(r.ok(), "the --tp 2 load built and paired both card models" + (r.ok() ? std::string() : ": " + r.message));
+    if (!r.ok()) return;
+    const long long used0 = free0 - card_free(0), used1 = free1 - card_free(1);
+    const long long slop = 3LL << 30;
+    check(used0 >= (long long) want0 && used0 <= (long long) want0 + slop,
+          "rank 0's card holds " + std::to_string(used0 >> 20) + " MiB, the table's slices say " + std::to_string(want0 >> 20) +
+          " or a little more");
+    check(used1 >= (long long) want1 && used1 <= (long long) want1 + slop,
+          "rank 1's card holds " + std::to_string(used1 >> 20) + " MiB, the table's slices say " + std::to_string(want1 >> 20) +
+          " or a little more");
+    check(want1 * 2 > want0 && want1 * 2 < want0 * 5, "rank 1 holds about half of rank 0 minus the head");
+    loaded.reset();   // the pair's memory goes back before the next case
     (void) axis_len;
 }
 }  // namespace
