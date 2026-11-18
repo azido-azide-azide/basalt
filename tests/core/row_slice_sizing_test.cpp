@@ -52,7 +52,7 @@ int main() {
         // D: a non-row-uniform quantized row (260 codes for 16 rows) - slices must refuse it.
         idx << "blk.1.bad.weight 0 0 512 324 0 324 32 16 4 0 32 0 0 260 64 0 0 0\n";
     }
-    const PackFiles p = [] {
+    const PackFiles p = [&] {
         PackFiles f;
         f.index = basalt::core::FileRange((dir / "index.txt").string());
         f.files[0] = basalt::core::FileRange((dir / "dense.bin").string());

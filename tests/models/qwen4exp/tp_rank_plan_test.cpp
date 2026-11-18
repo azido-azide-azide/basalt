@@ -83,7 +83,7 @@ int main() {
 
     // the loader map: every head-sliced role of every layer, sized to the shapes the layout contract pins
     {
-        WeightTable::RowSlices m0 = fn_row_slices(p0), m1 = fn_row_slices(p1);
+        core::WeightTable::RowSlices m0 = fn_row_slices(p0), m1 = fn_row_slices(p1);
         ok(m0.size() == 3 * g.n_layers && m1.size() == m0.size(), "the slice map covers 3 roles x 48 layers");
         int64_t rows0 = 0, rows1 = 0;
         for (const auto& kv : m0)

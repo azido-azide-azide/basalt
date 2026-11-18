@@ -77,8 +77,8 @@ FnPlace FnRankPlan::placement(const std::string& name, int64_t layer, bool* unkn
     return FnPlace::Replicated;
 }
 
-WeightTable::RowSlices fn_row_slices(const FnRankPlan& p) {
-    WeightTable::RowSlices m;
+core::WeightTable::RowSlices fn_row_slices(const FnRankPlan& p) {
+    core::WeightTable::RowSlices m;
     const auto qkv = p.qkv_rows();
     const auto gate = p.v_rows(p.full.ssm_state_size);
     const auto q = p.q_rows();

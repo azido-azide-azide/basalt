@@ -69,7 +69,7 @@ std::string fn_tp_check(const core::ModelGeometry& g, int tp);
 
 /// The loader's per-name row slices this card needs: the head-sliced mixer weights of every layer, keyed
 /// `blk.<l>.<role>` (the roles whose placement is RankRows; everything else the plan places by other rules).
-WeightTable::RowSlices fn_row_slices(const FnRankPlan& p);
+core::WeightTable::RowSlices fn_row_slices(const FnRankPlan& p);
 
 /// The plan for card `rank`; `err` (non-empty) when the check fails or the rank is out of range.
 FnRankPlan fn_rank_plan(const core::ModelGeometry& g, int tp, int rank, std::string& err);
