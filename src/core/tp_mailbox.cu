@@ -47,7 +47,7 @@ __device__ __forceinline__ void flag_release(uint32_t* p, uint32_t v) {
 // card while this kernel runs) and hand everything to `combine`. All vector loads sit in flight before the
 // stores. Returns false, warp-uniformly, once the wait gave up; the hang word is set for every warp then.
 template <class Combine>
-__device__ __forceinline__ bool tp_lane(int warp, int lane, Vec (&mine)[kG], Vec (&peer)[kG],
+__device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine)[kG], Vec (&peer)[kG],
                                         const int vecs, Vec* mine_payload, uint32_t* mine_flags,
                                         const Vec* peer_payload, const uint32_t* peer_flags,
                                         uint32_t* epochs, uint32_t* hang, Combine combine) {
@@ -70,6 +70,9 @@ __device__ __forceinline__ bool tp_lane(int warp, int lane, Vec (&mine)[kG], Vec
         unsigned spins = 0;
         while (static_cast<int32_t>(flag_acquire(&peer_flags[warp * kFlagStride]) - target) < 0) {
             __nanosleep(kPollSleepNs);
+            if (warp == 0 && (spins == 2000000u || spins == 10000000u))
+                printf("mb: rank %d warp 0 waits epoch %u, peer flag %u, spins %u\n", rank, target,
+                       flag_acquire(&peer_flags[warp * kFlagStride]), spins);
             if (++spins % 1024u == 0u && (spins > kSpinLimit || flag_acquire(hang) != 0u)) {
                 cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*hang)
                     .store(1u, cuda::memory_order_relaxed);
@@ -92,7 +95,7 @@ __device__ __forceinline__ bool tp_lane(int warp, int lane, Vec (&mine)[kG], Vec
 
 // The whole kernel body: one lane per warp of the grid, the grid's last warps idle past the payload.
 template <class Combine>
-__device__ __forceinline__ void exchange_stage(Vec* mine_payload, uint32_t* mine_flags,
+__device__ __forceinline__ void exchange_stage(int rank, Vec* mine_payload, uint32_t* mine_flags,
                                                const Vec* peer_payload, const uint32_t* peer_flags,
                                                uint32_t* epochs, uint32_t* hang, const int vecs,
                                                Combine combine) {
@@ -100,7 +103,7 @@ __device__ __forceinline__ void exchange_stage(Vec* mine_payload, uint32_t* mine
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     if (warp * (32 * kG) >= vecs) return;
     Vec mine[kG] = {}, peer[kG] = {};
-    tp_lane(warp, lane, mine, peer, vecs, mine_payload, mine_flags, peer_payload, peer_flags,
+    tp_lane(rank, warp, lane, mine, peer, vecs, mine_payload, mine_flags, peer_payload, peer_flags,
             epochs, hang, combine);
 }
 
@@ -193,22 +196,22 @@ struct SumF32 {
 
 __global__ __launch_bounds__(kBlockThreads) void exchange_bf16_kernel(
     VecBf16* partial, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
-    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs) {
-    exchange_stage(mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs,
+    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank) {
+    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs,
                    SumBf16{partial});
 }
 
 __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_kernel(
     const float* mine, VecBf16* base, Vec* mine_payload, uint32_t* mine_flags,
-    const Vec* peer_payload, const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs) {
-    exchange_stage(mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs,
+    const Vec* peer_payload, const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank) {
+    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs,
                    AddBf16{mine, base});
 }
 
 __global__ __launch_bounds__(kBlockThreads) void exchange_f32_kernel(
     Vec* partial, uint2* out16, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
-    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs) {
-    exchange_stage(mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs,
+    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank) {
+    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs,
                    SumF32{partial, out16});
 }
 
@@ -318,7 +321,7 @@ bool TpMailbox::exchange_bf16(int rank, size_t slot, void* partial, size_t bytes
     exchange_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
                            static_cast<cudaStream_t>(stream)>>>(
         static_cast<VecBf16*>(partial), s.payload[rank], s.flags[rank], s.payload[1 - rank],
-        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs));
+        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the BF16 exchange failed";
         return false;
@@ -343,7 +346,7 @@ bool TpMailbox::exchange_add_bf16(int rank, size_t slot, const float* mine, uint
     exchange_add_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
                                static_cast<cudaStream_t>(stream)>>>(
         mine, reinterpret_cast<VecBf16*>(base), s.payload[rank], s.flags[rank], s.payload[1 - rank],
-        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs));
+        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the add exchange failed";
         return false;
@@ -368,7 +371,7 @@ bool TpMailbox::exchange_f32(int rank, size_t slot, float* partial, uint16_t* bf
     exchange_f32_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<Vec*>(partial), reinterpret_cast<uint2*>(bf16_out), s.payload[rank],
         s.flags[rank], s.payload[1 - rank], s.flags[1 - rank], s.epochs[rank], hang_,
-        static_cast<int>(vecs));
+        static_cast<int>(vecs), rank);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the F32 exchange failed";
         return false;

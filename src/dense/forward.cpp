@@ -802,8 +802,12 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
             m.tp->epi = 0;
             if (!launch_window(*m.tp->peer, *st.peer, tokens, T, pos, pos3, err, false)) return false;
         }
+        const size_t peer_epi = m.tp->epi;
         m.tp->epi = 0;
         if (!launch_window(m, st, tokens, T, pos, pos3, err, false)) return false;
+        if (peer_epi != m.tp->epi)
+            basalt::log::error("dense tp", "window T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
+                               (long long) pos, (int) peer_epi, (int) m.tp->epi);
         {
             // both cards' graphs exist: queue them back to back (rank 1 first, its exchanges wait for rank 0's flags)
             const core::OnDevice on(m.tp->peer_dev);
@@ -1018,8 +1022,12 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
             m.tp->epi = 0;
             if (!launch_batch(*m.tp->peer, ps.data(), S, tokens, pos3, err, false)) return false;
         }
+        const size_t peer_epi = m.tp->epi;
         m.tp->epi = 0;
         if (!launch_batch(m, segs, S, tokens, pos3, err, false)) return false;
+        if (peer_epi != m.tp->epi)
+            basalt::log::error("dense tp", "batch S=%d: cards queued %d and %d exchanges (not lockstep)", S,
+                               (int) peer_epi, (int) m.tp->epi);
         {
             const core::OnDevice on(m.tp->peer_dev);
             if (cudaGraphLaunch(*batch_graph(*m.tp->peer, ps.data(), S), ps[0].st->stream) != cudaSuccess)
@@ -1164,17 +1172,25 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
             err = "dense tp: an earlier exchange diverged; the pair's results have split";
             return false;
         }
-        if (!m.tp->peer->ensure_chunk(err)) return false;
+        {
+            // the peer's chunk scratch must live on its own card
+            const core::OnDevice on(m.tp->peer_dev);
+            if (!m.tp->peer->ensure_chunk(err)) return false;
+        }
         if (!m.ensure_chunk(err)) return false;
+        m.tp->epi = 0;
         {
             const core::OnDevice on(m.tp->peer_dev);
-            m.tp->epi = 0;
             chunk_start(*m.tp->peer, *st.peer, tokens, rows, T, pos3);
             chunk_layers(*m.tp->peer, *st.peer, T, pos, 0, m.g.n_layers, nullptr);
         }
+        const size_t peer_epi = m.tp->epi;
         m.tp->epi = 0;
         chunk_start(m, st, tokens, rows, T, pos3);
         chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
+        if (peer_epi != m.tp->epi)
+            basalt::log::error("dense tp", "chunk T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
+                               (long long) pos, (int) peer_epi, (int) m.tp->epi);
         if (!cuda_ok("dense tp chunk", err)) return false;
         cudaEventRecord(m.tp->join_ev, st.peer->stream);
         cudaStreamWaitEvent(st.stream, m.tp->join_ev, 0);
