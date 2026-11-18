@@ -35,8 +35,9 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         err = "cannot create a CUDA stream";
         return false;
     }
-    // the drafter's state, the logits and the picks on the card that holds layer 0
-    const bool head = m.lb == 0, mtp = head && m.o.drafter == Drafter::Mtp, block = head && m.o.drafter == Drafter::Block;
+    // the drafter's state, the logits and the picks on the card that holds layer 0 (the tensor pair's rank 1 keeps none)
+    const bool head = m.lb == 0 && !m.tp_rank, mtp = head && m.o.drafter == Drafter::Mtp,
+                 block = head && m.o.drafter == Drafter::Block;
     size_t blockbytes = 0;
     if (block) {
         const BlockDrafter& bd = m.w.dflash;
@@ -189,6 +190,7 @@ public:
         block_ = m_.o.drafter == Drafter::Block;
         if (!init_state(m_, st_, err)) return false;
         if (m_.split && !split_session(m_, st_, err)) return false;
+        if (m_.tp && !tp_session(m_, st_, err)) return false;
         if (cudaHostAlloc((void**) &h_picks_, kWindow * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess) {
             err = "out of page-locked memory";
             return false;

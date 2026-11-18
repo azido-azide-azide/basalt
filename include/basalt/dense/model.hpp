@@ -153,6 +153,11 @@ bool attach_prompt_line(Model& m, int dev, int l_min, const Weights& w, std::str
 /// [0, cut).  The second card plans its products as the main card, so the output is the main card's alone to the bit.
 /// Called with the main card current, before any session is made.
 bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err);
+/// Tensor parallel: `peer` is a model made from the card plan of device `dev` (its half-wide weights already there),
+/// paired with `m` (rank 0): both run every layer of every window, batch and prompt chunk, and the column-parallel
+/// products' partial sums meet over a mailbox sized for a chunk's residual rows (`chunk_tokens` x n_embd).  Called
+/// with the main card current, before any session is made.
+bool attach_tp(Model& m, ModelPtr peer, int dev, int64_t chunk_tokens, std::string& err);
 /// Main-card bytes a second card's stage keeps (its hand-off buffers and the drafter features it holds back).
 uint64_t stage_main_bytes(const Geometry& g, const BlockDrafter& drafter);
 /// Main-card bytes a prompt line keeps (its hand-off buffers and the drafter features it holds back); 0 when a context of

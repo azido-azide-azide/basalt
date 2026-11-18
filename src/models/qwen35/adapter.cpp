@@ -193,6 +193,14 @@ public:
                 err = "qwen35: --tp and --diag-split-at do not mix (a layer split and a card split are different cuts)";
                 return false;
             }
+            if (want_block || want_mtp) {
+                err = "qwen35: --tp does not run a drafter yet (its head lives on rank 0 alone, unwired)";
+                return false;
+            }
+            if (o.vision) {
+                err = "qwen35: --tp does not run --vision yet";
+                return false;
+            }
             if (const std::string tperr = dense::tp::check(g, 2); !tperr.empty()) {
                 err = "qwen35: " + tperr;
                 return false;
@@ -348,10 +356,31 @@ public:
         if (tp) {
             basalt::log::info("basalt qwen35", "tensor parallel: rank0 %.2f GiB on CUDA0, rank1 %.2f GiB on CUDA%d (both hold all %d layers, half wide)",
                               (double) dev_bytes_ / 1073741824.0, (double) peer_bytes_ / 1073741824.0, tp_dev1, g.n_layers);
-            err = "qwen35: tensor-parallel weights loaded, rank0 " + std::to_string((long long) (dev_bytes_ >> 20)) +
-                  " MiB on CUDA0 and rank1 " + std::to_string((long long) (peer_bytes_ >> 20)) + " MiB on CUDA" +
-                  std::to_string(tp_dev1) + "; the tensor-parallel step is not wired yet";
-            return false;
+            // the pair's session and scratch rooms, card by card
+            const uint64_t reserve = (uint64_t) std::max(req.vram_reserve_mib, 0) << 20;
+            const dense::Geometry& g0 = plan0->geom;
+            const uint64_t need0 = dense::shared_bytes(g0, o.max_context, o.kv_int8, o.kv_resident) +
+                                   (uint64_t) o.sessions * dense::session_bytes(g0, o.max_context, false, o.kv_int8, o.kv_resident, 0, 0);
+            if (need0 + reserve + (512ull << 20) > free_b) {
+                err = "qwen35: rank 0 needs " + std::to_string((unsigned long long) (need0 >> 20)) +
+                      " MiB of session room on CUDA0, " + std::to_string((unsigned long long) (free_b >> 20)) +
+                      " MiB are free; lower --max-context or --parallel";
+                return false;
+            }
+            size_t free1 = 0, total1 = 0;
+            {
+                const core::OnDevice on(tp_dev1);
+                cudaMemGetInfo(&free1, &total1);
+            }
+            const dense::Geometry& g1 = plan1->geom;
+            const uint64_t need1 = dense::shared_bytes(g1, o.max_context, o.kv_int8, o.kv_resident) +
+                                   (uint64_t) o.sessions * dense::session_bytes(g1, o.max_context, false, o.kv_int8, o.kv_resident, 0, 0);
+            if (need1 + reserve + (512ull << 20) > free1) {
+                err = "qwen35: rank 1 needs " + std::to_string((unsigned long long) (need1 >> 20)) +
+                      " MiB of session room on CUDA" + std::to_string(tp_dev1) + ", " +
+                      std::to_string((unsigned long long) (free1 >> 20)) + " MiB are free; lower --max-context or --parallel";
+                return false;
+            }
         }
         o.host_embedding_bytes = tensor_payload_bytes(*te);
         o.gpu_weight_bytes = dev_bytes_ + peer_bytes_;
@@ -374,14 +403,35 @@ public:
                               "RAM per slot", (long long) dense::resident_cells(o.max_context, o.kv_resident), (long long) o.max_context,
                               (double) host_b / 1073741824.0);
         const uint64_t reserve = (uint64_t) std::max(req.vram_reserve_mib, 0) << 20;
-        if (need_b + reserve + (512ull << 20) > free_b) {
+        if (!tp && need_b + reserve + (512ull << 20) > free_b) {
             err = "qwen35: " + std::to_string((long long) o.sessions) + " session(s) of " + std::to_string((long long) o.max_context) +
                   " cells need " + std::to_string((unsigned long long) (need_b >> 20)) + " MiB, " +
                   std::to_string((unsigned long long) (free_b >> 20)) + " MiB are free; lower --max-context or --parallel";
             return false;
         }
-        model_ = dense::make_model(g, w, o, err);
+        model_ = dense::make_model(tp ? plan0->geom : g, w, o, err);
         if (!model_) return false;
+        if (tp) {   // rank 1's model (its plan's geometry; its weights already on its card) joins the pair
+            dense::Options o1 = o;
+            o1.drafter = dense::Drafter::None;
+            o1.draft = false;
+            o1.vision = false;
+            o1.mmproj = {};
+            dense::Weights w1 = peer_w;
+            w1.embd = w.embd;      // page-locked and mapped: the same address is valid on both cards
+            w1.head = w.head;      // rank 1 never reads it; its type keeps the product plans alike
+            dense::ModelPtr peer;
+            {
+                const core::OnDevice on(tp_dev1);
+                peer = dense::make_model(plan1->geom, w1, o1, err);
+            }
+            if (!peer) {
+                if (err.empty()) err = "qwen35: rank 1's model failed to build";
+                return false;
+            }
+            // one whole prompt chunk's residual rows is the widest exchange payload (dense's kChunk)
+            return dense::attach_tp(*model_, std::move(peer), tp_dev1, 4096, err);
+        }
         if (split_at_ > 0) return dense::attach_split(*model_, req.peer_devices.front(), split_at_, peer_w, err);
         if (!req.peer_devices.empty()) prompt_line(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
         return true;

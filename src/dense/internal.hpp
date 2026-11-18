@@ -1,6 +1,7 @@
 // src/dense/internal.hpp - the dense stack's model, session state and forward passes (see basalt/dense/model.hpp).
 #pragma once
 
+#include "basalt/core/tp_mailbox.hpp"
 #include "basalt/dense/model.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -120,6 +121,20 @@ struct SplitHand {
     size_t first_tap = 0;          ///< the first of them among the drafter's target layers
 };
 
+/// The tensor pair: the mailbox the two cards' column-parallel products sum through, and the other card's model
+/// (half-wide weights on its own card, its own scratch).  A step's exchanges take the mailbox's slots in host
+/// launch order, and both cards' bodies launch the same sequence, so every slot's epochs advance in lockstep -
+/// inside captured graphs too.  Owned by the rank 0 model, pointed at by both.
+struct TpHand {
+    core::TpMailbox mb;
+    ModelPtr peer_model;        ///< owns it: the model running the layers half-wide on the other card
+    Model* peer = nullptr;      ///< peer_model.get()
+    int peer_dev = -1;          ///< its CUDA device
+    size_t epi = 0;             ///< exchanges so far this body (both bodies start it at 0; slots alternate by it)
+    cudaEvent_t join_ev = nullptr;   ///< created on the peer card: rank 1's step end, waited for on rank 0
+    ~TpHand();
+};
+
 class Model {
 public:
     Geometry g;
@@ -162,6 +177,11 @@ public:
     SplitHand* hand = nullptr;                   // the layer split's decode hand-off, on both cards' models (null: none)
     Model* split_model = nullptr;                // the split's second card's model, and its CUDA device
     int split_dev = -1;
+    // the tensor pair (null: no tensor parallel): both cards run every layer half-wide, and every column-parallel
+    // product's partial meets the other card's over the mailbox; the residual rows stay equal on both cards
+    std::unique_ptr<TpHand> tp_own;              // the pair's hand, owned by the rank 0 model (both point at it)
+    TpHand* tp = nullptr;                        // the pair's shared hand (both cards' models point at one)
+    int tp_rank = 0;                             // 0: the card whose head the sessions sample
     ~Model();
     bool ensure_chunk(std::string& err);
     /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).
@@ -234,6 +254,9 @@ bool init_state(Model& m, SessionState& st, std::string& err);
 void free_state(SessionState& st);
 /// The layer split's second card's state of the session `st` of model `m` (st.peer).
 bool split_session(Model& m, SessionState& st, std::string& err);
+/// The tensor pair's rank 1 state of the session `st` of the rank 0 model `m` (st.peer): the same cells and recurrent
+/// state, of the card's head slices, on the peer card.
+bool tp_session(Model& m, SessionState& st, std::string& err);
 /// Tokens [pos, pos + n) of the session `st` across the layer split's cards, the chunks pipelined (the second card reads a
 /// chunk's later layers while the main card reads the next one's first layers); `progress` and `stop` as prompt_line_read's.
 /// A session with an MTP drafter reads its prompt chunk by chunk (split_chunk): that drafter reads every chunk's last rows.
