@@ -567,6 +567,13 @@ if(BUILD_TESTING)
   basalt_cpu_test(NAME fn_tp_rank_plan_test COMMAND fn_tp_rank_plan_test)
   set_tests_properties(fn_tp_rank_plan_test PROPERTIES TIMEOUT 60)
   endif()
+  if(BUILD_TESTING)
+  # the weight table's row-slice sizing: per-plane row arithmetic and the refusals (host only)
+  add_executable(row_slice_sizing_test tests/core/row_slice_sizing_test.cpp)
+  target_link_libraries(row_slice_sizing_test PRIVATE core)
+  basalt_cpu_test(NAME row_slice_sizing_test COMMAND row_slice_sizing_test)
+  set_tests_properties(row_slice_sizing_test PROPERTIES TIMEOUT 60)
+  endif()
   # the conversation cache: retention bookkeeping (header-only), the memory budget, the snapshot's validation (host
   # only: CUDA is linked but never initialized) and its transfer-failure paths, and a snapshot round trip on a device
   add_executable(conversation_cache_test tests/core/conversation_cache_test.cpp)

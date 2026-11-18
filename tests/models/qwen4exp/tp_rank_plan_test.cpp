@@ -81,6 +81,24 @@ int main() {
     for (const auto& c : p0.v_rows(g.ssm_state_size))
         ok(c.start % 128 == 0 && c.len % 128 == 0, "GDN value row runs 128-aligned");
 
+    // the loader map: every head-sliced role of every layer, sized to the shapes the layout contract pins
+    {
+        core::WeightTable::RowSlices m0 = fn_row_slices(p0), m1 = fn_row_slices(p1);
+        ok(m0.size() == 3 * g.n_layers && m1.size() == m0.size(), "the slice map covers 3 roles x 48 layers");
+        int64_t rows0 = 0, rows1 = 0;
+        for (const auto& kv : m0)
+            for (const auto& r : kv.second) rows0 += r.second;
+        for (const auto& kv : m1)
+            for (const auto& r : kv.second) rows1 += r.second;
+        const int64_t want = 12 * (2 * g.n_head * g.head_dim + 2 * g.n_head_kv * g.head_dim) +
+                             36 * (2 * g.ssm_conv_channels + g.ssm_value_dim);
+        ok(rows0 == want / 2 && rows1 == want - want / 2, "both cards' slices together cover exactly the sliced rows");
+        ok(m0.count("blk.3.attn_q.weight") && m0.count("blk.0.attn_qkv.weight") && m0.count("blk.0.ssm_conv1d.weight"),
+           "the map names per-kind roles on the right layers");
+        ok(!m0.count("blk.3.ssm_out.weight") && !m0.count("blk.0.hc_ffn_up.weight"),
+           "replicated roles appear in no slice");
+    }
+
     // the plan never asks for a column slice
     ok(!FnRankPlan::wants_columns("attn_qkv.weight") && !FnRankPlan::wants_columns("ssm_alpha.weight"),
        "row-sliced tensors want no columns");

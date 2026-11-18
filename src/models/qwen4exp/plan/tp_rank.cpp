@@ -64,16 +64,43 @@ FnPlace FnRankPlan::placement(const std::string& name, int64_t layer, bool* unkn
     if (name == "attn_q.weight" || name == "attn_k.weight" || name == "attn_v.weight")
         return qsa ? FnPlace::RankRows : FnPlace::Replicated;
     if (name == "attn_q_norm.weight" || name == "attn_k_norm.weight") return FnPlace::Replicated;
-    if (name == "attn_qkv.weight" || name == "attn_gate.weight" || name == "ssm_alpha.weight" ||
-        name == "ssm_beta.weight" || name == "ssm_dt.bias" || name == "ssm_a" || name == "ssm_norm.weight" ||
-        name == "ssm_conv1d.weight")
+    if (name == "attn_qkv.weight" || name == "attn_gate.weight" || name == "ssm_conv1d.weight")
         return FnPlace::RankRows;
+    if (name == "ssm_alpha.weight" || name == "ssm_beta.weight" || name == "ssm_dt.bias" || name == "ssm_a" ||
+        name == "ssm_norm.weight")
+        return FnPlace::Replicated;   // 1-D vectors of 48 values / state width: kernels take the head range
     if (name.rfind("hc_", 0) == 0 || name.rfind("indexer.", 0) == 0) return FnPlace::Replicated;
     if (name == "ffn_gate_inp.weight" || name == "ffn_gate_inp_shexp.weight") return FnPlace::Replicated;
     if (name == "ffn_gate_shexp.weight" || name == "ffn_up_shexp.weight" || name == "ffn_down_shexp.weight")
         return FnPlace::SharedOwner;
     if (unknown) *unknown = true;
     return FnPlace::Replicated;
+}
+
+core::WeightTable::RowSlices fn_row_slices(const FnRankPlan& p) {
+    core::WeightTable::RowSlices m;
+    const auto qkv = p.qkv_rows();
+    const auto gate = p.v_rows(p.full.ssm_state_size);
+    const auto q = p.q_rows();
+    const auto kv = p.kv_rows();
+    auto add = [&m](const std::string& name, const std::vector<core::GdnRun>& runs) {
+        std::vector<std::pair<int64_t, int64_t>> v;
+        for (const auto& r : runs) v.emplace_back(r.start, r.len);
+        m[name] = std::move(v);
+    };
+    for (int64_t l = 0; l < p.full.n_layers; ++l) {
+        const std::string b = "blk." + std::to_string(l) + ".";
+        if (is_qsa_layer(p.full, l)) {
+            add(b + "attn_q.weight", q);
+            add(b + "attn_k.weight", kv);
+            add(b + "attn_v.weight", kv);
+        } else {
+            add(b + "attn_qkv.weight", qkv);
+            add(b + "attn_gate.weight", gate);
+            add(b + "ssm_conv1d.weight", qkv);
+        }
+    }
+    return m;
 }
 
 bool FnRankPlan::wants_columns(const std::string& name) {
