@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace basalt::core {
 
@@ -78,6 +79,9 @@ private:
     uint8_t* block_ = nullptr;   // the whole pinned block (slots' lines, then slots' payloads, then the hang word)
     uint32_t* hang_ = nullptr;   // the hang word (host view)
     Slot* slot_views_ = nullptr; // per slot: payload/flag pointers per rank and the per-rank device epochs
+    // debug (TP bring-up): the value count the pair's rank 1 last carried per slot, for the enqueue-time
+    // agreement check that the two cards' exchanges say the same size (a mismatch wedges the round forever)
+    std::vector<size_t> last_n_;
 };
 
 }  // namespace basalt::core

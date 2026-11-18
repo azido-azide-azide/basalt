@@ -194,6 +194,19 @@ struct SumF32 {
     }
 };
 
+// Enqueue-time agreement: the pair's cards must say the same size every round (the grids' warp counts key off
+// it, and a round where they disagree wedges the pair's flags forever). Rank 1's call for a round comes first
+// (the drivers queue the deep card's step ahead); rank 0's compares. Zero: off (a reopen clears it).
+bool n_agree(size_t* last, size_t slot, int rank, size_t n, std::string& err) {
+    if (rank != 0) { last[slot] = n; return true; }
+    if (last[slot] != 0 && last[slot] != n) {
+        err = "tp mailbox: slot " + std::to_string(slot) + "'s round carries " + std::to_string(last[slot]) +
+              " values on card 1 and " + std::to_string(n) + " on card 0 (the cards disagree; the pair will not turn)";
+        return false;
+    }
+    return true;
+}
+
 __global__ __launch_bounds__(kBlockThreads) void exchange_bf16_kernel(
     VecBf16* partial, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
     const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank) {
@@ -316,6 +329,8 @@ bool TpMailbox::exchange_bf16(int rank, size_t slot, void* partial, size_t bytes
         return false;
     }
     const size_t vecs = bytes / kVecBytes;
+    if (last_n_.size() < n_slots_) last_n_.assign(n_slots_, 0);
+    if (!n_agree(last_n_.data(), slot, rank, bytes / kVecBytes * 8, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
@@ -341,6 +356,8 @@ bool TpMailbox::exchange_add_bf16(int rank, size_t slot, const float* mine, uint
         err = "tp mailbox: an add exchange's payload is out of range";
         return false;
     }
+    if (last_n_.size() < n_slots_) last_n_.assign(n_slots_, 0);
+    if (!n_agree(last_n_.data(), slot, rank, n, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_add_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
@@ -366,6 +383,8 @@ bool TpMailbox::exchange_f32(int rank, size_t slot, float* partial, uint16_t* bf
         err = "tp mailbox: an F32 exchange's payload is out of range";
         return false;
     }
+    if (last_n_.size() < n_slots_) last_n_.assign(n_slots_, 0);
+    if (!n_agree(last_n_.data(), slot, rank, n, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_f32_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
