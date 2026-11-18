@@ -561,6 +561,11 @@ if(BUILD_TESTING)
   target_link_libraries(expert_layout_test PRIVATE model_qwen4exp_engine)
   basalt_cpu_test(NAME expert_layout_test COMMAND expert_layout_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
   set_tests_properties(expert_layout_test PROPERTIES TIMEOUT 60)
+  # the Flash-Next TP card plan: role placements, row-run partitions, expert parity (host only)
+  add_executable(fn_tp_rank_plan_test tests/models/qwen4exp/tp_rank_plan_test.cpp)
+  target_link_libraries(fn_tp_rank_plan_test PRIVATE model_qwen4exp_engine core)
+  basalt_cpu_test(NAME fn_tp_rank_plan_test COMMAND fn_tp_rank_plan_test)
+  set_tests_properties(fn_tp_rank_plan_test PROPERTIES TIMEOUT 60)
   endif()
   # the conversation cache: retention bookkeeping (header-only), the memory budget, the snapshot's validation (host
   # only: CUDA is linked but never initialized) and its transfer-failure paths, and a snapshot round trip on a device
