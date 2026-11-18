@@ -92,10 +92,10 @@ std::vector<Frag> payload_fragments(uint32_t type, int64_t rows, int64_t cols, c
                 if (!kernels::nvfp4p::fits(rows, cols)) return {};
                 for (const core::GdnRun& r : runs)
                     if (r.start % 128 || r.len % 128) return {};   // whole 128-row scale tiles
-                const int64_t G = cols / 64;
+                const int64_t G = cols / 64, rlen = runs_len(runs);
                 for (const core::GdnRun& r : runs) f.push_back({(uint64_t) r.start * cols / 2, at, (uint64_t) r.len * cols / 2}), at += (uint64_t) r.len * cols / 2;
-                const uint64_t so = (uint64_t) rows * cols / 2;
-                at = so;
+                const uint64_t so = (uint64_t) rows * cols / 2;         // the full matrix's scale region
+                at = (uint64_t) rlen * cols / 2;                        // the slice's scale region
                 for (const core::GdnRun& r : runs) {
                     const uint64_t len = (uint64_t) (r.len / 128) * G * 512;
                     f.push_back({so + (uint64_t) (r.start / 128) * G * 512, at, len});
