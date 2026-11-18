@@ -186,7 +186,7 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
         if (slices != nullptr && slices->count(name)) {
             uint64_t sbytes = 0;
-            if (!line_sliced_dst(line, (*slices)[name], sbytes, err)) return false;
+            if (!line_sliced_dst(line, slices->at(name), sbytes, err)) return false;
             compact += (sbytes + a - 1) / a * a;
             continue;
         }
@@ -222,7 +222,7 @@ bool WeightTable::pool_bytes_by_layer(const PackFiles& pack, int64_t n_layers, s
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
         uint64_t eff_dst = dst_bytes;
         if (slices != nullptr && slices->count(name)) {
-            if (!line_sliced_dst(line, (*slices)[name], eff_dst, err)) return false;
+            if (!line_sliced_dst(line, slices->at(name), eff_dst, err)) return false;
         }
         const uint64_t bytes = (eff_dst + a - 1) / a * a;
         const long l = std::strncmp(name, "blk.", 4) == 0 ? std::strtol(name + 4, nullptr, 10) : -1;

@@ -14,6 +14,7 @@
 // at a head boundary (32/128/256-aligned — whole quant blocks in every arena form).  No kernel bytes move
 // here: this is the plan; the loader and the pair driver act on it.
 #include "basalt/core/gdn_head_split.hpp"
+#include "basalt/core/weights.hpp"   // WeightTable::RowSlices
 #include "basalt/models/qwen4exp/decode/layout.hpp"   // core::ModelGeometry
 
 #include <cstdint>
@@ -65,6 +66,10 @@ struct FnRankPlan {
 
 /// Why the geometry cannot run tensor-parallel on `tp` cards; empty when it can.
 std::string fn_tp_check(const core::ModelGeometry& g, int tp);
+
+/// The loader's per-name row slices this card needs: the head-sliced mixer weights of every layer, keyed
+/// `blk.<l>.<role>` (the roles whose placement is RankRows; everything else the plan places by other rules).
+WeightTable::RowSlices fn_row_slices(const FnRankPlan& p);
 
 /// The plan for card `rank`; `err` (non-empty) when the check fails or the rank is out of range.
 FnRankPlan fn_rank_plan(const core::ModelGeometry& g, int tp, int rank, std::string& err);
