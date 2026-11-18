@@ -809,6 +809,8 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
         }
         const size_t peer_epi = m.tp->epi;
         m.tp->epi = 0;
+        m.tp->mb.post_gate(token, st.stream);   // gated on both sides: either card's queue may fill while the host
+                                                // is still queueing the other, and a gated stream never blocks it
         if (!launch_window(m, st, tokens, T, pos, pos3, err, false)) return false;
         m.tp->mb.gate_release();
         if (peer_epi != m.tp->epi)
@@ -1030,6 +1032,7 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
         }
         const size_t peer_epi = m.tp->epi;
         m.tp->epi = 0;
+        m.tp->mb.post_gate(token, s0);
         if (!launch_batch(m, segs, S, tokens, pos3, err, false)) return false;
         m.tp->mb.gate_release();
         if (peer_epi != m.tp->epi)
@@ -1194,6 +1197,7 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
         const size_t peer_epi = m.tp->epi;
         basalt::log::info("dense tp", "chunk T=%d pos=%lld: card 1's %d exchanges enqueued", T, (long long) pos,
                           (int) peer_epi);
+        m.tp->mb.post_gate(token, st.stream);
         m.tp->epi = 0;
         chunk_start(m, st, tokens, rows, T, pos3);
         chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
