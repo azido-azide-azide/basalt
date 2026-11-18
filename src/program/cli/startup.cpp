@@ -112,8 +112,11 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     }
     // Batched serving reads a prompt on its own thread while verify windows run.  A lazy kernel load on that thread
     // synchronizes the context and can wait on a window kernel that waits on the load, so batched serving loads every
-    // kernel up front.  An explicit CUDA_MODULE_LOADING wins.
-    if (o.serve && o.batch >= 2 && !module_loading_set) basalt::platform::set_env("CUDA_MODULE_LOADING", "EAGER");
+    // kernel up front.  A tensor-parallel pair needs the same: its steps queue on both cards at once, and a card whose
+    // exchange kernel spins for its peer holds the context against any lazy load the enqueue thread still owes.
+    // An explicit CUDA_MODULE_LOADING wins.
+    if (!module_loading_set && ((o.serve && o.batch >= 2) || o.tp >= 2))
+        basalt::platform::set_env("CUDA_MODULE_LOADING", "EAGER");
     return std::nullopt;
 }
 
