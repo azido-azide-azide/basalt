@@ -2,17 +2,18 @@
 // include/basalt/models/qwen4exp/plan/tp_rank.hpp - the tensor-parallel card plan for the Flash-Next MoE model
 // (qwen4exp): what one card of a `tp`-card group holds, by tensor role.  The cut follows the proven reference
 // design for this model family: the mixer OUTPUT projections (QSA attn_output, GDN ssm_out) are REPLICATED —
-// both cards hold the whole weight and each multiplies its own head columns' activations, producing a PARTIAL
-// sum that the block's one BF16 mailbox exchange turns into the same bits on both cards.  Replicating the
-// weight (instead of slicing its columns) is what the arena's layout forces — quantized tensors sit as ONE
-// interleaved block stream (tests/core/tp_col_probe.cpp measures the refusal) — and it costs only VRAM.  The
-// hc streams and the router are replicated too.  The card's GDN slice is its key-head range
-// (core::GdnHeadSlice): its activations carry the card's value heads.  The shared expert stays whole and
-// alternates owner by layer parity; routed experts are partitioned WHOLE by expert-id parity so each card
-// streams only its half over its own link, and the MoE block output is one FP32 exchange.  Head, embedding,
-// PLE and MTP belong to rank 0 alone.  Every weight slice this plan asks the loader to build is a ROW range
-// at a head boundary (32/128/256-aligned — whole quant blocks in every arena form).  No kernel bytes move
-// here: this is the plan; the loader and the pair driver act on it.
+// both cards hold the whole weight, the cards' head activations cross the mailbox BEFORE the projection,
+// and both cards then compute the identical block output from identical inputs.  Replicating the weight
+// (instead of slicing its K axis) follows the arena's shape: row(output-axis) slices are one contiguous
+// span per plane (the loader's RowSlices), while these projections store the K axis CONTIGUOUS, so a K
+// slice would be a strided span per row.  The hc streams and the router are replicated too.  The card's
+// GDN slice is its key-head range (core::GdnHeadSlice): its activations carry the card's value heads.
+// The shared expert stays whole and alternates owner by layer parity; routed experts are partitioned WHOLE
+// by expert-id parity so each card streams only its half over its own link, and the MoE block output is
+// one FP32 exchange of the cards' partial sums.  Head, embedding, PLE and MTP belong to rank 0 alone.
+// Every weight slice this plan asks the loader to build is a ROW range at a head boundary (32/128/256
+// aligned — whole quant blocks in every arena form).  No kernel bytes move here: this is the plan; the
+// loader and the pair driver act on it.
 #include "basalt/core/gdn_head_split.hpp"
 #include "basalt/core/weights.hpp"   // WeightTable::RowSlices
 #include "basalt/models/qwen4exp/decode/layout.hpp"   // core::ModelGeometry
