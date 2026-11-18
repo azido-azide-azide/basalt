@@ -165,8 +165,8 @@ int main() {
     // ---- full layer, start to finish
     gdn_gates(dab, ddt, dssm, gbuf, bbuf, T, 0, HK, HV);
     gdn_conv(dhf, dqkv, dcw, hf_f, T, 0, HK, HV);
-    gdn_recurrence(dsf, hf_f, gbuf, bbuf, dz, dgamma, 1e-6f, work_f.data(), y_f, nullptr, T, 0, GdnGate::Sigmoid,
-                   nullptr, nullptr, nullptr, HK, HV);
+    gdn_recurrence_bf16(dsf, hf_f, gbuf, bbuf, dz, dgamma, 1e-6f, work_f.data(), y_f, T, 0, GdnGate::Sigmoid,
+                        nullptr, nullptr, nullptr, nullptr, HK, HV);
     if (cudaStreamSynchronize(0) != cudaSuccess || cudaGetLastError() != cudaSuccess) {
         std::printf("FAIL full-layer run: %s\n", cudaGetErrorString(cudaGetLastError()));
         return 1;
@@ -174,8 +174,8 @@ int main() {
     // ---- the card's slice, same kernels, its own head counts
     gdn_gates(dabs, ddts, dssms, gsbuf, bsbuf, T, 0, NK, NV);
     gdn_conv(dhs, dqkvs, dcws, hf_s, T, 0, NK, NV);
-    gdn_recurrence(dss, hf_s, gsbuf, bsbuf, dzs, dgamma, 1e-6f, work_s.data(), y_s, nullptr, T, 0, GdnGate::Sigmoid,
-                   nullptr, nullptr, nullptr, NK, NV);
+    gdn_recurrence_bf16(dss, hf_s, gsbuf, bsbuf, dzs, dgamma, 1e-6f, work_s.data(), y_s, T, 0, GdnGate::Sigmoid,
+                        nullptr, nullptr, nullptr, nullptr, NK, NV);
     if (cudaStreamSynchronize(0) != cudaSuccess || cudaGetLastError() != cudaSuccess) {
         std::printf("FAIL slice run: %s\n", cudaGetErrorString(cudaGetLastError()));
         return 1;
@@ -201,19 +201,16 @@ int main() {
 
     // ---- y, bitwise, per value head (with the exact packed-local -> global head map)
     {
-        const int rep = HV / HK;
         auto global_head = [&](int local) { return (local / NK) * HK + k0 + (local % NK); };
+        std::vector<float> yf((size_t) T * HV * S), ys((size_t) T * NV * S);
+        cudaMemcpy(yf.data(), y_f, sizeof(float) * yf.size(), cudaMemcpyDeviceToHost);
+        cudaMemcpy(ys.data(), y_s, sizeof(float) * ys.size(), cudaMemcpyDeviceToHost);
         size_t bad = 0;
         for (int64_t t = 0; t < T; ++t)
-            for (int h = 0; h < NV; ++h) {
-                float a[2], b[2];
-                for (int c = 0; c < S; c += 2) {
-                    cudaMemcpy(a, y_s + ((size_t) t * NV + h) * S + c, 8, cudaMemcpyDeviceToHost);
-                    cudaMemcpy(b, y_f + ((size_t) t * HV + global_head(h)) * S + c, 8, cudaMemcpyDeviceToHost);
-                    if (std::memcmp(a, b, 8)) ++bad;
-                }
-            }
-        (void) rep;
+            for (int h = 0; h < NV; ++h)
+                if (std::memcmp(&ys[(size_t) t * NV * S + (size_t) h * S], &yf[(size_t) t * HV * S + (size_t) global_head(h) * S],
+                                sizeof(float) * S))
+                    ++bad;
         if (bad) std::printf("  FAIL y: %zu of %d head-rows differ\n", bad, NV);
         else std::printf("  ok y (%d heads x %lld tokens, bitwise)\n", NV, (long long) T);
         fails += (bad != 0);
