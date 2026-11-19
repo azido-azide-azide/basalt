@@ -168,6 +168,41 @@ int weights(Context& context) {
                                      &fn_tp->slices);
             if (ok) ok = basalt::core::check_all(fn_tp->wt, g, err, &fn_tp->plan.card);
             if (ok) ok = fn_tp->native.load(o.native_shards, fn_tp->wt, err, true, 0, -1, nullptr, 0, &fn_tp->slices);
+            // the twin's hyper-connection entries, still OnDevice(peer_dev): the skip set kept the bf16 forms out
+            // of THIS card's arena too, and the rebind above served the main table alone - rank 1's windows read
+            // data == nullptr (window 2f: wd[half]->data NULL at the first rank-1 capture).  hc8_table_adopt's
+            // source is the model file's HOST copy table (core::hc8_find, model_file.cpp:450 - process-wide RAM,
+            // not card 0's VRAM: a twin pass is no silent reuse), and hc8_upload allocates on the CURRENT device:
+            // under OnDevice(peer_dev) this builds card 1's copy of card 0's, bit for bit, keyed (peer_dev, q) in
+            // the now device-scoped registry (hc_fused.cu) - the window's ~659 MiB of HC reads never touch PCIe.
+            // The injections stay bf16 in this arena, copies beside them, exactly as the main loop registers them.
+            const size_t hc8_before = basalt::kernels::hc8_bytes();   // cross-device total; the delta is this card's
+            if (ok && !hc8_names.empty()) {
+                for (const std::string& n : hc8_names) {
+                    const basalt::core::WeightRef* r1 = fn_tp->wt.find(n);
+                    const void* q = r1 ? basalt::core::hc8_table_adopt(n, nullptr, (int) r1->ne1, (int) r1->ne0) : nullptr;
+                    if (q == nullptr || !fn_tp->wt.rebind(n, q)) {
+                        err = "hc8: no 8-bit copy of " + n + " on CUDA" + std::to_string(peer_dev);
+                        ok = false;
+                        break;
+                    }
+                }
+                for (const auto& kv : fn_tp->wt.all()) {
+                    if (!ok) break;
+                    if (kv.first.ends_with("_inject.weight") && kv.first.find(".hc_") != std::string::npos &&
+                        kv.second.data &&
+                        basalt::core::hc8_table_adopt(kv.first, (const uint16_t*) kv.second.data, (int) kv.second.ne1,
+                                                      (int) kv.second.ne0) == nullptr) {
+                        err = "hc8: no 8-bit copy of " + kv.first + " on CUDA" + std::to_string(peer_dev);
+                        ok = false;
+                    }
+                }
+                if (ok)
+                    basalt::log::info("basalt generate", "tensor pair: CUDA%d's hyper-connection 8-bit copies, %zu "
+                                         "matrices %.0f MiB",
+                                 peer_dev, hc8_names.size(),
+                                 (double) (basalt::kernels::hc8_bytes() - hc8_before) / 1048576.0);
+            }
             if (!ok) {
                 cudaFree(arena);
                 fn_tp.reset();  // frees the twin's arena; the tables and slabs hold nothing that outlives it
