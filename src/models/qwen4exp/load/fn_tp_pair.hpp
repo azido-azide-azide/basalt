@@ -29,6 +29,25 @@ struct FnTpPair {
     basalt::core::WeightTable wt;                // its half of every sliced tensor; rows point into `arena`
     basalt::core::NativeDense native;            // its native projection slabs, on `dev`
     basalt::core::TpMailbox mb;                  // the pair's exchanges; the driver opens it at bring-up
+    bool mb_open = false;                        // whether bring-up opened `mb` (so a reopen never resets it)
+    // the geometries of the driver's two cards: `card0` is rank 0's own card geometry (the same object the
+    // load checked rank 0's tables against - Context.fn_tp_card), `g_full` the whole model's - both Verifier
+    // inits take a card geometry and read the FULL widths (the two replicated output projections) through
+    // FnTp::g_full, exactly as the recorder (set_tp, 32c-2) already does.
+    const basalt::core::ModelGeometry* card0 = nullptr;
+    const basalt::core::ModelGeometry* g_full = nullptr;
+
+    /// The driver's bring-up opens the pair's mailbox (imitating the dense pair's attach_tp,
+    /// src/dense/stage.cpp:945-985: one mailbox for the pair, two slots - a window's exchanges alternate
+    /// between them - each as wide as the payload's widest row).  `dev0` names rank 0's card; `dev` is
+    /// already set with the twin.  Idempotent: the mailbox opens once per process and must not be reopened
+    /// under a running window (its slot epochs live in it).
+    bool open_mb(int dev0, size_t slots, size_t max_bytes, std::string& err) {
+        if (mb_open) return true;
+        if (!mb.open(dev0, dev, slots, max_bytes, err)) return false;
+        mb_open = true;
+        return true;
+    }
 
     FnTpPair() = default;
     FnTpPair(const FnTpPair&) = delete;

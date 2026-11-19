@@ -148,6 +148,12 @@ int weights(Context& context) {
         fn_tp->dev = peer_dev;
         fn_tp->plan = plan1;
         fn_tp->slices = std::move(slices1);
+        // the driver's geometry pair: rank 0 inits its Verifier with `card0` (the very geometry check_all
+        // held this card's tables to, from layer_plan's rank-0 plan via Context.fn_tp_card) and both cards
+        // read the model's full widths through `g_full` - the generate phase's `g` outlives the driver
+        // exactly like every other Context resource (the phase chain unwinds only after serve returns).
+        fn_tp->card0 = fn_tp_card;
+        fn_tp->g_full = &g;
         {
             const basalt::core::OnDevice on_peer(peer_dev);
             if (cudaMalloc(&fn_tp->arena, pool1) != cudaSuccess) {
