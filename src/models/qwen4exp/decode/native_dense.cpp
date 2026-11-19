@@ -67,7 +67,8 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 bool NativeDense::plan_bytes(const std::vector<std::string>& shards, bool include_ple_key, int64_t layer_lo,
-                             int64_t layer_hi, uint64_t& out, std::string& err) {
+                             int64_t layer_hi, uint64_t& out, std::string& err,
+                             const WeightTable::RowSlices* slices) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -83,8 +84,28 @@ bool NativeDense::plan_bytes(const std::vector<std::string>& shards, bool includ
                 if (!basalt::kernels::native_mmvq_supported(tensor.type) || tensor.shape.size() != 2 ||
                     tensor.shape[0] == 0 || tensor.shape[0] > INT_MAX || tensor.shape[1] == 0 || tensor.shape[1] > INT_MAX)
                     continue;
-                out += basalt::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
-                                                                 (int) tensor.shape[1]);
+                const uint64_t full = basalt::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
+                                                                                (int) tensor.shape[1]);
+                if (slices) {
+                    if (const auto s = slices->find(tensor.name); s != slices->end()) {
+                        // the card's rows only: whole rows are what the native format stacks contiguously
+                        if (full % tensor.shape[1]) {
+                            err = "native dense: cannot price whole rows of " + tensor.name;
+                            return false;
+                        }
+                        uint64_t rows = 0;
+                        for (const auto& run : s->second) {
+                            if (!run.second || run.first + run.second > tensor.shape[1]) {
+                                err = "native dense: a row run of " + tensor.name + " is outside the file's matrix";
+                                return false;
+                            }
+                            rows += run.second;
+                        }
+                        out += full / tensor.shape[1] * rows;
+                        continue;
+                    }
+                }
+                out += full;
             }
         }
         return true;
@@ -141,7 +162,8 @@ constexpr uint64_t kSlabAlign = 256;   // matrices start at 256-byte offsets, as
 uint64_t NativeDense::slab_bytes(uint64_t plan_total) { return plan_total + kSlabAlign * 1024; }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, void* slab_at, uint64_t slab_cap) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, void* slab_at, uint64_t slab_cap,
+                       const WeightTable::RowSlices* slices) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -154,7 +176,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         std::set<std::string> seen;
         // the bytes the uploads below will write (for the progress lines)
         uint64_t plan_total = 0;
-        if (!plan_bytes(shards, include_ple_key, layer_lo, layer_hi, plan_total, err)) return false;
+        if (!plan_bytes(shards, include_ple_key, layer_lo, layer_hi, plan_total, err, slices)) return false;
         int load_dev = 0;
         if (cudaGetDevice(&load_dev) != cudaSuccess) load_dev = 0;
         LoadProgress progress(LoadProgress::cuda(load_dev), plan_total);
@@ -255,11 +277,42 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||
                     ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
-                    tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
+                    tensor.shape[0] != (uint64_t) ref.ne0) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
-                const auto bytes = basalt::kernels::native_mmvq_weight_bytes(
-                    tensor.type, (int) ref.ne0, (int) ref.ne1);
+                // The rows this card uploads: the whole matrix, or its slice's runs stacked in order.  Whole
+                // native rows are contiguous (ne0 is the block axis), so a run is one file span, and the
+                // stacked runs are exactly the [ne0, rows] matrix the (sliced) canonical ref describes.
+                std::vector<std::pair<uint64_t, uint64_t>> runs{{0, tensor.shape[1]}};
+                if (slices) {
+                    if (const auto s = slices->find(tensor.name); s != slices->end() && !s->second.empty())
+                        runs.assign(s->second.begin(), s->second.end());
+                }
+                uint64_t rows = 0, row_bytes = 0, bytes = 0;
+                if (runs.size() == 1 && runs[0].first == 0 && runs[0].second == tensor.shape[1]) {
+                    if (tensor.shape[1] != (uint64_t) ref.ne1) {
+                        err = "native dense: incompatible matrix " + tensor.name; return false;
+                    }
+                    bytes = basalt::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1);
+                } else {
+                    const uint64_t full = basalt::kernels::native_mmvq_weight_bytes(
+                        tensor.type, (int) tensor.shape[0], (int) tensor.shape[1]);
+                    if (full % tensor.shape[1]) {
+                        err = "native dense: cannot price whole rows of " + tensor.name; return false;
+                    }
+                    row_bytes = full / tensor.shape[1];
+                    for (const auto& run : runs) {
+                        if (!run.second || run.first + run.second > tensor.shape[1]) {
+                            err = "native dense: a row run of " + tensor.name + " is outside the file's matrix";
+                            return false;
+                        }
+                        rows += run.second;
+                    }
+                    if (rows != (uint64_t) ref.ne1) {
+                        err = "native dense: incompatible matrix " + tensor.name; return false;
+                    }
+                    bytes = row_bytes * rows;
+                }
                 void* where = nullptr;
                 DevicePtr own;
                 if (slab_base != nullptr && slab_used + bytes <= slab_bytes) {
@@ -274,7 +327,21 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     where = allocation;
                 }
                 std::string upload_err;
-                if (where == nullptr || !uploader.upload(gguf.path(), gguf.data_start() + tensor.offset, bytes, where, upload_err)) {
+                bool uploaded = true;
+                if (row_bytes == 0) {   // the whole matrix in one span
+                    uploaded = where != nullptr &&
+                               uploader.upload(gguf.path(), gguf.data_start() + tensor.offset, bytes, where, upload_err);
+                } else {   // the card's runs, stacked at the matrix's head
+                    uint64_t placed = 0;
+                    for (const auto& run : runs) {
+                        uploaded = where != nullptr && uploader.upload(
+                                       gguf.path(), gguf.data_start() + tensor.offset + run.first * row_bytes,
+                                       run.second * row_bytes, (char*) where + placed, upload_err);
+                        if (!uploaded) break;
+                        placed += run.second * row_bytes;
+                    }
+                }
+                if (!uploaded) {
                     err = "native dense upload " + tensor.name + ": " +
                           (where == nullptr ? std::string("no device memory") : upload_err);
                     return false;

@@ -1,12 +1,13 @@
 #pragma once
 
+#include "basalt/core/weights.hpp"   // WeightTable::RowSlices
+
 #include <cstdint>
 #include <set>
 #include <string>
 #include <vector>
 
 namespace basalt::core {
-class WeightTable;
 struct PackFiles;
 
 // Experimental GDN/QSA/shared-expert projection overrides. Upload unchanged native GGUF
@@ -24,9 +25,12 @@ public:
     /// split's stage holds its own layers' projections, not the whole model's); the others keep data == nullptr.
     /// `slab_at`: the device block (`slab_cap` bytes, `slab_bytes` long at least) the matrices go in instead of one this
     /// object allocates and owns.
+    /// `slices`: a tensor-parallel card's row runs.  The file keeps the FULL matrix; the named tensors upload
+    /// only their runs, stacked in order - which is exactly the [ne0, sum(rows)] matrix the canonical (sliced)
+    /// WeightRef describes, because the native format stores whole rows contiguously (ne0 is the block axis).
     bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
               bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1, void* slab_at = nullptr,
-              uint64_t slab_cap = 0);
+              uint64_t slab_cap = 0, const WeightTable::RowSlices* slices = nullptr);
     /// The bytes of the block the matrices of `plan_bytes`' total take (their alignment included).
     static uint64_t slab_bytes(uint64_t plan_total);
     /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
@@ -34,8 +38,10 @@ public:
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
                              std::set<std::string>& out, std::string& err);
     /// The bytes `load` with the same arguments will write to the device, from the GGUF headers only.
+    /// `slices` prices the named tensors at their row runs' bytes (see `load`).
     static bool plan_bytes(const std::vector<std::string>& shards, bool include_ple_key, int64_t layer_lo,
-                           int64_t layer_hi, uint64_t& out, std::string& err);
+                           int64_t layer_hi, uint64_t& out, std::string& err,
+                           const WeightTable::RowSlices* slices = nullptr);
     /// The bytes `plan_bytes` counts, by block: `per_layer[l]` for the `blk.<l>.` matrices, `shared` for the PLE key (a
     /// stage always holds it).
     static bool plan_bytes_by_layer(const std::vector<std::string>& shards, bool include_ple_key, int64_t n_layers,
