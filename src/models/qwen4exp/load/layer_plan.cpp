@@ -1,5 +1,9 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/models/qwen4exp/plan/tp_rank.hpp"
 #include "context.hpp"
+
+#include <cstdlib>
+#include <optional>
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -201,7 +205,38 @@ int layer_plan(Context& context) {
         for (const std::string& n : hc8_names) skip.insert(n);
     }
     uint64_t pool_bytes = 0;
-    if (!basalt::core::WeightTable::pool_bytes(pack_files, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    // ---- tensor parallel: the pair holds every layer, each card half as wide by heads.  The experts keep their
+    // existing placement (the arena serves both cards already); TP changes the dense weights on the card: rank 0's
+    // row runs, and the arena is priced and packed to exactly those bytes.  The card's geometry is what the layout
+    // check must then expect.  (The pair's runtime twin arrives with the driver; until then this path loads and
+    // refuses to run, see weights().)
+    basalt::core::WeightTable::RowSlices fn_slices;
+    std::optional<basalt::plan::FnRankPlan> fn_plan;
+    if (o.tp >= 2) {
+        if (multi_gpu || !split_at.empty()) {
+            err = "qwen4exp: --tp and a layer split do not mix (a layer split and a card split are different cuts)";
+            return fatal_start_error(err);
+        }
+        if (o.vision) {
+            err = "qwen4exp: --tp does not run --vision yet";
+            return fatal_start_error(err);
+        }
+        // native shards stay WHOLE for now - their loader reads the pack's source region and cross-checks the
+        // table's (sliced) shapes, so a card's native upload must learn the plan's row runs before the pair
+        // runtime lets them run.  Nothing reaches that load while weights() refuses to run a TP card below.
+        if (const std::string tperr = basalt::plan::fn_tp_check(g, o.tp); !tperr.empty()) {
+            err = tperr;
+            return fatal_start_error(err);
+        }
+        fn_plan = basalt::plan::fn_rank_plan(g, o.tp, 0, err);
+        if (!err.empty()) return fatal_start_error(err);
+        fn_slices = basalt::plan::fn_row_slices(*fn_plan);
+        basalt::log::info("basalt generate", "tensor parallel: this card (rank 0 of %d) takes the head rows of %zu "
+                             "mixer tensors; its arena shrinks to the bytes the slices leave",
+                     (int) o.tp, fn_slices.size());
+    }
+    if (!basalt::core::WeightTable::pool_bytes(pack_files, pool_bytes, err, skip.empty() ? nullptr : &skip,
+                                               fn_slices.empty() ? nullptr : &fn_slices)) {
         return fatal_start_error(err);
     }
 
@@ -213,6 +248,8 @@ int layer_plan(Context& context) {
     context.add_foreign = add_foreign;
     context.hc8_names = &hc8_names;
     context.pool_bytes = &pool_bytes;
+    context.fn_tp_slices = fn_slices.empty() ? nullptr : &fn_slices;
+    context.fn_tp_card = fn_slices.empty() ? nullptr : &fn_plan->card;
     return weights(context);
 }
 

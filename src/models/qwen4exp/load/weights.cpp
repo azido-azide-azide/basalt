@@ -1,6 +1,8 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
+#include <cstdlib>
+
 namespace basalt::models::qwen4exp::generate {
 
 int weights(Context& context) {
@@ -14,6 +16,8 @@ int weights(Context& context) {
     auto& skip = *context.skip;
     auto& hc8_names = *context.hc8_names;
     auto& pool_bytes = *context.pool_bytes;
+    const auto* fn_tp_slices = context.fn_tp_slices;
+    const auto* fn_tp_card = context.fn_tp_card;
 
     // ---- the bytes this start places, once, from the model file's tables: the dense weights, the 8-bit copies, the
     // draft layer, the head and every expert (the GPU cache plus its complement in RAM).  Each term is the total its own
@@ -79,12 +83,29 @@ int weights(Context& context) {
         return s;
     };
     basalt::core::WeightTable wt;
-    if (!wt.load(pack_files, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!wt.load(pack_files, arena, pool_bytes, err, skip.empty() ? nullptr : &skip, true, fn_tp_slices)) {
         return fatal_start_error(err);
     }
-    // every tensor's shape and engine form against what the kernels read (skipped rows keep their metadata)
-    if (!basalt::core::check_all(wt, g, err)) {
+    // every tensor's shape and engine form against what the kernels read (skipped rows keep their metadata); a TP
+    // card's sliced roles carry the card's widths, its replicated roles the full model's (check_all picks per role)
+    if (!basalt::core::check_all(wt, g, err, fn_tp_card)) {
         return fatal_start_error(o.model + ": " + err);
+    }
+    if (fn_tp_slices) {
+        // the pair's runtime twin (the second card's half and the mailbox driver) is not in this build yet: the
+        // load path is real and reported, and then the start is refused rather than run half a model.  With
+        // BASALT_FN_TP_LOAD_ONLY set, this exit is the test's success: the arena was priced, packed and checked.
+        uint64_t full_bytes = 0;
+        basalt::core::WeightTable::pool_bytes(pack_files, full_bytes, err, skip.empty() ? nullptr : &skip);
+        basalt::log::info("basalt generate", "tensor parallel load: arena %llu MiB of %llu MiB (rank 0 of %d, %zu "
+                             "sliced tensors), layout checked against the card's geometry",
+                     (unsigned long long) (pool_bytes >> 20), (unsigned long long) (full_bytes >> 20),
+                     (int) o.tp, fn_tp_slices->size());
+        cudaFree(arena);
+        if (std::getenv("BASALT_FN_TP_LOAD_ONLY") != nullptr) return 0;
+        basalt::log::error("basalt generate", "the tensor-parallel pair's runtime (second card's half, the "
+                             "exchanges) is not wired yet - this build only proves the load");
+        return 1;
     }
     basalt::log::info("basalt generate", "%llu MiB of weights loaded from %s in %.1f s (%zu tensors "
                          "skipped: served from the source tensors)",

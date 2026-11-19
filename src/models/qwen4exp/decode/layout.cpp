@@ -42,41 +42,47 @@ bool fail(std::string& err, const LayerView& v, const char* suffix, const char* 
     return false;
 }
 
-bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std::string& err) {
+bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std::string& err,
+               const ModelGeometry* card = nullptr) {
     const LayerView v(t, layer);
     const bool qsa = is_qsa_layer(g, layer);
+    // A tensor-parallel card: the roles the card plan slices carry the CARD's widths; every replicated role is
+    // checked against the full model it really is.  `full` is what the caller's geometry always means.
+    const ModelGeometry& full = g;
+    const ModelGeometry& cw = card ? *card : g;
 
     // ---- the 2-D tensor set, per layer family
     const Want2 want2[] = {
         // gated residual, EVERY layer - `gr_read` takes w_down (hc_lr, hc_dim) and w_up (hc_lr, hc_dim)
         // after its own transpose, so the pack's orientation is [hc_dim, hc_lr] and [hc_lr, hc_dim].
-        {"hc_attn_down.weight", g.hc_dim(), g.hc_lr, false, false},
-        {"hc_attn_up.weight", g.hc_lr, g.hc_dim(), false, false},
-        {"hc_attn_inject.weight", g.hc_dim(), g.hc, false, false},
-        {"hc_ffn_down.weight", g.hc_dim(), g.hc_lr, false, false},
-        {"hc_ffn_up.weight", g.hc_lr, g.hc_dim(), false, false},
-        {"hc_ffn_inject.weight", g.hc_dim(), g.hc, false, false},
+        {"hc_attn_down.weight", full.hc_dim(), full.hc_lr, false, false},
+        {"hc_attn_up.weight", full.hc_lr, full.hc_dim(), false, false},
+        {"hc_attn_inject.weight", full.hc_dim(), full.hc, false, false},
+        {"hc_ffn_down.weight", full.hc_dim(), full.hc_lr, false, false},
+        {"hc_ffn_up.weight", full.hc_lr, full.hc_dim(), false, false},
+        {"hc_ffn_inject.weight", full.hc_dim(), full.hc, false, false},
         // MoE, EVERY layer
-        {"ffn_gate_inp.weight", g.n_embd, g.n_expert, false, false},
-        {"ffn_gate_shexp.weight", g.n_embd, g.n_ff, false, false},
-        {"ffn_up_shexp.weight", g.n_embd, g.n_ff, false, false},
-        {"ffn_down_shexp.weight", g.n_ff, g.n_embd, false, false},
-        // GDN only
-        {"attn_qkv.weight", g.n_embd, g.ssm_conv_channels, false, true},
-        {"attn_gate.weight", g.n_embd, g.ssm_value_dim, false, true},
-        {"ssm_out.weight", g.ssm_value_dim, g.n_embd, false, true},
-        {"ssm_conv1d.weight", g.ssm_d_conv, g.ssm_conv_channels, false, true},
-        {"ssm_alpha.weight", g.n_embd, g.ssm_v_heads, false, true},
-        {"ssm_beta.weight", g.n_embd, g.ssm_v_heads, false, true},
-        // QSA only
-        {"attn_q.weight", g.n_embd, 2 * g.n_head * g.head_dim, true, false},
-        {"attn_k.weight", g.n_embd, g.n_head_kv * g.head_dim, true, false},
-        {"attn_v.weight", g.n_embd, g.n_head_kv * g.head_dim, true, false},
-        {"attn_output.weight", g.n_head * g.head_dim, g.n_embd, true, false},
+        {"ffn_gate_inp.weight", full.n_embd, full.n_expert, false, false},
+        {"ffn_gate_shexp.weight", full.n_embd, full.n_ff, false, false},
+        {"ffn_up_shexp.weight", full.n_embd, full.n_ff, false, false},
+        {"ffn_down_shexp.weight", full.n_ff, full.n_embd, false, false},
+        // GDN only - qkv, gate and conv are the card's head rows; ssm_out is replicated whole and the
+        // 1-D scalars are replicated vectors whose head RANGE the kernels index, so their widths stay full
+        {"attn_qkv.weight", full.n_embd, cw.ssm_conv_channels, false, true},
+        {"attn_gate.weight", full.n_embd, cw.ssm_value_dim, false, true},
+        {"ssm_out.weight", full.ssm_value_dim, full.n_embd, false, true},
+        {"ssm_conv1d.weight", full.ssm_d_conv, cw.ssm_conv_channels, false, true},
+        {"ssm_alpha.weight", full.n_embd, full.ssm_v_heads, false, true},
+        {"ssm_beta.weight", full.n_embd, full.ssm_v_heads, false, true},
+        // QSA only - q/k/v are the card's head rows; attn_output is replicated whole
+        {"attn_q.weight", full.n_embd, 2 * cw.n_head * cw.head_dim, true, false},
+        {"attn_k.weight", full.n_embd, cw.n_head_kv * cw.head_dim, true, false},
+        {"attn_v.weight", full.n_embd, cw.n_head_kv * cw.head_dim, true, false},
+        {"attn_output.weight", full.n_head * full.head_dim, full.n_embd, true, false},
         // THE INDEXER.  `q_proj` is the QUERY count and `k_proj` is the KEY width, and they are different
         // numbers - conflating them makes the planner's indexer term 4x too big.
-        {"indexer.q_proj.weight", g.n_embd, g.idx_q_heads * g.idx_key_dim, true, false},
-        {"indexer.k_proj.weight", g.n_embd, g.idx_key_dim, true, false},
+        {"indexer.q_proj.weight", full.n_embd, full.idx_q_heads * full.idx_key_dim, true, false},
+        {"indexer.k_proj.weight", full.n_embd, full.idx_key_dim, true, false},
     };
     for (const Want2& w : want2) {
         if (w.qsa_only && !qsa) continue;
@@ -94,16 +100,16 @@ bool check_one(const WeightTable& t, const ModelGeometry& g, int64_t layer, std:
     // and that single exception is the one a reader would not guess, so it is written down rather than
     // inferred from the tensor count.
     const Want1 want1[] = {
-        {"hc_attn_norm.weight", g.hc_dim(), WeightKind::F32, false, false},
-        {"hc_ffn_norm.weight", g.hc_dim(), WeightKind::F32, false, false},
-        {"ffn_gate_inp_shexp.weight", g.n_embd, WeightKind::Bf16InF32, false, false},
-        {"ssm_a", g.ssm_v_heads, WeightKind::F32, false, true},
-        {"ssm_dt.bias", g.ssm_v_heads, WeightKind::F32, false, true},
-        {"ssm_norm.weight", g.ssm_state_size, WeightKind::F32, false, true},
-        {"attn_q_norm.weight", g.head_dim, WeightKind::F32, true, false},
-        {"attn_k_norm.weight", g.head_dim, WeightKind::F32, true, false},
-        {"indexer.q_norm.weight", g.idx_key_dim, WeightKind::F32, true, false},
-        {"indexer.k_norm.weight", g.idx_key_dim, WeightKind::F32, true, false},
+        {"hc_attn_norm.weight", full.hc_dim(), WeightKind::F32, false, false},
+        {"hc_ffn_norm.weight", full.hc_dim(), WeightKind::F32, false, false},
+        {"ffn_gate_inp_shexp.weight", full.n_embd, WeightKind::Bf16InF32, false, false},
+        {"ssm_a", full.ssm_v_heads, WeightKind::F32, false, true},
+        {"ssm_dt.bias", full.ssm_v_heads, WeightKind::F32, false, true},
+        {"ssm_norm.weight", full.ssm_state_size, WeightKind::F32, false, true},
+        {"attn_q_norm.weight", full.head_dim, WeightKind::F32, true, false},
+        {"attn_k_norm.weight", full.head_dim, WeightKind::F32, true, false},
+        {"indexer.q_norm.weight", full.idx_key_dim, WeightKind::F32, true, false},
+        {"indexer.k_norm.weight", full.idx_key_dim, WeightKind::F32, true, false},
     };
     for (const Want1& w : want1) {
         if (w.qsa_only && !qsa) continue;
@@ -138,18 +144,19 @@ std::string LayerView::name(const char* suffix) const {
     return "blk." + std::to_string(layer_) + "." + suffix;
 }
 
-bool check_layer(const WeightTable& table, const ModelGeometry& g, int64_t layer, std::string& err) {
+bool check_layer(const WeightTable& table, const ModelGeometry& g, int64_t layer, std::string& err,
+                 const ModelGeometry* card) {
     if (layer < 0 || layer >= g.n_layers) {
         err = "layer " + std::to_string(layer) + " is outside 0.." + std::to_string(g.n_layers - 1);
         return false;
     }
-    return check_one(table, g, layer, err);
+    return check_one(table, g, layer, err, card);
 }
 
-bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& err) {
+bool check_all(const WeightTable& table, const ModelGeometry& g, std::string& err, const ModelGeometry* card) {
     int64_t n_qsa = 0, n_gdn = 0;
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        if (!check_one(table, g, l, err)) return false;
+        if (!check_one(table, g, l, err, card)) return false;
         if (is_qsa_layer(g, l)) {
             ++n_qsa;
         } else {
