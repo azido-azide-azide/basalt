@@ -69,8 +69,11 @@ bool Verifier::WindowRecorder::inputs() {
     pos_i = v_.pos_ + MT * (NH + NKV);
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
-    // residual, pending write and inject (see set_stage)
-    if (v_.lb_ > 0) {
+    // residual, pending write and inject (see set_stage).  The pair's rank 1 belongs to that consuming branch too:
+    // the token-embedding table is a device-0 slab (native_embed()/embedding_gather_dev() read card 0's memory),
+    // so rank 1's window cannot embed - it starts from the [R][bo][inj] rows rank 0's window publishes into the
+    // pair's hand buffer (below), the same triple a split stage hands on, from the model's layer 0.
+    if (v_.lb_ > 0 || (v_.tp_ != nullptr && v_.tp_->rank == 1 && v_.hand_in_ != nullptr)) {
         if (!v_.batch_rec_) wait_flag_ge(v_.m_flag_ + 12, 1, cs);   // the previous stage's graph raised it after its hand-off
         const float* hin = v_.hand_in_ + (size_t) hrow0 * HB;   // the group's rows: [R][bo][inj] contiguous
         copy_from_mapped(v_.R_, hin, (int64_t) T * HC * N, cs);
@@ -93,6 +96,19 @@ bool Verifier::WindowRecorder::inputs() {
         embedding_gather_dev(codes, scales, offsets, v_.tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
                              row_codes, row_groups, v_.emb_, cs);
         broadcast_streams(v_.emb_, v_.R_, N, (int) HC, T, cs);
+    }
+
+    // the pair's rank 0, right after its embed (not at the window's end like a split stage's hand-off, record.cpp):
+    // rank 1's first mixer exchange waits on rank 0's layer 0, and rank 1 cannot reach its layer 0 before these
+    // rows exist - publishing at the graph's end would deadlock the pair's first launch back-to-back.  The rows
+    // are [R][bo][inj] exactly as a split stage hands them, so a card pair starts every window from one shared
+    // start state; both arenas then rotate identically and the exchange's equal-bits invariant stands.
+    if (v_.tp_ != nullptr && v_.tp_->rank == 0 && v_.hand_out_ != nullptr) {
+        float* hout = v_.hand_out_ + (size_t) hrow0 * HB;
+        copy_from_mapped(hout, v_.R_, (int64_t) T * HC * N, cs);
+        copy_from_mapped(hout + (size_t) T * HC * N, v_.bo_, (int64_t) T * N, cs);
+        copy_from_mapped(hout + (size_t) T * (HC + 1) * N, v_.inj2_, (int64_t) T * HC, cs);
+        if (v_.tp_->hand_flag != nullptr) signal_flag(v_.tp_->hand_flag, 1, cs);   // wakes rank 1's wait_flag_ge above
     }
 
     // per-layer state indices (GDN and QSA layers are numbered separately)
