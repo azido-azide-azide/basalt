@@ -1483,7 +1483,16 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
         (a.pub_ctr && (!a.w_router || !a.xq)) ||
         (a.w_gate_sh && (!a.w_router || !a.gate_sh || (reinterpret_cast<uintptr_t>(a.w_gate_sh) & 15u) != 0)) ||
         (a.xq_sh && !a.w_router)) {
-        basalt::log::error("basalt", "hc_fused_read: invalid arguments or unsupported device");
+        // the catch-all was blind at the pair's first capture (window 2f): name the failing clause.
+        basalt::log::error("basalt",
+                           "hc_fused_read: rejected [dev_ok=%d T=%d R=%d R_out=%d wnorm=%d wdown=%d wup=%d lo=%d rs=%d "
+                           "mixed=%d xn=%d winj=%d injout=%d apply=%d boprev=%d injprev=%d wroute=%d logits=%d ids=%d "
+                           "weights=%d pub=%d xq=%d wgsh=%d gsh=%d shxq=%d misalign=%d alias=%d]",
+                     (int) d.ok, (int) a.T, !!a.R, !!a.R_out, !!a.w_norm, !!a.w_down, !!a.w_up, !!a.lo, !!a.rs,
+                     !!a.mixed, !!a.xn, !!a.w_inject, !!a.inject_out, (int) a.apply, !!a.bo_prev, !!a.inj_prev,
+                     !!a.w_router, !!a.logits, !!a.ids, !!a.weights, !!a.pub_ctr, !!a.xq, !!a.w_gate_sh, !!a.gate_sh,
+                     !!a.xq_sh, (int) (a.w_gate_sh && (reinterpret_cast<uintptr_t>(a.w_gate_sh) & 15u) != 0),
+                     (int) (a.apply && a.inj_prev == a.inject_out));
         std::exit(1);
     }
     HcLaunch L{};
