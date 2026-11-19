@@ -87,8 +87,8 @@ int weights(Context& context) {
         return fatal_start_error(err);
     }
     // every tensor's shape and engine form against what the kernels read (skipped rows keep their metadata); a TP
-    // card's tensors are half-wide by heads, so they are checked against the card's own geometry
-    if (!basalt::core::check_all(wt, fn_tp_card ? *fn_tp_card : g, err)) {
+    // card's sliced roles carry the card's widths, its replicated roles the full model's (check_all picks per role)
+    if (!basalt::core::check_all(wt, g, err, fn_tp_card)) {
         return fatal_start_error(o.model + ": " + err);
     }
     if (fn_tp_slices) {

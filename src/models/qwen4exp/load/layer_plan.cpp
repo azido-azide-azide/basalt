@@ -221,10 +221,9 @@ int layer_plan(Context& context) {
             err = "qwen4exp: --tp does not run --vision yet";
             return fatal_start_error(err);
         }
-        if (!o.native_shards.empty()) {
-            err = "qwen4exp: --tp does not slice --native-dense shards yet";
-            return fatal_start_error(err);
-        }
+        // native shards stay WHOLE for now - their loader reads the pack's source region and cross-checks the
+        // table's (sliced) shapes, so a card's native upload must learn the plan's row runs before the pair
+        // runtime lets them run.  Nothing reaches that load while weights() refuses to run a TP card below.
         if (const std::string tperr = basalt::plan::fn_tp_check(g, o.tp); !tperr.empty()) {
             err = tperr;
             return fatal_start_error(err);
