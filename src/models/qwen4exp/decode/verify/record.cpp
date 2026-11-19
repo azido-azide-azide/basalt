@@ -74,6 +74,10 @@ bool Verifier::WindowRecorder::run() {
         if (!v_.batch_rec_ && v_.next_ != nullptr && v_.next_->m_flag_ != nullptr) signal_flag(v_.next_->m_flag_ + 12, 1, cs);
         return true;
     }
+    // the pair's rank 1 records no head: the LM head and its sampling are rank 0's alone (the twin's
+    // output.weight entry carries no bytes on its card - tp_skip_head, verify.hpp) and the driver discards
+    // rank 1's picks; the graph simply ends after the last layer's post().
+    if (v_.tp_skip_head()) return true;
     return head();
 }
 

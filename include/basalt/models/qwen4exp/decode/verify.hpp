@@ -140,7 +140,12 @@ public:
                                          ///< window graph raises it after publishing the pair's start rows,
                                          ///< waking rank 1's waiting inputs()
     };
-    void set_tp(FnTp* tp) { tp_ = tp; }
+    void set_tp(FnTp* tp) { tp_ = tp; if (tp_skip_head()) head_sampling_ = false; }   // the head off-switch, see tp_skip_head
+    /// True on the pair's SECOND card: the LM head and its sampling stay rank 0's (design line "PLE + LM head +
+    /// embedding: rank0-only"), so a rank-1 window records no head and queues no sampler - the twin's
+    /// output.weight entry has no bytes on its card (verified: window 2h's rank-1 capture died in the head's
+    /// planes self-check "output.weight: the planes add up to 0 B but the tensor is 0 B").  Solo: never.
+    bool tp_skip_head() const { return tp_ != nullptr && tp_->rank == 1; }
     /// the mapped word a pair hand-off wakes on (this card's m_flag_[12]; the driver names it for the
     /// peer's FnTp::hand_flag, and resets it per window like run() does for a chain stage)
     uint32_t* tp_hand_flag() { return m_flag_ + 12; }
@@ -245,7 +250,7 @@ public:
     /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose picks are
     /// discarded - a prompt read through windows commits every token - so they cost no sampler launch or sync and
     /// never read a history staged for another position.
-    void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    void set_head_sampling(bool on) { if (tp_skip_head()) on = false; head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
     /// Skip exact head scoring below this row for the next window.
     void set_head_from(int t) { head_from_ = t; if (next_) next_->set_head_from(t); }
     /// On: a sampled window also leaves draft_prob(t), the probability row t's final distribution gives the window's
