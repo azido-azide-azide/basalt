@@ -5,6 +5,8 @@
 
 namespace basalt::models::qwen4exp::generate {
 
+struct FnTpPair;  // src/models/qwen4exp/load/fn_tp_pair.hpp
+
 // Startup phases keep their resources on the stack until the following phases return.
 // This view borrows those resources without changing their construction or destruction order.
 struct Context {
@@ -51,6 +53,7 @@ struct Context {
     // layout check expects of a half-wide tensor); null when the card runs the whole model
     const basalt::core::WeightTable::RowSlices* fn_tp_slices = nullptr;
     const basalt::core::ModelGeometry* fn_tp_card = nullptr;
+    FnTpPair* fn_tp = nullptr;  // the pair's live second card (built by the load, read by the driver)
     uint64_t* model_bytes = nullptr;
     uint64_t* expert_total_bytes = nullptr;
     uint64_t* cuda0_fixed_bytes = nullptr;
