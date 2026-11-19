@@ -172,6 +172,7 @@ public:
 private:
     friend class QfnRequest;
     using Context::o;
+    using Context::fn_tp;
     using Context::model_file;
     using Context::err;
     using Context::n_vocab;
@@ -224,6 +225,10 @@ private:
     int hist_dev{};
     basalt::core::Verifier ver{};
     basalt::core::VerifyHits vh{};
+    // tensor pair (--tp 2): the two cards' roles for the recorder (Verifier::set_tp, 32c-2).  The runtime
+    // owns them; bring-up fills {mb, rank, g_full} at init and the driver zeroes their `epi` per window
+    // (the dense pair's law, src/dense/forward.cpp:794-828).  Null geometries until then keep them inert.
+    basalt::core::Verifier::FnTp fn_tp_role[2]{};
     // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
     // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
     basalt::core::Verifier ver_same{};

@@ -18,6 +18,7 @@ class MtpDrafter;
 namespace basalt::kernels { class PleTable; }
 namespace basalt::kernels::cpu { class ExpertPool; }
 namespace basalt::vision { class CudaEncoder; }
+namespace basalt::models::qwen4exp::generate { struct FnTpPair; }
 
 namespace basalt::models::qwen4exp {
 struct Options;
@@ -45,6 +46,11 @@ struct Context {
     std::vector<std::pair<int32_t, int32_t>>& profile_loaded;
     const bool& pf_borrow;
     basalt::core::WeightTable& wt;
+    // tensor parallel (--tp 2): the pair handle the twin load left on the weights() stack (null when the
+    // card runs the whole model).  A raw pointer, not a reference: the runtime borrows it exactly like the
+    // load chain does (its FnTpPair::card0/g_full name the geometries, its mb waits to be opened by
+    // bring-up) and outlives every phase that reads it.
+    basalt::models::qwen4exp::generate::FnTpPair* fn_tp = nullptr;
     int32_t*& d_mrope;
     std::vector<int32_t>& mrope_host;
     std::string& cvec_summary;

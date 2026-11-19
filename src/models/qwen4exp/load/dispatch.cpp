@@ -143,6 +143,7 @@ int dispatch(Context& context) {
             .profile_loaded = profile_loaded,
             .pf_borrow = pf_borrow,
             .wt = wt,
+            .fn_tp = context.fn_tp,
             .d_mrope = d_mrope,
             .mrope_host = mrope_host,
             .cvec_summary = cvec_summary,
