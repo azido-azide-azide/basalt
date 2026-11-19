@@ -43,7 +43,7 @@ int weights(Context& context) {
         std::set<std::string> index_names;
         for_each_index_name(pack_files.index, [&](const std::string& n) { index_names.insert(n); });
         const bool planned =
-            basalt::core::NativeDense::plan_bytes(o.native_shards, true, 0, -1, dense_bytes, err) &&
+            basalt::core::NativeDense::plan_bytes(o.native_shards, true, 0, -1, dense_bytes, err, fn_tp_slices) &&
             basalt::core::NativeHead::plan_bytes(o.native_shards, head_bytes, err) &&
             (o.mtp.empty() || o.spec < 2 ||
              basalt::core::MtpDrafter::plan_bytes(basalt::core::MtpFiles::from(srcs), g, mtp_bytes, err));
@@ -91,22 +91,6 @@ int weights(Context& context) {
     if (!basalt::core::check_all(wt, g, err, fn_tp_card)) {
         return fatal_start_error(o.model + ": " + err);
     }
-    if (fn_tp_slices) {
-        // the pair's runtime twin (the second card's half and the mailbox driver) is not in this build yet: the
-        // load path is real and reported, and then the start is refused rather than run half a model.  With
-        // BASALT_FN_TP_LOAD_ONLY set, this exit is the test's success: the arena was priced, packed and checked.
-        uint64_t full_bytes = 0;
-        basalt::core::WeightTable::pool_bytes(pack_files, full_bytes, err, skip.empty() ? nullptr : &skip);
-        basalt::log::info("basalt generate", "tensor parallel load: arena %llu MiB of %llu MiB (rank 0 of %d, %zu "
-                             "sliced tensors), layout checked against the card's geometry",
-                     (unsigned long long) (pool_bytes >> 20), (unsigned long long) (full_bytes >> 20),
-                     (int) o.tp, fn_tp_slices->size());
-        cudaFree(arena);
-        if (std::getenv("BASALT_FN_TP_LOAD_ONLY") != nullptr) return 0;
-        basalt::log::error("basalt generate", "the tensor-parallel pair's runtime (second card's half, the "
-                             "exchanges) is not wired yet - this build only proves the load");
-        return 1;
-    }
     basalt::log::info("basalt generate", "%llu MiB of weights loaded from %s in %.1f s (%zu tensors "
                          "skipped: served from the source tensors)",
                  (unsigned long long) (pool_bytes >> 20), o.model.c_str(), load_s(), skip.size());
@@ -134,12 +118,29 @@ int weights(Context& context) {
 
     basalt::core::NativeDense native_dense;
     {
-        if (!native_dense.load(o.native_shards, wt, err, true)) {
+        if (!native_dense.load(o.native_shards, wt, err, true, 0, -1, nullptr, 0, fn_tp_slices)) {
             basalt::log::error("basalt generate", "native dense projections: %s", err.c_str());
             return 1;
         }
         basalt::log::info("basalt generate", "%zu native projection matrices, %.2f MiB of weights, in %.1f s",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
+    }
+    if (fn_tp_slices) {
+        // the pair's runtime twin (the second card's half and the mailbox driver) is not in this build yet: this
+        // card's arena AND its native matrices are real, reported, and then the start is refused rather than run
+        // half a model.  With BASALT_FN_TP_LOAD_ONLY set, that load IS the test's success.
+        uint64_t full_bytes = 0;
+        basalt::core::WeightTable::pool_bytes(pack_files, full_bytes, err, skip.empty() ? nullptr : &skip);
+        basalt::log::info("basalt generate", "tensor parallel load: arena %llu MiB of %llu MiB, %zu native matrices "
+                             "%.0f MiB (rank 0 of %d, %zu sliced tensors), layout checked against the card's geometry",
+                     (unsigned long long) (pool_bytes >> 20), (unsigned long long) (full_bytes >> 20),
+                     native_dense.tensor_count(), (double) native_dense.weight_bytes() / 1048576.0,
+                     (int) o.tp, fn_tp_slices->size());
+        cudaFree(arena);
+        if (std::getenv("BASALT_FN_TP_LOAD_ONLY") != nullptr) return 0;
+        basalt::log::error("basalt generate", "the tensor-parallel pair's runtime (second card's half, the "
+                             "exchanges) is not wired yet - this build only proves the load");
+        return 1;
     }
 
     // The fused hyper-connection read needs the layout where R lags by one pending write; the per-stage measurement
