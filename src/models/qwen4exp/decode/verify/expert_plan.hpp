@@ -46,6 +46,11 @@ struct DecMoe {
     float* h_rows = nullptr; float* m_rows = nullptr;
     bool tag = false;       ///< the combine polls the peer's rows (each dword not yet written holds the tag word)
     bool tags = false;      ///< the combine waits for the CPU pool's word itself: no wait launch (without --wait-stats)
+    /// the tensor pair (32c-4): res1 mirrors the TWIN card's expert tier - its residency reaches this card
+    /// through FnTp::twin_residency, and the route kernel relabels the twin's entries out of this plan
+    /// (kDmSkip, dec_moe.hpp).  There is no peer window to launch, ring or wait (pdev stays -1, xp empty),
+    /// so every pdev/peer branch beside this one stays gated on the peer tier exactly as before.
+    bool pair_res1 = false;
     size_t rows_words = 0;
     bool tag_dirty = false; ///< a released window may have left written rows behind
     size_t x_stride = 0, xq_stride = 0;      ///< per ring, floats / bytes

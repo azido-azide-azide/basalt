@@ -44,10 +44,21 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
         __syncthreads();
     }
     dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
+    if (a.tp_pair != 0) {   // the tensor pair's partition (32c-4): dm_ring_head's identical rewrite - rank 0
+                            // gives the twin's entries (tier >= 2) to kDmSkip, rank 1 keeps only its own tier's
+                            // entries the twin does not also hold; both cards' sums then cover every entry once
+        if (tid < n) {
+            const int32_t e = s_ids[tid];
+            const bool twin = e >= 0 && e < a.n_expert && a.res1 != nullptr && a.res1[e] >= 0;
+            if (a.tp_pair == 1 ? s_kind[tid] >= 2
+                               : s_kind[tid] != 0 || twin) s_kind[tid] = kDmSkip;
+        }
+        __syncthreads();
+    }
     if (tid < n) {
         if (s_kind[tid] < 0) atomicAdd(&s_ncpu, 1);
         else if (s_kind[tid] == 2) atomicAdd(&s_npeer, 1);
-        else if (s_kind[tid] >= 3) atomicAdd(&s_nx[s_kind[tid] - 3], 1);
+        else if (s_kind[tid] >= 3 && s_kind[tid] != kDmSkip) atomicAdd(&s_nx[s_kind[tid] - 3], 1);
     }
     __syncthreads();
     int npeers = s_npeer;   // every peer's entries

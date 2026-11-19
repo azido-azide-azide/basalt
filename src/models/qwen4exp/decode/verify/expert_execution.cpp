@@ -32,6 +32,10 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         dm_->tag_dirty = false;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    // the persistent peer window: a device-plan peer-mode thing only.  The tensor pair never has one - its
+    // twin card hosts rank 1's OWN graph and dm_->pdev stays -1 / dm_->xp stays empty even though res1 now
+    // mirrors the twin's residency (DecMoe::pair_res1, 32c-4) - so both blocks below are inert for the pair
+    // by this gate, not by a pair-specific one: the ring words the pair's res1 feeds are never rung.
     if (dm_->pdev >= 0) {
         const OnDevice on(dm_->pdev);
         basalt::kernels::DmPeerArgs pa;

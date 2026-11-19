@@ -34,7 +34,14 @@ bool Verifier::dm_init(std::string& err) {
     const char* why = nullptr;
     if (!lay.native) why = "the experts are not a native pack";
     else if (all_resident_) why = "every expert is resident";
-    else if (hits_.h_res == nullptr) why = "no host residency table";
+    // the pair's second card has no VerifyHits residency view (its tier is a PeerExperts object): its
+    // OWN tier, named by set_own_tier, is the residency source (32c-4).  Solo and rank 0 keep the
+    // host_res table; there was never a `peer_ != nullptr` gate on dm CONSTRUCTION - the 32c-3 spec's
+    // "dm_ only builds when peer_ != nullptr" named this no-residency-table gate, and it is the one
+    // own_tier_ exempts (all the xpeers/peer-window branches below stay gated on peer_ and never run
+    // in pair mode: the pair's cards set no peer_).
+    else if (hits_.h_res == nullptr && own_tier_ == nullptr) why = "no host residency table";
+    else if (own_tier_ != nullptr && !own_tier_->valid()) why = "the pair's own expert tier is not open";
     else if ((int64_t) max_t_ * ss_->k > kDmCap) why = "the window is too large";
     for (int64_t l = 0; why == nullptr && l < g.n_layers; ++l) {
         const auto& f = lay.fmt[(size_t) l];
@@ -94,6 +101,16 @@ bool Verifier::dm_init(std::string& err) {
     d->tags = d->wstat == nullptr;
     d->shadow0.assign((size_t) LE, INT32_MIN);
     d->shadow1.assign((size_t) LE, -1);
+    // the tensor pair (32c-4): res1 mirrors the TWIN card's residency so its own route kernel sees the
+    // twin's experts as foreign (the kinds pass turns them into kDmSkip, dec_moe.hpp); res1 itself starts
+    // all -1 (nothing foreign resident), which is what shadow1 says, and the first dm_sync uploads the
+    // difference.  The table must cover [n_layers * n_expert] exactly - both sources (the runtime's
+    // host_res for rank 1, the PeerExperts tier for rank 0) are the model's full table.
+    d->pair_res1 = tp_ != nullptr && tp_->twin_residency != nullptr;
+    if (d->pair_res1 && (int64_t) tp_->twin_residency->size() != LE) {
+        err = "verify: the pair's twin residency table is not [n_layers * n_expert]";
+        return false;
+    }
     d->pin_stride = (size_t) LE * 24;   // [res0 | ptab0 | res1 | ptab1] per slot
     if (cudaHostAlloc((void**) &d->pin, d->pin_stride * DecMoe::kPinSlots, cudaHostAllocPortable) != cudaSuccess) {
         cudaGetLastError();

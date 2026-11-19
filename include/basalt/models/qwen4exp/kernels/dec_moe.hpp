@@ -22,13 +22,18 @@ namespace basalt::kernels {
 
 constexpr int kDmCap = 128;          ///< entries per window: kVerifyMaxT tokens x top-10 fit
 constexpr int kDmMaxX = 2;           ///< peer cards past the first, each with its own ring, doorbell and done word
+/// the tensor pair (32c-4): an entry this card's plan can see but the TWIN card computes - the route kernel
+/// relabels it this instead of 2/3+q (a pair card has no peer window to launch or wait), and the combine
+/// contributes a zero row for it.  Never a tier number; nothing else ever writes it.
+constexpr int32_t kDmSkip = 8;
 
 /// One ring (layer) as the route kernel publishes it to mapped memory.
 struct DmRing {
     int32_t n_tok = 0, layer = 0, n_vram = 0, n_peer = 0, n_cpu = 0, pad[3] = {};
     int32_t ids[kDmCap] = {};
     int32_t kind[kDmCap] = {};       ///< 0: CUDA0's VRAM tier, 2: the peer card, 3 + q: further peer q, -1: the CPU
-                                     ///< pool; a further peer's own ring holds its entries as 2 and every other GPU's as 0
+                                     ///< pool; a further peer's own ring holds its entries as 2 and every other GPU's as 0;
+                                     ///< kDmSkip: the twin pair card computes it (32c-4) - no tier, no pool, no wait
 };
 
 /// CUDA0's grouped plan (native_expert_grouped's lists) and every entry's tier, on the device.
@@ -37,7 +42,8 @@ struct DmPlan {
     int32_t start[kDmCap + 1];
     int32_t dst[kDmCap];
     int32_t tok[kDmCap];
-    int32_t kind[kDmCap];            ///< 0 CUDA0's VRAM tier, 1 the staged share, 2 + the peers, -1 the CPU pool
+    int32_t kind[kDmCap];            ///< 0 CUDA0's VRAM tier, 1 the staged share, 2 + the peers, -1 the CPU pool,
+                                     ///< kDmSkip the twin pair card computes it (32c-4; counted in no count[ ])
     unsigned long long ptr[kDmCap];
     /// the staged share (kind 1): CPU misses CUDA0 copies from host RAM into staging and computes; its own lists
     int32_t scounts[2];              ///< [0] groups, [1] entries
@@ -79,6 +85,10 @@ struct DmRouteArgs {
     unsigned long long* stats = nullptr;   ///< DM_WAIT_STATS (kDmStatWords, device) or null: the doorbell's time
     int peer_cap = 0;                ///< PEER_CAP: the peer's groups past this many go to the CPU pool (0: no cap)
     bool kinds = false;              ///< mode 2: also every entry's tier into plan->kind and counts[2], counts[3]
+    /// the tensor pair (32c-4): 1 for rank 0 (entries of tier >= 2 - the twin's - become kDmSkip), 2 for rank 1
+    /// (only entries its OWN tier holds and the twin's res1 row does not stay 0; everything else becomes
+    /// kDmSkip).  0 solo: no rewrite, every kind pass below behaves exactly as before.
+    int tp_pair = 0;
     /// further peers: their residency rows (an entry no tier before holds goes to the first that does), their rings
     /// (written like ring_m) and their doorbells (rung like peer_seq_m)
     int n_x = 0;

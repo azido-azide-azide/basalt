@@ -139,6 +139,12 @@ public:
                                          ///< hand's - execution.cpp:65 resets the chain's per window): rank 0's
                                          ///< window graph raises it after publishing the pair's start rows,
                                          ///< waking rank 1's waiting inputs()
+        /// the OTHER card's VRAM expert residency ([n_layers * n_expert] slot or -1): each card's device MoE
+        /// plan reads it into dm's res1 so the twin's experts classify OUT of its own plan (32c-4): rank 0's
+        /// twin view is card 1's PeerExperts tier (serve's bring-up), rank 1's is the main ExpertCache's
+        /// host_res.  Null off the pair; the blob addresses behind it stay on the twin's own card - this
+        /// card only ever asks whether the twin holds the expert.
+        const std::vector<int32_t>* twin_residency = nullptr;
     };
     void set_tp(FnTp* tp) { tp_ = tp; if (tp_skip_head()) head_sampling_ = false; }   // the head off-switch, see tp_skip_head
     /// True on the pair's SECOND card: the LM head and its sampling stay rank 0's (design line "PLE + LM head +
@@ -151,6 +157,16 @@ public:
     uint32_t* tp_hand_flag() { return m_flag_ + 12; }
     /// the device arena `init` carved for this card's windows, for the pair's budget line (32c-3 item 7)
     uint64_t tp_arena_bytes() const { return arena_bytes_; }
+    /// The VRAM expert tier THIS card owns, when it is a PeerExperts tier: the pair's second card drives its
+    /// device-planned MoE tail from its residency and blob addresses (32c-4) - dm's res0/ptab0 mirror this
+    /// tier instead of the VerifyHits tables, and dm builds without a `peer_` (the pair has none: the twin
+    /// card hosts its own graph, no persistent peer window; see set_tp).  Rank 0's own tier is the main
+    /// ExpertCache already carried by its VerifyHits, so rank 0 never sets this; solo never sets it.
+    /// Before init, like set_peer.
+    void set_own_tier(PeerExperts* tier) { own_tier_ = tier; }
+    /// Whether the device-planned MoE tail came up (the pair's bring-up refuses a card whose tail is off:
+    /// without it its window is a plain doorbell verifier and the pair's MoE partial-sum has no partial).
+    bool dm_on() const { return dm_ != nullptr; }
     /// The CPU pool and the expert source the window's CPU tier runs on: between doorbells the parked workers predict
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
@@ -299,6 +315,10 @@ public:
     /// `displaced` expert bytes its peer reserve pushes off the peer.  Windows of up to max_t tokens.  Call before
     /// gs_cuda0_bytes / gs_peer_bytes; true when the split is taken.
     static bool gs_decide(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1, int max_t, int64_t displaced);
+    /// Records the GDN mixer split as not taken without modelling it (the tensor pair never prices it - its MoE
+    /// split is per-card device plans and a partial-sum exchange, not a key-head split; 32c-4).  Behaves like a
+    /// gs_decide that came back false for every later gs_*_bytes reader; call at the pricing site, before them.
+    static void gs_price_off();
     /// The peer bytes the head split by vocabulary loads after the peer's expert tier is filled, for a head of
     /// `row_bytes` per row and native `type`, windows of up to max_t tokens; 0 when the split is not taken.
     static int64_t hs_peer_bytes(size_t row_bytes, int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1);
@@ -458,6 +478,7 @@ private:
     struct WindowRecorder;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
+    PeerExperts* own_tier_ = nullptr;   ///< the pair's card's OWN VRAM expert tier (set_own_tier; null: VerifyHits, solo)
     FnTp* tp_ = nullptr;   ///< the tensor pair's role (set_tp; null = the card runs the whole model)
     uint64_t arena_bytes_ = 0;   ///< the device arena init carved (tp_arena_bytes; the pair's budget line)
     std::vector<PeerExperts*> xpeers_;

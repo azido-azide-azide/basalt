@@ -158,9 +158,15 @@ int QfnRuntime::init_verify() {
                            (int) ((uintptr_t) fn_tp == 0x6F), (void*) this);
         // the pair does not run the persistent peer window: card 1 hosts rank 1's graph instead (the dense
         // pair's law, src/dense/forward.cpp:794-828).  The tier FILL is untouched - peer_experts placement
-        // still ran at load - only the WINDOW-driving set_peer/add_peer above is skipped for rank 0.
-        basalt::log::info("basalt serve", "tensor pair: expert tier stays card1's, the pair's MoE exchange "
-                             "lands with the next slice");
+        // still ran at load - only the WINDOW-driving set_peer/add_peer above is skipped for rank 0.  The
+        // filled tier is now load-bearing for the MoE split (32c-4): it IS rank 1's own device plan, so a
+        // pair that somehow loaded without it cannot partition experts and must say so at once.
+        if (!peer.valid()) {
+            basalt::log::error("basalt serve", "tensor pair: CUDA%d's expert tier was not filled at load", fn_tp->dev);
+            return 1;
+        }
+        basalt::log::info("basalt serve", "tensor pair: expert tier stays card1's - and is now card1's OWN "
+                             "device MoE plan (32c-4)");
         // one mailbox for the pair (attach_tp, src/dense/stage.cpp:945-985): two slots - a window's
         // exchanges alternate between them - of 98304 B: kVerifyMaxT bf16 model-head rows (8 * 6144 * 2);
         // the f32 MoE rows (8 * 2560 * 4) fit the same slots when 32c-4 starts exchanging them.
@@ -168,8 +174,12 @@ int QfnRuntime::init_verify() {
             basalt::log::error("basalt serve", "tensor pair: the mailbox failed to open: %s", err.c_str());
             return 1;
         }
-        fn_tp_role[0] = {&fn_tp->mb, 0, fn_tp->g_full, {0, 0}, nullptr};
-        fn_tp_role[1] = {&fn_tp->mb, 1, fn_tp->g_full, {0, 0}, nullptr};
+        // each rank's device plan reads the OTHER card's residency as res1 (FnTp::twin_residency): rank 0's
+        // twin is card 1's PeerExperts tier, rank 1's is the runtime's host_res - the main ExpertCache's
+        // table, which the adapt/lend threads keep current (a pointer into it, so it must outlive the pair;
+        // the runtime member does).
+        fn_tp_role[0] = {&fn_tp->mb, 0, fn_tp->g_full, {0, 0}, nullptr, &peer.residency()};
+        fn_tp_role[1] = {&fn_tp->mb, 1, fn_tp->g_full, {0, 0}, nullptr, &host_res};
         ver.set_tp(&fn_tp_role[0]);   // before init: init carves the exchange's scratch for the full rows (32c-2)
     }
     ver.set_cpu_warm(drive.d.pool, drive.d.src);
@@ -206,6 +216,16 @@ int QfnRuntime::init_verify() {
     }
     if (fn_tp != nullptr && !init_pair_rank1())   // rank 1's session, verifier and roles (32c-3)
         return 1;
+    if (fn_tp != nullptr && (!ver.dm_on() || !ver_tp.dm_on())) {
+        // the pair's MoE split IS the two cards' device plans (32c-4): each card routes against its own
+        // residency, relabels the twin's entries away (kDmSkip) and exchanges its partial.  A card whose
+        // tail did not build would exchange a full MoE row for every expert it can see - a silent double
+        // count - so the pair refuses to start instead of serving wrong logits.
+        basalt::log::error("basalt serve", "tensor pair: the MoE device plans did not come up (CUDA0 %d, "
+                             "CUDA%d %d) - both cards need their device-planned tail",
+                     (int) ver.dm_on(), fn_tp->dev, (int) ver_tp.dm_on());
+        return 1;
+    }
     // each stage's verifier gets its stage's slot sessions
     if (o.batch > 0) {
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -317,20 +337,23 @@ bool QfnRuntime::init_pair_rank1() {
         basalt::log::error("basalt serve", "tensor pair: zeroing CUDA%d's session state failed", fn_tp->dev);
         return false;
     }
-    // the residency view, empty-but-named: init insists a VRAM expert tier exists (lifecycle.cpp:132-138),
-    // and nothing reads these while h_res is null - the all-resident scan skips it (lifecycle.cpp:362-376)
-    // and dm_init builds no device-planned tail without a peer (expert_resources.cpp:111-114), so rank 1
-    // gets a plain-doorbell verifier.  cache_base names its OWN arena (a live region on its card, not rank 0's);
-    // the real tier view is the next slice's set_own_tier (design memo 32c-4).  d_res is never dereferenced
-    // under a null h_res; it carries rank 0's word only to satisfy the existence check.
+    // the residency view, REAL for the MoE tail (32c-4): the route kernel's mode-0/1 pointer maths reads
+    // cache_base + slot_off to name expert blobs, and on this card those blobs live in the PeerExperts
+    // tier - so the view carries the tier's own slot triple (the same device_slot(0)+slot_offsets() pair
+    // rank 0's view is built from, verify.cpp:23-27).  h_res stays null: the residency that dm's res0/ptab0
+    // mirror comes from set_own_tier below (the tier object is the single source, and its slot_address()
+    // maths is exactly this triple), the all-resident scan skips a null h_res (lifecycle.cpp:362-376, and
+    // 32c-4 skips it for the pair anyway), and refresh_ar never sees it.  d_res carries rank 0's word only
+    // to satisfy init's existence check (lifecycle.cpp:132-138); it is never dereferenced.
     vh_tp.d_res = thits.d_res;
     vh_tp.h_res = nullptr;
-    vh_tp.cache_base = (const uint8_t*) fn_tp->arena;
-    vh_tp.slot_off = nullptr;
-    vh_tp.n_slots = 0;
+    vh_tp.cache_base = peer.cache().device_slot(0);
+    vh_tp.slot_off = peer.cache().slot_offsets();
+    vh_tp.n_slots = peer.cache().slots();
     vh_tp.blob = thits.blob;
     ver_tp.set_route_tail_skip(o.route_tail_skip);
     ver_tp.set_route_prior(o.route_prior);
+    ver_tp.set_own_tier(&peer);   // before init: dm_init's residency gate and res0/ptab0 source (32c-4)
     ver_tp.set_tp(&fn_tp_role[1]);   // before init, like rank 0's (init carves the exchange scratch)
     if (!ver_tp.init(fn_tp->wt, cg, ss_tp, vh_tp, nullptr, std::max({o.spec, o.batch, 2}), err)) {
         basalt::log::error("basalt serve", "tensor pair, CUDA%d: %s", fn_tp->dev, err.c_str());

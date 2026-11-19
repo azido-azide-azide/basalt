@@ -55,6 +55,12 @@ static int gs_plan(const ModelGeometry& g, int dev0, int dev1) { return g_gs_off
 // weights at its achieved bandwidth, less the peer item's growth per window token beyond the first.  Its reserve
 // displaces the same bytes of experts from the peer to RAM, which decode pays as CPU-tier misses.  The prompt path is
 // not priced: it streams the displaced experts with the rest of a chunk's, at no measurable cost.
+// the tensor pair records the split as NOT priced-taken (32c-4): with no decision to read, gs_plan reports
+// 0 key heads moved and every later reader - this file's byte pricings, cache_size's late reserve,
+// cache_fill's card room - treats the mixer as whole on CUDA0, exactly the state a decided-against split
+// leaves.  Call before any of them, at the pricing site.
+void Verifier::gs_price_off() { g_gs_off = true; }
+
 bool Verifier::gs_decide(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1, int max_t,
                          int64_t displaced) {
     g_gs_off = false;

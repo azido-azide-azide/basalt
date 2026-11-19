@@ -293,7 +293,9 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     if (dm && (v_.route_prior_ > 0.0f || v_.route_tail_skip_ > 0) && n * (int) K <= kDmCap) {   // opt-in routing changes
         ResidentTabs held;
         held.add(v_.dm_->res0 + l * g.n_expert);
-        if (v_.dm_->pdev >= 0) held.add(v_.dm_->res1 + l * g.n_expert);
+        // a pair card's "held" is the PAIR: res1 on a pair card is the twin's residency (pair_res1, 32c-4),
+        // so the prior biases toward and the tail-skip protects experts resident on either card
+        if (v_.dm_->pdev >= 0 || v_.dm_->pair_res1) held.add(v_.dm_->res1 + l * g.n_expert);
         for (const DecMoe::XPeer& x : v_.dm_->xp) held.add(x.res + l * g.n_expert);
         PdlScope pt(false);
         try {
@@ -309,7 +311,9 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         ra.ids = v_.ids_; ra.x = xm; ra.n_tok = n; ra.k = (int) K; ra.n_embd = (int) N;
         ra.n_expert = (int) g.n_expert; ra.layer = (int) l;
         ra.res0 = v_.dm_->res0 + l * g.n_expert;
-        ra.res1 = v_.dm_->pdev >= 0 ? v_.dm_->res1 + l * g.n_expert : nullptr;
+        ra.res1 = (v_.dm_->pdev >= 0 || v_.dm_->pair_res1) ? v_.dm_->res1 + l * g.n_expert : nullptr;
+        // the pair's partition rides the route kernel (32c-4): rank+1 selects the rewrite, 0 keeps solo as-is
+        ra.tp_pair = v_.tp_ != nullptr ? v_.tp_->rank + 1 : 0;
         ra.cache_base = v_.hits_.cache_base; ra.slot_off = v_.dm_->slot_off; ra.blob = (long long) v_.hits_.blob;
         ra.plan = v_.dm_->plan; ra.xq = v_.nat_xq_;
         const int64_t r = l - v_.lb_;

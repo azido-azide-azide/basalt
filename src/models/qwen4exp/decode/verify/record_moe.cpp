@@ -5,6 +5,7 @@
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/core/tp_mailbox.hpp"   // the pair's FP32 MoE partial-sum exchange after each combine (32c-4)
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
@@ -188,10 +189,35 @@ bool Verifier::WindowRecorder::post(int64_t l) {
         }   // true: the combine is the wait's programmatic dependent
         stamp(l, 23);
         try {
-            dec_moe_combine(v_.parts_, v_.dm_->m_rows, v_.m_ymiss_, v_.dm_->plan, v_.w_, v_.shared_, v_.bo_, N, K, n, nullptr, nullptr,
+            // rank 1 of a pair passes shared=null: the shared expert stays rank 0's compute (its table is
+            // a card-0 slab copy either way), so the pair's two partials plus the one shared sum cover
+            // the MoE output exactly once (32c-4, DecMoe::pair_res1 partition in the route kernels).
+            const float* moe_shared = v_.tp_ != nullptr && v_.tp_->rank == 1 ? nullptr : v_.shared_;
+            dec_moe_combine(v_.parts_, v_.dm_->m_rows, v_.m_ymiss_, v_.dm_->plan, v_.w_, moe_shared, v_.bo_, N, K, n,
+                            nullptr, nullptr,
                             ring, cs, !v_.dm_->tags, tag_done, v_.dm_->tags ? v_.m_flag_ : nullptr, v_.dm_->cseen,
                             sh_read ? v_.sh_g_ : nullptr);
         } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        // the pair's symmetric FP32 MoE partial-sum exchange (32c-4): each card's bo_ rows are now its
+        // PARTIAL of this layer's MoE output (every routed expert entered exactly one card's plan by the
+        // route kernel's kDmSkip partition, the shared expert only rank 0's combine).  Enqueued right after
+        // the combine on both cards' capture streams, so both enqueue 48 of them per window, on the same
+        // slots in the same order as the mixer exchanges alternate them (the epi counter tp_assemble uses);
+        // each card's bo_ comes back as the same FP32 sum of the two partials - in place, no bf16_out, the
+        // residual and the head read fp32 - and FP32 adds are commutative bit-exact, so the two cards'
+        // bits agree after exactly one cross-card add.
+        if (v_.tp_ != nullptr) {
+            FnTp* tp = v_.tp_;
+            std::string e;
+            if (!tp->mb->exchange_f32(tp->rank, tp->epi[tp->rank]++ & 1, v_.bo_, nullptr,
+                                      (size_t) n * (size_t) N, cs, e)) {
+                err = "tp moe exchange [call site line " + std::to_string((int) __LINE__) + "] T=" + std::to_string(T) +
+                      " N=" + std::to_string((long long) N) + " card=" + std::to_string(tp->rank) + " epi=" +
+                      std::to_string((long long) tp->epi[tp->rank]) + " layer=" + std::to_string((long long) l) +
+                      "]: " + e;
+                return false;
+            }
+        }
     } else if (n > 1) {   // one launch for the window's rows
         try {
             native_moe_combine_multi(v_.parts_, v_.w_, v_.shared_, v_.bo_, N, K, n, cs);

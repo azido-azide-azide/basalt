@@ -55,7 +55,8 @@ bool Verifier::dm_sync(std::string& err) {
     unsigned long long* const pin_ptab0 = (unsigned long long*) (pin + (pin ? (size_t) LE * 4 : 0));
     int32_t* const pin_res1 = (int32_t*) (pin + (pin ? (size_t) LE * 12 : 0));
     unsigned long long* const pin_ptab1 = (unsigned long long*) (pin + (pin ? (size_t) LE * 16 : 0));
-    const bool up0 = span(hits_.h_res, d->shadow0, a, b);
+    const int32_t* const res0_now = own_tier_ != nullptr ? own_tier_->residency().data() : hits_.h_res;
+    const bool up0 = span(res0_now, d->shadow0, a, b);
     if (up0) {
         decode_events().tag(1u << 4);
         const int32_t* src = d->shadow0.data() + a;
@@ -71,9 +72,12 @@ bool Verifier::dm_sync(std::string& err) {
         if (!pin) { pv.resize(b - a); p = pv.data(); }
         for (size_t i = a; i < b; ++i) {
             const int32_t slot = d->shadow0[i];
-            p[i - a] = slot >= 0 ? (unsigned long long) (hits_.cache_base + (hits_.slot_off ? (size_t) hits_.slot_off[slot]
-                                                                                             : (size_t) slot * hits_.blob))
-                                 : 0ull;
+            // the pair's own tier names its blobs (set_own_tier, 32c-4); the main card keeps the VerifyHits
+            // triple (cache_base + slot offsets), which already IS its ExpertCache
+            p[i - a] = slot < 0 ? 0ull
+                     : own_tier_ != nullptr ? (unsigned long long) own_tier_->slot_address(slot)
+                     : (unsigned long long) (hits_.cache_base + (hits_.slot_off ? (size_t) hits_.slot_off[slot]
+                                                                                : (size_t) slot * hits_.blob));
         }
         if (copy_small(d->ptab0 + a, p, (b - a) * 8, cs_) != cudaSuccess) {
             err = "verify: glue table upload";
@@ -82,8 +86,16 @@ bool Verifier::dm_sync(std::string& err) {
     }
     std::vector<uint32_t>& ch = d->put_i;
     ch.clear();
-    if (d->pdev >= 0) {
-        const int32_t* now = peer_->residency().data();
+    // res1's source: the peer tier's residency, or (the pair, 32c-4) the TWIN card's host table named by
+    // FnTp::twin_residency - a plain int32 table, no blob addresses behind it on this card: the pair's
+    // route kernel only asks the twin's row whether an expert is the twin's (kDmSkip), and the twin's own
+    // graph computes it there.  The ptab/table-put machinery below belongs to the persistent peer window
+    // and stays gated on d->pdev (never set in pair mode).
+    const int32_t* res1_now = nullptr;
+    if (d->pdev >= 0) res1_now = peer_->residency().data();
+    else if (d->pair_res1) res1_now = tp_->twin_residency->data();
+    if (res1_now != nullptr) {
+        const int32_t* now = res1_now;
         if (std::memcmp(now, d->shadow1.data(), LE * 4) != 0)
             for (size_t i = 0; i < LE; ++i)
                 if (now[i] != d->shadow1[i]) ch.push_back((uint32_t) i);
@@ -101,6 +113,8 @@ bool Verifier::dm_sync(std::string& err) {
             err = "verify: device-planned MoE peer residency upload";
             return false;
         }
+    }
+    if (!ch.empty() && d->pdev >= 0) {
         auto addr = [&](size_t i) {
             return d->shadow1[i] >= 0 ? (unsigned long long) peer_->slot_address(d->shadow1[i]) : 0ull;
         };

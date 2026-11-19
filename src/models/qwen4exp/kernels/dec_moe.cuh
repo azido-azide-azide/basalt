@@ -272,10 +272,24 @@ __device__ void dm_ring_head(const DmRouteArgs& a, const int32_t* res0, const in
         __syncthreads();
     }
     dm_stage_split(a, r_ids, r_kind, n, tid, r_pf);
+    if (a.tp_pair != 0) {   // the tensor pair's partition (32c-4): every entry the twin's tier holds is the
+                            // TWIN's compute, not a peer wait - rank 0 skips tier >= 2 (its own VRAM tier is 0
+                            // and there are no other GPUs), rank 1 keeps only entries its own tier holds (kind
+                            // 0) that the twin (its res1, rank 0's residency) does not also hold: an expert in
+                            // both tiers is rank 0's, so the pair's sums cover every entry exactly once.
+        if (tid < n) {
+            const int32_t e = r_ids[tid];
+            const bool twin = e >= 0 && e < a.n_expert && res1 != nullptr && res1[e] >= 0;
+            if (a.tp_pair == 1 ? r_kind[tid] >= 2
+                               : r_kind[tid] != 0 || twin) r_kind[tid] = kDmSkip;
+        }
+        __syncthreads();
+    }
     if (tid < n) {
         if (r_kind[tid] < 0) atomicAdd(&r_cnt[0], 1);
         else if (r_kind[tid] == 2) atomicAdd(&r_cnt[1], 1);
-        else if (r_kind[tid] >= 3) atomicAdd(&r_cnt[r_kind[tid]], 1);   // further peer q at 3 + q
+        else if (r_kind[tid] >= 3 && r_kind[tid] != kDmSkip) atomicAdd(&r_cnt[r_kind[tid]], 1);   // further peer q at 3 + q
+        else if (r_kind[tid] == kDmSkip) {}   // counted nowhere: the twin computes it (see dm_combine4_kernel)
         else atomicAdd(&r_cnt[2], 1);
     }
     __syncthreads();
@@ -373,12 +387,15 @@ __device__ void dm_glue_ring_pub(const DmRouteArgs& a, const void* xq, int tid, 
         while (dm_ld_acquire(a.pub_ctr + 2) == 0u) __nanosleep(32);
     __syncthreads();
     const int n4 = a.n_tok * (a.n_embd / 4);   // the FFN input rows the CPU pool reads, 16 bytes at a time
-    for (int i = tid; i < n4; i += blockDim.x) ((float4*) a.x_m)[i] = __ldcg((const float4*) a.x + i);
+    if (a.tp_pair != 2)   // rank 1 of a pair never has CPU or peer entries (every foreign kind is kDmSkip,
+                          // dm_ring_head): its ring's mapped rows would be PCIe traffic no reader ever reads
+        for (int i = tid; i < n4; i += blockDim.x) ((float4*) a.x_m)[i] = __ldcg((const float4*) a.x + i);
     if (tid == 0)
         while (dm_ld_acquire(a.pub_ctr) < a.pub_target) __nanosleep(32);
     __syncthreads();
     const int n16 = a.n_tok * (a.n_embd / 32) * 36 / 16;   // the q8_1 rows, 16 bytes at a time
-    for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
+    if (a.tp_pair != 2)
+        for (int i = tid; i < n16; i += blockDim.x) ((uint4*) a.xq_m)[i] = __ldcg((const uint4*) xq + i);
     if (tid == 0) {
         while (dm_ld_acquire(a.pub_ctr + 1) == 0u) __nanosleep(32);
         if (reset) {

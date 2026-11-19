@@ -38,8 +38,14 @@ int cache_size(Context& context) {
                    ? basalt::prefill::Prefill::peer_bytes(o.prefill_chunk, peer_streamed_share) : 0;
     };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
-    // only when the cards cannot hold them all
-    if (o.peer_device >= 1) {
+    // only when the cards cannot hold them all.  The tensor pair never takes the split (32c-4, deliverable 0):
+    // its cut is per-card MoE plans + the FP32 partial-sum exchange, not a key-head split - so the price is
+    // recorded as NOT taken (gs_price_off) instead of computed, and every later gs_peer_bytes/gs_cuda0_bytes
+    // reader (this file's late reserve, cache_fill's card room, the hs reservation) charges card 1 nothing for
+    // machinery pair mode never runs (a pair card has no pdev, so gs_init stays off its verifier too).
+    if (o.peer_device >= 1 && o.tp >= 2)
+        basalt::core::Verifier::gs_price_off();
+    else if (o.peer_device >= 1) {
         int d0 = 0, count = 0;
         size_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
         cudaGetDevice(&d0);
