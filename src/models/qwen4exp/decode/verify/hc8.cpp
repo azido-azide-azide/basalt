@@ -64,6 +64,12 @@ bool Verifier::prepare_hc8(const WeightTable& wt, const ModelGeometry& g, std::s
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
     LoadProgress progress(LoadProgress::cuda(dev), total);
+    // Idempotent per (device, matrix): a table whose hc8 entries were already rebound to their 8-bit copies (the
+    // load's pass at generate/weights.cpp, or the pair twin's there) re-passes with r->data holding the COPY
+    // pointer; hc8_upload finds that pointer keyed (current device, copy) in the registry (the "owned" form,
+    // hc_fused.hpp:102-104) and returns it without a second upload.  This phase runs on the caching card only -
+    // the pair's second card got its copies at load (generate/weights.cpp's twin pass) and no serve init re-runs
+    // this for it; init_pair_rank1 only needs hc_fused_init on the ambient (pair) device.
     for (const Hc8Tensor& t : tensors) {
         const WeightRef* r = wt.find(t.name);
         if (r == nullptr || r->data == nullptr) continue;   // not held on this device

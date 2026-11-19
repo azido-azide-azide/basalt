@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -1246,9 +1247,25 @@ struct Hc8Copy {
     int rows = 0, cols = 0, srow = 0;
     bool owned = false;    // keyed by q itself: no bf16 matrix behind it
 };
+// The registry is keyed (device, pointer).  A TP pair's two cards hold their OWN copy of each matrix (the reads
+// stream ~659 MiB of copies per decode window - a card must never resolve its pointer to the other card's VRAM),
+// and cudaMalloc addresses are not unique across devices, so a pointer-only key could alias the two cards' copies
+// outright.  Every registration takes the device the copy lives on (the ambient one - hc8_prepare first proves
+// the staged matrix is there, hc8_alloc/hc8_upload allocate under the ambient one); every lookup resolves under
+// the caller's current device, the card whose kernel reads the copy.  A single-device process keys every entry
+// under its one device: the same entries, the same resolutions, the same pointers as the pointer-only map gave.
+struct Hc8Key {
+    int dev;
+    const void* p;
+    bool operator==(const Hc8Key& o) const { return dev == o.dev && p == o.p; }
+};
+struct Hc8KeyHash {
+    size_t operator()(const Hc8Key& k) const { return std::hash<const void*>()(k.p) * 31u + (size_t) k.dev; }
+};
+int hc8_cur_dev() { int d = 0; cudaGetDevice(&d); return d; }
 std::mutex g_hc8_mu;
-std::unordered_map<const void*, Hc8Copy> g_hc8;
-size_t g_hc8_bytes = 0;
+std::unordered_map<Hc8Key, Hc8Copy, Hc8KeyHash> g_hc8;
+size_t g_hc8_bytes = 0;   // across every device: a caller prices its own card by the delta its own pass leaves
 
 // The copies are carved out of large allocations: one cudaMalloc per matrix rounds each up to the allocator's
 // granularity, which costs a fraction of a MiB per matrix.  Offsets stay 256-byte aligned, as separate allocations are.
@@ -1322,36 +1339,38 @@ bool hc8_only() { return true; }
 
 void hc8_prepare(const uint16_t* w, int rows, int cols) {
     if (w == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return;
-    std::lock_guard<std::mutex> lk(g_hc8_mu);
-    if (g_hc8.count(w)) return;
-    int dev = 0;
     cudaPointerAttributes pa{};
-    cudaGetDevice(&dev);
+    const int dev = hc8_cur_dev();
+    std::lock_guard<std::mutex> lk(g_hc8_mu);
+    if (g_hc8.count({dev, w})) return;
     if (cudaPointerGetAttributes(&pa, w) != cudaSuccess || pa.type != cudaMemoryTypeDevice || pa.device != dev) {
         cudaGetLastError();
         return;   // another card's matrix: its reads stay bf16
     }
     Hc8Copy c;
     if (!hc8_make(w, rows, cols, c)) return;   // that read stays bf16
-    g_hc8[w] = c;
+    g_hc8[{dev, w}] = c;
     g_hc8_bytes += c.bytes;
 }
 
 const void* hc8_adopt(const uint16_t* w, int rows, int cols) {
     if (w == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return nullptr;
+    const int dev = hc8_cur_dev();   // hc8_make allocates on this card: its readers resolve the key here
     std::lock_guard<std::mutex> lk(g_hc8_mu);
     Hc8Copy c;
     if (!hc8_make(w, rows, cols, c)) return nullptr;
     c.owned = true;
-    g_hc8[c.q] = c;
+    g_hc8[{dev, c.q}] = c;
     g_hc8_bytes += c.bytes;
     return c.q;
 }
 
 const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, int rows, int cols) {
     if (q == nullptr || s == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return nullptr;
+    const int dev = hc8_cur_dev();   // the copy lands on this card; a second card's pass builds and keys its own
     std::lock_guard<std::mutex> lk(g_hc8_mu);
-    if (w != nullptr && g_hc8.count(w)) return w;
+    if (w != nullptr && g_hc8.count({dev, w})) return w;   // already here: the re-pass (prepare_hc8 over a rebound
+                                                           // table) finds the copy under its own pointer, not a re-upload
     const int64_t n = (int64_t) rows * cols;
     Hc8Copy c;
     c.rows = rows;
@@ -1371,14 +1390,15 @@ const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, in
     }
     c.owned = w == nullptr;
     const void* key = w != nullptr ? (const void*) w : (const void*) c.q;
-    g_hc8[key] = c;
+    g_hc8[{dev, key}] = c;
     g_hc8_bytes += c.bytes;
     return key;
 }
 
 bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* bytes) {
+    const int dev = hc8_cur_dev();   // the reading card resolves its OWN copy: the rebind installed a local pointer
     std::lock_guard<std::mutex> lk(g_hc8_mu);
-    const auto it = g_hc8.find(w);
+    const auto it = g_hc8.find({dev, w});
     if (it == g_hc8.end()) return false;
     *q = it->second.q;
     *s = it->second.s;
@@ -1387,8 +1407,9 @@ bool hc8_lookup(const void* w, const int8_t** q, const uint16_t** s, size_t* byt
 }
 
 bool hc8_view(const void* w, Hc8View& v) {
+    const int dev = hc8_cur_dev();
     std::lock_guard<std::mutex> lk(g_hc8_mu);
-    const auto it = g_hc8.find(w);
+    const auto it = g_hc8.find({dev, w});
     if (it == g_hc8.end()) return false;
     const Hc8Copy& c = it->second;
     v.q = c.q; v.s = c.s; v.rows = c.rows; v.cols = c.cols; v.srow = c.srow; v.bytes = c.bytes; v.owned = c.owned;
@@ -1449,12 +1470,15 @@ struct CnMaps {
     CUtensorMap tm[6];
     bool ok;
 };
-// The tensor maps of a read's 8-bit matrices; false when one failed.
+// The tensor maps of a read's 8-bit matrices; false when one failed.  A CUtensorMap bakes the base ADDRESS, so
+// the cache keys (device, q_down) too: the pair's two cards hold copies of the same matrices, and an address
+// collision across cards must not hand card 1 a map encoding card 0's VRAM.
 bool cn_maps(const HcFusedArgs& h, CUtensorMap* tm) {
     static std::mutex mu;
-    static std::unordered_map<const void*, CnMaps> cache;
+    static std::unordered_map<Hc8Key, CnMaps, Hc8KeyHash> cache;
+    const int dev = hc8_cur_dev();
     std::lock_guard<std::mutex> lk(mu);
-    auto it = cache.find(h.q_down);
+    auto it = cache.find({dev, h.q_down});
     if (it == cache.end()) {
         CnMaps c{};
         constexpr auto U64 = CU_TENSOR_MAP_DATA_TYPE_UINT64, U16 = CU_TENSOR_MAP_DATA_TYPE_UINT16;
@@ -1468,7 +1492,7 @@ bool cn_maps(const HcFusedArgs& h, CUtensorMap* tm) {
         const cuuint64_t sd[3] = {SU8, N, HC}, ss[2] = {SU8 * 2, (cuuint64_t) N * SU8 * 2};
         const cuuint32_t sb[3] = {SU8, UPCM_SL, HC};
         c.ok = c.ok && tmap(&c.tm[4], h.q_up, U64, 4, qd, qs, qb) && tmap(&c.tm[5], h.s_up, U16, 3, sd, ss, sb);
-        it = cache.emplace(h.q_down, c).first;
+        it = cache.emplace(Hc8Key{dev, h.q_down}, c).first;
     }
     std::copy(it->second.tm, it->second.tm + 6, tm);
     return it->second.ok;
