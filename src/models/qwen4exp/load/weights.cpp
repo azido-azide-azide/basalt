@@ -1,7 +1,9 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/models/qwen4exp/plan/tp_rank.hpp"
 #include "context.hpp"
 
 #include <cstdlib>
+#include <optional>
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -126,20 +128,62 @@ int weights(Context& context) {
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
     }
     if (fn_tp_slices) {
-        // the pair's runtime twin (the second card's half and the mailbox driver) is not in this build yet: this
-        // card's arena AND its native matrices are real, reported, and then the start is refused rather than run
-        // half a model.  With BASALT_FN_TP_LOAD_ONLY set, that load IS the test's success.
+        // ---- the pair's second card: rank 1's half of every sliced tensor, on its own device, in its own arena
+        // and native slabs.  The two cards' row runs are disjoint and each whole - together they are the model.
+        const int peer_dev = o.peer_devices.empty() ? 1 : o.peer_devices.front();
+        const basalt::plan::FnRankPlan plan1 = basalt::plan::fn_rank_plan(g, o.tp, 1, err);
+        if (!err.empty()) {
+            cudaFree(arena);
+            return fatal_start_error(err);
+        }
+        basalt::core::WeightTable::RowSlices slices1 = basalt::plan::fn_row_slices(plan1);
+        uint64_t pool1 = 0;
+        if (!basalt::core::WeightTable::pool_bytes(pack_files, pool1, err, skip.empty() ? nullptr : &skip, &slices1)) {
+            cudaFree(arena);
+            return fatal_start_error(err);
+        }
+        void* arena1 = nullptr;
+        std::optional<basalt::core::WeightTable> wt1;
+        std::optional<basalt::core::NativeDense> native1;
+        {
+            const basalt::core::OnDevice on_peer(peer_dev);
+            if (cudaMalloc(&arena1, pool1) != cudaSuccess) {
+                cudaGetLastError();
+                basalt::log::error("basalt generate", "cudaMalloc(%llu) for CUDA%d's weight arena failed",
+                             (unsigned long long) pool1, peer_dev);
+                cudaFree(arena);
+                return 1;
+            }
+            wt1.emplace();
+            bool ok = wt1->load(pack_files, arena1, pool1, err, skip.empty() ? nullptr : &skip, true, &slices1);
+            if (ok) ok = basalt::core::check_all(*wt1, g, err, &plan1.card);
+            if (ok) {
+                native1.emplace();
+                ok = native1->load(o.native_shards, *wt1, err, true, 0, -1, nullptr, 0, &slices1);
+            }
+            if (!ok) {
+                cudaFree(arena1);
+                cudaFree(arena);
+                return fatal_start_error(err);
+            }
+        }
+        // the pair's runtime twin (the driver that runs both halves and the mailbox between them) is not in this
+        // build yet: both cards' loads are real, reported, and then the start is refused rather than run half a
+        // model.  With BASALT_FN_TP_LOAD_ONLY set, that load IS the test's success.
         uint64_t full_bytes = 0;
         basalt::core::WeightTable::pool_bytes(pack_files, full_bytes, err, skip.empty() ? nullptr : &skip);
-        basalt::log::info("basalt generate", "tensor parallel load: arena %llu MiB of %llu MiB, %zu native matrices "
-                             "%.0f MiB (rank 0 of %d, %zu sliced tensors), layout checked against the card's geometry",
+        basalt::log::info("basalt generate", "tensor parallel load: CUDA0 arena %llu MiB (of %llu full), %zu native "
+                             "matrices %.0f MiB; CUDA%d arena %llu MiB, %zu native matrices %.0f MiB; %zu sliced "
+                             "tensors per card, layout checked against each card's geometry",
                      (unsigned long long) (pool_bytes >> 20), (unsigned long long) (full_bytes >> 20),
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / 1048576.0,
-                     (int) o.tp, fn_tp_slices->size());
+                     peer_dev, (unsigned long long) (pool1 >> 20),
+                     native1->tensor_count(), (double) native1->weight_bytes() / 1048576.0, fn_tp_slices->size());
         cudaFree(arena);
+        cudaFree(arena1);
         if (std::getenv("BASALT_FN_TP_LOAD_ONLY") != nullptr) return 0;
-        basalt::log::error("basalt generate", "the tensor-parallel pair's runtime (second card's half, the "
-                             "exchanges) is not wired yet - this build only proves the load");
+        basalt::log::error("basalt generate", "the tensor-parallel pair's runtime (the driver that runs both "
+                             "halves and the exchanges) is not wired yet - this build only proves the load");
         return 1;
     }
 
