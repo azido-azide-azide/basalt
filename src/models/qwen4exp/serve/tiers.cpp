@@ -99,6 +99,19 @@ void QfnRuntime::res_upload() {
     }
 }
 
+// the pair's twin upload (32c-4, qfn_state.hpp's comment): rank 0's tables mirror its cache and card 1's
+// tier, rank 1's mirror card 1's tier and the runtime's host_res - one adapt round moved both sources -
+// so its early dm_sync runs on both cards.  rank 1's streams and tables are device-bound to its card, so
+// it runs under OnDevice(fn_tp->dev); the copy_small chunks and the fence rules are dm_sync's own.
+bool QfnRuntime::dm_presync_pair(std::string& perr) {
+    bool ok = ver.dm_presync(perr);
+    if (fn_tp != nullptr) {
+        const basalt::core::OnDevice on_tp(fn_tp->dev);
+        ok = ver_tp.dm_presync(perr) && ok;
+    }
+    return ok;
+}
+
 // the peer tiers take the next most-routed CPU misses: each passes over what the primary (r0) or another tier
 // holds or takes in this round; with one tier r0 is its whole view
 bool QfnRuntime::adapt_peers(const std::vector<int32_t>& r0, std::string& perr) {
@@ -460,9 +473,9 @@ bool QfnRuntime::xq_advance(bool wait) {
             }
             host_res[(size_t) x.lout * g.n_expert + x.out] = basalt::core::kNotResident;
         }
-        {   // the residency uploads go ahead of the incoming copies in the copy queue
+        {   // the residency uploads go ahead of the incoming copies in the copy queue (both pair cards, 32c-4)
             std::string perr;
-            if (!ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+            if (!dm_presync_pair(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
             res_upload();
             ver.dm_fence(adapt_stream);
         }

@@ -196,7 +196,7 @@ inline void QfnRequest::spawn_adapt(bool early) {
                     adapt_ok = runtime_.xq_stage != 0 ? runtime_.xq_advance(false) : runtime_.xq_round(pre ? &ranked : nullptr);
                     basalt::core::decode_events().stamp(6);
                     std::string perr;
-                    if (adapt_ok && !runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                    if (adapt_ok && !runtime_.dm_presync_pair(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                     basalt::core::decode_events().stamp(7);
                     basalt::core::decode_gaps().hms[20] += ms_pre + ms(tb);
                 });
@@ -209,7 +209,7 @@ inline void QfnRequest::spawn_adapt(bool early) {
                 adapt_ok = runtime_.adapt();
                 if (adapt_ok) {   // the evictions' residency, uploaded beside the draft
                     std::string perr;
-                    if (!runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                    if (!runtime_.dm_presync_pair(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                 }
                 basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             });
@@ -251,7 +251,7 @@ inline void QfnRequest::tier_after_commit() {
                     if (boundary) {
                         runtime_.apply_pending(true, false);
                         std::string perr;
-                        if (!runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                        if (!runtime_.dm_presync_pair(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                     }
                     if (copies) copy_done = !runtime_.src.exchanges_staged() || runtime_.src.copy_exchanges(8ull << 20);
                 });

@@ -360,7 +360,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     all_resident_ = false;
     ar_off_ = false;
     if (h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-    if (hits.h_res != nullptr && hits.d_res != nullptr && hits.cache_base != nullptr) {
+    // a tensor-pair card never takes the zero-doorbell variant (32c-4): the pair's windows must capture the
+    // SAME recorder variant on both cards - every MoE tail is the device-planned one with the FP32 partial
+    // exchange, and that path needs dm, which the zero-doorbell branch replaces with resident_plan.  The
+    // scan's premise (every expert of the range in THIS card's cache) can only hold for one of the pair at
+    // a time anyway - card 1's tier holds about half - but forcing it here is what makes the variant a law
+    // rather than an accident of how the tiers happened to fill.
+    if (tp_ == nullptr && hits.h_res != nullptr && hits.d_res != nullptr && hits.cache_base != nullptr) {
         {
             bool all_ok = true;
             for (int64_t l = lb_; l < le_ && all_ok; ++l) {

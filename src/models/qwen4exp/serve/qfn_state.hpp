@@ -256,6 +256,13 @@ private:
     float* tp_hand = nullptr;
     bool pair_runnable = false;
     bool init_pair_rank1();   // rank 1's session and Verifier (defined with the verify operations)
+    // the residency-sync rule of the dm windows, for the pair (32c-4): an adapt round or a landed round
+    // changes BOTH cards' residency - rank 0's host_res (rank 1's res1 source, FnTp::twin_residency) and
+    // card 1's tier (rank 1's res0/ptab0 source, set_own_tier, and rank 0's res1 source) - so the early
+    // dm_sync that takes the next window's table copies out of its critical path must run on both cards.
+    // rank 1's dm_sync runs under its own device: its cs_ stream and tables live there.  Off the pair this
+    // is exactly the single ver.dm_presync the call sites used to make.  Defined with the tier operations.
+    bool dm_presync_pair(std::string& perr);
     // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
     // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
     basalt::core::Verifier ver_same{};
