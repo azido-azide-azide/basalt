@@ -42,6 +42,14 @@ struct Verifier::WindowRecorder {
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
     const int64_t HV = g.ssm_v_heads, HK = g.ssm_k_heads, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
     const int64_t IQ = g.idx_q_heads, ID = g.idx_key_dim, NE = g.n_expert, MT = v_.max_t_;
+    // a pair card's REPLICATED output projections take the FULL model's activation width (the exchange
+    // assembles the whole head row before them); every other kernel keeps the card's own geometry.
+    const ModelGeometry& gf = v_.tp_ && v_.tp_->g_full ? *v_.tp_->g_full : g;
+    const int64_t ZVF = gf.ssm_value_dim, NHDF = (int64_t) gf.n_head * gf.head_dim;
+    /// Activation-first mixer exchange: place the card's `half_dim`-wide head rows (`src`, bf16 or fp32, row
+    /// stride half_dim) at the model's head slot of a full row, sum the pair's rows over the mailbox, widen
+    /// and quantize the result (full_dim wide) into xq_ for the replicated projection.
+    bool tp_assemble(int64_t half_dim, int64_t full_dim, const void* src, bool src_bf16);
     const kernels::QsaShapes s = verify_detail::shapes_of(g);
     const kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +

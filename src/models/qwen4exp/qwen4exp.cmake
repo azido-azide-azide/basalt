@@ -44,6 +44,7 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/fused_gdn.cu
   src/models/qwen4exp/kernels/qsa_select.cu
   src/models/qwen4exp/kernels/verify_kernels.cu
+  src/models/qwen4exp/kernels/tp_exchange.cu
   src/models/qwen4exp/kernels/dense_tc.cu
   src/models/qwen4exp/kernels/mid_chain.cu
   src/models/qwen4exp/kernels/qsa_mid.cu

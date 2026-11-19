@@ -32,6 +32,13 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
     float* hb = v_.h_L_ + (size_t) gi * MT * C;
     float* gate = v_.gate_L_ + (size_t) gi * MT * HV;
     float* beta = v_.beta_L_ + (size_t) gi * MT * HV;
+    // a pair card reads the head-indexed replicated vectors (alpha/beta rows, dt/a) from its model's head
+    // slot: the kernels index card-local heads into them
+    const int64_t hv0 = v_.tp_ ? (int64_t) v_.tp_->rank * HV : 0;
+    const uint16_t* w_alpha_p = (const uint16_t*) wa->data + hv0 * N;
+    const uint16_t* w_beta_p = (const uint16_t*) wb->data + hv0 * N;
+    const float* dt_p = (const float*) wdt->data + hv0;
+    const float* ssm_a_p = (const float*) wsa->data + hv0;
     PdlScope ps(pdl);   // the layer's GDN kernels, after the hc read
     if (gs_split) {   // CUDA0's key heads in place (dec_gdn_rec's head map); the peer's arrive in the combine
         const GsLayer& GL = v_.gs_layers_[(size_t) gi];
@@ -39,10 +46,11 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         kernels::dense_tc_pair(GL.tq, GL.wqkv0, v_.gs_qkv0_, C0, GL.tz, GL.wz0, v_.gs_z0_, Z0, v_.xq_, (int) N, n, cs);
         DecRecArgs ra;
         ra.state = state; ra.qkv = v_.gs_qkv0_; ra.conv_w = (const float*) wc->data; ra.x = xm;
-        ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
-        ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = v_.gs_z0_;
+        ra.w_alpha = w_alpha_p; ra.w_beta = w_beta_p;
+        ra.dt = dt_p; ra.ssm_a = ssm_a_p; ra.z = v_.gs_z0_;
         ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = v_.xq_;
         ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+        if (v_.tp_) ra.y16 = v_.y16_;   // the pair's card keeps its heads' bf16 rows for the exchange
         ra.k0 = 0; ra.nk = v_.gs_nk0_; ra.qkv_out = qkv;
         dec_gdn_rec(ra, n, cs);
         dense_proj(4, GL.to, GL.wo0, v_.xq_, v_.bo_, Z0, (int) N, n, cs);
@@ -82,17 +90,19 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         for (int i = 2; i <= 5; ++i) stamp(l, i);
         DecRecArgs ra;
         ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
-        ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
-        ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = v_.z_;
+        ra.w_alpha = w_alpha_p; ra.w_beta = w_beta_p;
+        ra.dt = dt_p; ra.ssm_a = ssm_a_p; ra.z = v_.z_;
         ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = v_.xq_;
         ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+        if (v_.tp_) ra.y16 = v_.y16_;   // the pair's card keeps its heads' bf16 rows for the exchange
         ra.early_trigger = pdl;   // PDL2: the out projection stages its weights
         {
             PdlScope pr(pdl);
             rec(ra);
         }
         stamp(l, 6);
-        dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZV, (int) N, n, cs);
+        if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true)) return false;
+        dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
         goto gdn_done;
     }
     const bool pk_z = gdnf_fork && v_.sh_hi_ != nullptr && n <= 2;
@@ -108,10 +118,11 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         stamp(l, 2);
         DecRecArgs ra;
         ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
-        ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
-        ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = v_.z_;
+        ra.w_alpha = w_alpha_p; ra.w_beta = w_beta_p;
+        ra.dt = dt_p; ra.ssm_a = ssm_a_p; ra.z = v_.z_;
         ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = v_.xq_;
         ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+        if (v_.tp_) ra.y16 = v_.y16_;   // the pair's card keeps its heads' bf16 rows for the exchange
         cudaStreamWaitEvent(cs, v_.ev_join_, 0);
         for (int i = 3; i <= 5; ++i) stamp(l, i);
         {
@@ -119,7 +130,8 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
             dec_gdn_rec(ra, n, cs);
         }
         stamp(l, 6);
-        dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZV, (int) N, n, cs);
+        if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true)) return false;
+        dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
         goto gdn_done;
     }
     if (gdnf_fork && gdnf == 3) gdnf_z_side();
@@ -128,10 +140,11 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
     if (gdnf) {
         DecRecArgs ra;
         ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
-        ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
-        ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = v_.z_;
+        ra.w_alpha = w_alpha_p; ra.w_beta = w_beta_p;
+        ra.dt = dt_p; ra.ssm_a = ssm_a_p; ra.z = v_.z_;
         ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = v_.xq_;
         ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+        if (v_.tp_) ra.y16 = v_.y16_;   // the pair's card keeps its heads' bf16 rows for the exchange
         ra.early_trigger = pdl;   // PDL2: the out projection stages its weights
         if (gdnf_fork) {
             if (gdnf == 2) gdnf_z_side();
@@ -142,13 +155,15 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
             PdlScope pn(pdl, true);   // the norm follows the join
             dec_gdn_rec_norm(ra, n, cs);
             stamp(l, 6);
-            dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZV, (int) N, n, cs);
+            if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true)) return false;
+            dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
         } else {
             dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
             for (int i = 3; i <= 5; ++i) stamp(l, i);
             dec_gdn_rec(ra, n, cs);
             stamp(l, 6);
-            dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZV, (int) N, n, cs);
+            if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true)) return false;
+            dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
         }
         goto gdn_done;
     }
@@ -159,8 +174,8 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
     } else
     gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, 0);
     stamp(l, 3);
-    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                 (const float*) wsa->data, gate, beta, (int) N, (int) HV,
+    gdn_ab_multi(xm, w_alpha_p, w_beta_p, dt_p,
+                 ssm_a_p, gate, beta, (int) N, (int) HV,
                  n, cs);
     stamp(l, 4);
     dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
@@ -173,8 +188,9 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
     gdn_step_norm_multi(state, hb, (int) C, gate, beta, v_.z_, (const float*) wnm->data, EPS, v_.y_, (int) HK,
                         (int) HV, T, nullptr, cs, 0);
     stamp(l, 6);
-    native_quantize_q8_1(v_.y_, v_.xq_, (int) ZV, n, cs);
-    dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZV, (int) N, n, cs);
+    if (v_.tp_) { if (!tp_assemble(ZV, ZVF, v_.y_, false)) return false; }   // fp32 y rows placed directly
+    else native_quantize_q8_1(v_.y_, v_.xq_, (int) ZV, n, cs);
+    dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
     gdn_done:;
     return true;
 }

@@ -107,6 +107,8 @@ struct DecodeEvents {
 };
 DecodeEvents& decode_events();
 
+class TpMailbox;  // basalt/core/tp_mailbox.hpp - the pair's exchange; FnTp holds a pointer to it
+
 class Verifier {
 public:
     Verifier() = default;
@@ -121,6 +123,20 @@ public:
     /// A further peer card's expert tier, served like the first by a persistent kernel of its own (its own ring,
     /// doorbell and done word); only with the device-planned MoE tail.  Before init, after set_peer.
     void add_peer(PeerExperts* peer) { xpeers_.push_back(peer); }
+    /// The card's role on a tensor-parallel pair (qwen4exp --tp 2): its rank and the pair's mailbox, and the
+    /// FULL model's geometry - read only for the two replicated output projections' input widths, since the
+    /// activation-first exchange hands every card the whole head rows.  Before init: init carves the
+    /// exchange's scratch and sizes the q8_1 staging for the full-width rows.  The cards never name each
+    /// other's objects: they meet in the mailbox's slots (core::TpMailbox), like the dense pair's.
+    struct FnTp {
+        basalt::core::TpMailbox* mb = nullptr;
+        int rank = 0;
+        const ModelGeometry* g_full = nullptr;
+        size_t epi[2] = {0, 0};   ///< the driver zeroes these per window; the capture's exchanges alternate
+                                  ///< the two slots by them (a window that queued unequal counts on the two
+                                  ///< cards wedges its rounds - the dense pair's lockstep check)
+    };
+    void set_tp(FnTp* tp) { tp_ = tp; }
     /// The CPU pool and the expert source the window's CPU tier runs on: between doorbells the parked workers predict
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
@@ -398,6 +414,7 @@ private:
     struct WindowRecorder;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
+    FnTp* tp_ = nullptr;   ///< the tensor pair's role (set_tp; null = the card runs the whole model)
     std::vector<PeerExperts*> xpeers_;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
     ExpertSource* warm_src_ = nullptr;
@@ -664,6 +681,8 @@ private:
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
+    uint16_t *y16_ = nullptr, *mixb_ = nullptr;               // tp: this card's bf16 head halves; the assembled
+    float* mixf_ = nullptr;                                   //     full row; its fp32 widening for the quantizer
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
     float *z_ = nullptr, *y_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;

@@ -168,7 +168,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
     const uint64_t HS = (uint64_t) basalt::kernels::NG_HIST * basalt::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
-    const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
+    // a pair card quantizes the FULL model's activation rows before its replicated output projections, and it
+    // carves the exchange's scratch (the card's own geometry is otherwise all the arena needs)
+    const uint64_t ZVF = (tp_ != nullptr && tp_->g_full != nullptr) ? (uint64_t) tp_->g_full->ssm_value_dim : ZV;
+    const uint64_t NHDF = (tp_ != nullptr && tp_->g_full != nullptr)
+                              ? (uint64_t) tp_->g_full->n_head * (uint64_t) tp_->g_full->head_dim
+                              : NH * HD;
+    const uint64_t mixw = std::max<uint64_t>(std::max<uint64_t>(ZVF, NHDF), N);
+    const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD), mixw);
 
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
@@ -232,6 +239,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
+        if (tp_ != nullptr) {   // the pair's mixer exchange: this card's bf16 head halves, the assembled bf16
+                                // full row (equal bits on both cards), its fp32 widening for the quantizer
+            y16_ = b.take<uint16_t>((uint64_t) T * ZV);
+            mixb_ = b.take<uint16_t>((uint64_t) T * mixw);
+            mixf_ = b.take<float>((uint64_t) T * mixw);
+        }
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);

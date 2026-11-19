@@ -5,6 +5,9 @@
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/models/qwen4exp/kernels/cvec.hpp"
+#include "basalt/models/qwen4exp/kernels/tp_exchange.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/core/tp_mailbox.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include <string>
 
@@ -29,6 +32,27 @@ using namespace verify_detail;
 bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     WindowRecorder recorder(*this, T, cs, err);
     return recorder.run();
+}
+
+// The pair's card turns its own heads' activation rows into both cards' whole rows: its values land at their
+// model head slot (zeros elsewhere), the mailbox sums the two cards' placements (x + 0 = x: one rounding, equal
+// bits on both cards), and the widened row quantizes as every single-card window quantizes its projection input.
+bool Verifier::WindowRecorder::tp_assemble(int64_t half_dim, int64_t full_dim, const void* src, bool src_bf16) {
+    using namespace basalt::kernels;
+    FnTp* tp = v_.tp_;
+    const int64_t off = (int64_t) tp->rank * half_dim;
+    if (src_bf16)
+        tp_place_bf16_bf16(v_.mixb_, (const uint16_t*) src, half_dim, full_dim, off, T, cs);
+    else
+        tp_place_bf16_f32(v_.mixb_, (const float*) src, half_dim, full_dim, off, T, cs);
+    std::string e;
+    if (!tp->mb->exchange_bf16(tp->rank, tp->epi[tp->rank]++ & 1, v_.mixb_, (size_t) T * full_dim * 2, cs, e)) {
+        err = "tp mixer exchange (l=" + std::to_string((long long) (v_.lb_ + tp->epi[tp->rank] % 1000)) + "): " + e;
+        return false;
+    }
+    tp_bf16_widen(v_.mixf_, v_.mixb_, (int64_t) T * full_dim, cs);
+    native_quantize_q8_1(v_.mixf_, v_.xq_, (int) full_dim, T, cs);
+    return true;
 }
 
 bool Verifier::WindowRecorder::run() {
