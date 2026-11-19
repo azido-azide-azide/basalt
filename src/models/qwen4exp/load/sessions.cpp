@@ -188,12 +188,18 @@ int sessions(Context& context) {
     {
         const basalt::core::OnDevice on0(0);
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
-        if (cudaMalloc(&sbuf, basalt::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        // the tensor pair (--tp 2): the card's own session is carved on the CARD geometry - the pair's KV
+        // is per-card (each card attends over its own kv-head slice; the design memo's "KV stays card0"
+        // line describes the expert-tier mode), so the QSA pools and GDN rows are half-wide and the
+        // driver's rank-0 Verifier indexes them with the card shapes its init is given.  Solo is
+        // untouched: context.fn_tp_card is null unless the pair load runs.
+        const basalt::core::ModelGeometry& sg = context.fn_tp_card != nullptr ? *context.fn_tp_card : g;
+        if (cudaMalloc(&sbuf, basalt::core::session_bytes(sg, o.max_context, K, 0, hi0)) != cudaSuccess) {
             basalt::log::error("basalt generate", "session state allocation failed");
             return 1;
         }
-        solo_kv_bytes = basalt::core::session_bytes(g, o.max_context, K, 0, hi0);
-        if (basalt::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        solo_kv_bytes = basalt::core::session_bytes(sg, o.max_context, K, 0, hi0);
+        if (basalt::core::session_init(sg, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
             basalt::log::error("basalt generate", "session_init failed");
             return 1;
         }
@@ -206,7 +212,7 @@ int sessions(Context& context) {
         ss.ple.hist = ss.ple_hist;
         // generate mode starts from an empty sequence, and nothing else zeroes this state before the prompt path or
         // the verifier reads it (--serve zeroes it per request when nothing is reused)
-        basalt::core::session_zero(ss, g, nullptr, main_cs);
+        basalt::core::session_zero(ss, sg, nullptr, main_cs);   // sized by the carve's own geometry
         if (cudaDeviceSynchronize() != cudaSuccess) {
             basalt::log::error("basalt generate", "zeroing the session state failed");
             return 1;
