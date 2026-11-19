@@ -292,6 +292,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    arena_bytes_ = count.used;   // the pair's budget line reads it back (tp_arena_bytes)
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
     int cs_least = 0, cs_greatest = 0;

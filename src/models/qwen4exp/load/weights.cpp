@@ -174,10 +174,11 @@ int weights(Context& context) {
                 return fatal_start_error(err);
             }
         }
-        context.fn_tp = &*fn_tp;  // the driver's bring-up borrows the pair; the gate below still refuses the start
-        // the pair's runtime twin (the driver that runs both halves and the mailbox between them) is not in this
-        // build yet: both cards' loads are real, reported, and then the start is refused rather than run half a
-        // model.  With BASALT_FN_TP_LOAD_ONLY set, that load IS the test's success.
+        context.fn_tp = &*fn_tp;  // the driver's bring-up borrows the pair
+        // the pair's runtime twin is built by the serve init from here on (32c-3): the load reports and the
+        // phases continue - the refusal to RUN moved to AFTER bring-up warms both cards' graphs (serve
+        // verifies it in serve/verify.cpp's capture_windows; a bare generate --tp 2 refuses in dispatch()).
+        // BASALT_FN_TP_LOAD_ONLY still exits 0 - at those late gates - so the load-and-bring-up test stands.
         uint64_t full_bytes = 0;
         basalt::core::WeightTable::pool_bytes(pack_files, full_bytes, err, skip.empty() ? nullptr : &skip);
         basalt::log::info("basalt generate", "tensor parallel load: CUDA0 arena %llu MiB (of %llu full), %zu native "
@@ -187,11 +188,6 @@ int weights(Context& context) {
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / 1048576.0,
                      peer_dev, (unsigned long long) (pool1 >> 20),
                      fn_tp->native.tensor_count(), (double) fn_tp->native.weight_bytes() / 1048576.0, fn_tp_slices->size());
-        cudaFree(arena);
-        if (std::getenv("BASALT_FN_TP_LOAD_ONLY") != nullptr) return 0;
-        basalt::log::error("basalt generate", "the tensor-parallel pair's runtime (the driver that runs both "
-                             "halves and the exchanges) is not wired yet - this build only proves the load");
-        return 1;
     }
 
     // The fused hyper-connection read needs the layout where R lags by one pending write; the per-stage measurement

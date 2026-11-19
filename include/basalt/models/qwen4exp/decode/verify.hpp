@@ -135,8 +135,17 @@ public:
         size_t epi[2] = {0, 0};   ///< the driver zeroes these per window; the capture's exchanges alternate
                                   ///< the two slots by them (a window that queued unequal counts on the two
                                   ///< cards wedges its rounds - the dense pair's lockstep check)
+        uint32_t* hand_flag = nullptr;   ///< rank 1's mapped hand-off word (its m_flag_[12], the layer-split
+                                         ///< hand's - execution.cpp:65 resets the chain's per window): rank 0's
+                                         ///< window graph raises it after publishing the pair's start rows,
+                                         ///< waking rank 1's waiting inputs()
     };
     void set_tp(FnTp* tp) { tp_ = tp; }
+    /// the mapped word a pair hand-off wakes on (this card's m_flag_[12]; the driver names it for the
+    /// peer's FnTp::hand_flag, and resets it per window like run() does for a chain stage)
+    uint32_t* tp_hand_flag() { return m_flag_ + 12; }
+    /// the device arena `init` carved for this card's windows, for the pair's budget line (32c-3 item 7)
+    uint64_t tp_arena_bytes() const { return arena_bytes_; }
     /// The CPU pool and the expert source the window's CPU tier runs on: between doorbells the parked workers predict
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
@@ -172,6 +181,7 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+
     /// Row `t` of the last window's head logits (n_vocab floats) to the host, every one exact. Valid after run().
     bool copy_logits(int t, float* host) const;
     /// Rows t0..t0+n of the last window's head: picks[t]'s log probability and the row's `top` likeliest tokens,
@@ -415,6 +425,7 @@ private:
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
     FnTp* tp_ = nullptr;   ///< the tensor pair's role (set_tp; null = the card runs the whole model)
+    uint64_t arena_bytes_ = 0;   ///< the device arena init carved (tp_arena_bytes; the pair's budget line)
     std::vector<PeerExperts*> xpeers_;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
     ExpertSource* warm_src_ = nullptr;

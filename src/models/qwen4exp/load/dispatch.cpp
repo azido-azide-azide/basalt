@@ -74,6 +74,16 @@ int dispatch(Context& context) {
     auto& split_stages_text = context.split_stages_text;
     auto& split_stages = *context.split_stages;
 
+    if (context.fn_tp != nullptr && !o.serve) {
+        // the pair's driver windows live in the serve runtime; a bare generate --tp 2 has none - refusal at
+        // the same late point serve's pair bring-up answers (after the whole load, before any window runs):
+        // the twin load and every phase up to here were the test.  LOAD_ONLY takes it as success (exit 0).
+        if (std::getenv("BASALT_FN_TP_LOAD_ONLY") != nullptr) return 0;
+        basalt::log::error("basalt generate", "the tensor pair's driver windows are not run-able yet - the MoE "
+                             "pair exchange lands in the next slice; this build only brings the pair up");
+        return 1;
+    }
+
     // Where the routed experts live, fastest tier first, and a warning when any of them is only in the file (decode
     // reads those from the SSD).  Called once the tiers are final.
     basalt::program::ExpertSpill tier_spill;   // the experts only the file holds, once the tiers are final

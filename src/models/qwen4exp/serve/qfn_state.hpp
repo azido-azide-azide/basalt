@@ -147,6 +147,13 @@ void seed_usage_from_prompt(std::vector<float>& usage, const std::vector<uint32_
 
 class QfnRequest;
 
+// the pair's window/commit driver (serve/tp_window.cpp) - declared here so the friend lines in the runtime
+// below name them; they reach the pair's window stack the way the request's own phases do.
+class QfnRuntime;
+bool run_tp_window(QfnRuntime& rt, int T, const int32_t* tokens, int64_t p, basalt::core::PoolMultiFn pool,
+                   void* user, std::vector<int32_t>& outv, std::string& err);
+bool run_tp_commit(QfnRuntime& rt, int n_keep, std::string& err, int parts);
+
 // Flash-Next's serving state over the shared one.
 class QfnRuntime final : public Runtime, private Context {
 public:
@@ -171,6 +178,9 @@ public:
 
 private:
     friend class QfnRequest;
+    friend bool run_tp_window(QfnRuntime&, int, const int32_t*, int64_t, basalt::core::PoolMultiFn, void*,
+                              std::vector<int32_t>&, std::string&);
+    friend bool run_tp_commit(QfnRuntime&, int, std::string&, int);
     using Context::o;
     using Context::fn_tp;
     using Context::model_file;
@@ -229,6 +239,23 @@ private:
     // owns them; bring-up fills {mb, rank, g_full} at init and the driver zeroes their `epi` per window
     // (the dense pair's law, src/dense/forward.cpp:794-828).  Null geometries until then keep them inert.
     basalt::core::Verifier::FnTp fn_tp_role[2]{};
+    // ---- rank 1's window stack (32c-3): owned by the runtime, brought up by init_pair_rank1 under
+    // OnDevice(fn_tp->dev).  Its session carves its own arena (`sbuf_tp`, `sbuf_tp_bytes` recorded) on the
+    // CARD geometry; its Verifier inits with `vh_tp` - an empty residency view, its expert tier's one
+    // arriving with the next slice's set_own_tier - `tp_hand` (mapped start rows rank 0's window graph
+    // publishes) and its own `tp_stream` (created like the sessions phase's main stream).  `pair_runnable`
+    // stays false until the MoE exchange lands (32c-4): the driver refuses on it, and the bring-up's refusal
+    // keeps any window from ever reaching it before then.
+    basalt::core::SessionState ss_tp{};
+    basalt::core::Verifier ver_tp{};
+    basalt::core::VerifyHits vh_tp{};
+    void* sbuf_tp = nullptr;
+    uint64_t sbuf_tp_bytes = 0;
+    cudaStream_t tp_stream = nullptr;
+    float* tp_hand_host = nullptr;   // the pair's start rows: host view and its mapped device name
+    float* tp_hand = nullptr;
+    bool pair_runnable = false;
+    bool init_pair_rank1();   // rank 1's session and Verifier (defined with the verify operations)
     // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
     // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
     basalt::core::Verifier ver_same{};
