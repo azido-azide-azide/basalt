@@ -101,7 +101,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
             rec(ra);
         }
         stamp(l, 6);
-        if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true)) return false;
+        if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true, (int) __LINE__)) return false;
         dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
         goto gdn_done;
     }
@@ -130,7 +130,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
             dec_gdn_rec(ra, n, cs);
         }
         stamp(l, 6);
-        if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true)) return false;
+        if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true, (int) __LINE__)) return false;
         dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
         goto gdn_done;
     }
@@ -155,14 +155,14 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
             PdlScope pn(pdl, true);   // the norm follows the join
             dec_gdn_rec_norm(ra, n, cs);
             stamp(l, 6);
-            if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true)) return false;
+            if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true, (int) __LINE__)) return false;
             dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
         } else {
             dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
             for (int i = 3; i <= 5; ++i) stamp(l, i);
             dec_gdn_rec(ra, n, cs);
             stamp(l, 6);
-            if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true)) return false;
+            if (v_.tp_ && !tp_assemble(ZV, ZVF, v_.y16_, true, (int) __LINE__)) return false;
             dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
         }
         goto gdn_done;
@@ -188,7 +188,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
     gdn_step_norm_multi(state, hb, (int) C, gate, beta, v_.z_, (const float*) wnm->data, EPS, v_.y_, (int) HK,
                         (int) HV, T, nullptr, cs, 0);
     stamp(l, 6);
-    if (v_.tp_) { if (!tp_assemble(ZV, ZVF, v_.y_, false)) return false; }   // fp32 y rows placed directly
+    if (v_.tp_) { if (!tp_assemble(ZV, ZVF, v_.y_, false, (int) __LINE__)) return false; }   // fp32 y rows placed directly
     else native_quantize_q8_1(v_.y_, v_.xq_, (int) ZV, n, cs);
     dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZVF, (int) N, n, cs);
     gdn_done:;

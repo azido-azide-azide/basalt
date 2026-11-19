@@ -49,7 +49,7 @@ struct Verifier::WindowRecorder {
     /// Activation-first mixer exchange: place the card's `half_dim`-wide head rows (`src`, bf16 or fp32, row
     /// stride half_dim) at the model's head slot of a full row, sum the pair's rows over the mailbox, widen
     /// and quantize the result (full_dim wide) into xq_ for the replicated projection.
-    bool tp_assemble(int64_t half_dim, int64_t full_dim, const void* src, bool src_bf16);
+    bool tp_assemble(int64_t half_dim, int64_t full_dim, const void* src, bool src_bf16, int site);
     const kernels::QsaShapes s = verify_detail::shapes_of(g);
     const kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +

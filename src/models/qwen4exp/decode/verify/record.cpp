@@ -37,7 +37,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 // The pair's card turns its own heads' activation rows into both cards' whole rows: its values land at their
 // model head slot (zeros elsewhere), the mailbox sums the two cards' placements (x + 0 = x: one rounding, equal
 // bits on both cards), and the widened row quantizes as every single-card window quantizes its projection input.
-bool Verifier::WindowRecorder::tp_assemble(int64_t half_dim, int64_t full_dim, const void* src, bool src_bf16) {
+bool Verifier::WindowRecorder::tp_assemble(int64_t half_dim, int64_t full_dim, const void* src, bool src_bf16,
+                                              int site) {
     using namespace basalt::kernels;
     FnTp* tp = v_.tp_;
     const int64_t off = (int64_t) tp->rank * half_dim;
@@ -47,7 +48,12 @@ bool Verifier::WindowRecorder::tp_assemble(int64_t half_dim, int64_t full_dim, c
         tp_place_bf16_f32(v_.mixb_, (const float*) src, half_dim, full_dim, off, T, cs);
     std::string e;
     if (!tp->mb->exchange_bf16(tp->rank, tp->epi[tp->rank]++ & 1, v_.mixb_, (size_t) T * full_dim * 2, cs, e)) {
-        err = "tp mixer exchange (l=" + std::to_string((long long) (v_.lb_ + tp->epi[tp->rank] % 1000)) + "): " + e;
+        err = "tp mixer exchange [call site line " + std::to_string(site) + "] half=" + std::to_string((long long) half_dim) +
+              " full=" + std::to_string((long long) full_dim) + " T=" + std::to_string(T) + " N=" +
+              std::to_string((long long) N) + " card=" + std::to_string(tp->rank) + " epi=" +
+              std::to_string((long long) tp->epi[tp->rank]) + " ZV=" + std::to_string((long long) g.ssm_value_dim) +
+              " ZVF=" + std::to_string((long long) gf.ssm_value_dim) + " NH=" + std::to_string((long long) NH) +
+              " HD=" + std::to_string((long long) HD) + " NKV=" + std::to_string((long long) NKV) + "]: " + e;
         return false;
     }
     tp_bf16_widen(v_.mixf_, v_.mixb_, (int64_t) T * full_dim, cs);

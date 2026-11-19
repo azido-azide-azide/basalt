@@ -197,6 +197,13 @@ public:
     bool tp_capture(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
         return run_begin(T, tokens, pos0, err, nullptr, false);
     }
+    /// one width's solo-shape capture, exposed for the pair's INTERLEAVED warm (serve/verify.cpp's
+    /// capture_windows: the two cards must queue the same width's exchanges against each other, or the
+    /// mailbox's enqueue-time agreement compares rounds that were never meant to meet)
+    bool warm_one(int T, std::string& err) {
+        refresh_ar();
+        return capture(T, err);
+    }
     bool tp_launch(std::string& err);   ///< the cudaGraphLaunch(tp_window.cpp:pair) that run_begin skipped
     int tp_serve_once(PoolMultiFn pool, void* user, std::string& err) { return serve_poll(pool, user, err); }
     bool tp_end(int32_t* out, std::string& err) { return run_end(out, err); }

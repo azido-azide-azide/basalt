@@ -351,15 +351,34 @@ int QfnRuntime::capture_windows() {
     // law, src/dense/forward.cpp:794-828: a captured-while-peer-runs exchange holds the spin through the
     // whole instantiate, so both cards' graphs must exist before either launches)
     if (o.serve && fn_tp != nullptr) {
-        const basalt::core::OnDevice on_tp(fn_tp->dev);
-        if (!ver_tp.warm_graphs(err)) {
-            basalt::log::error("basalt serve", "tensor pair: capturing CUDA%d's verify windows failed: %s",
-                               fn_tp->dev, err.c_str());
-            return 1;
+        // the pair warms INTERLEAVED, width by width: the mailbox's enqueue-time agreement (tp_mailbox.cu's
+        // n_agree: rank 1 writes the slot's size, rank 0's round compares) pairs rounds by slot, so the two
+        // cards' capture sequences must advance together - rank 1's step, then rank 0's, at every width -
+        // exactly how the dense pair's forward_window captures both before either launches.  Warming whole
+        // cards one after another compares rank 0's T=1 rounds against rank 1's T=2 leftovers (window 2i:
+        // "slot 1's round carries 12288 values on card 1 and 6144 on card 0").  Both cards' epi counters
+        // restart at every width, as the window driver does, so the two sequences are identical.
+        for (int T = 1; T <= std::max({o.spec, o.batch, 2}); ++T) {
+            for (auto& r : fn_tp_role) r.epi[0] = r.epi[1] = 0;
+            {
+                const basalt::core::OnDevice on_tp(fn_tp->dev);
+                if (!ver_tp.warm_one(T, err)) {
+                    basalt::log::error("basalt serve", "tensor pair: capturing CUDA%d's T=%d window failed: %s",
+                                       fn_tp->dev, T, err.c_str());
+                    return 1;
+                }
+            }
+            if (!ver.warm_one(T, err)) {
+                basalt::log::error("basalt serve", "tensor pair: capturing CUDA0's T=%d window failed: %s", T,
+                                   err.c_str());
+                return 1;
+            }
+            basalt::log::info("basalt serve", "tp warm T=%d: CUDA%d queued %zu exchanges, CUDA0 %zu", T, fn_tp->dev,
+                              fn_tp_role[1].epi[1], fn_tp_role[0].epi[0]);
         }
     }
     // every window width's graph is captured before READY, not by the first request that needs it
-    if (o.serve && stages.empty() && !ver.warm_graphs(err)) {
+    if (o.serve && fn_tp == nullptr && stages.empty() && !ver.warm_graphs(err)) {
         basalt::log::error("basalt serve", "capturing the verify windows failed: %s", err.c_str());
         return 1;
     }

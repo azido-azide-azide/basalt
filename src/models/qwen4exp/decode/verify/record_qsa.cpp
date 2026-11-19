@@ -297,7 +297,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     }
     stamp(l, 14);
     PdlScope ps(pdl);   // after the gate kernel
-    if (v_.tp_) { if (!tp_assemble(NH * HD, NHDF, v_.attn32_, false)) return false; }
+    if (v_.tp_) { if (!tp_assemble(NH * HD, NHDF, v_.attn32_, false, (int) __LINE__)) return false; }
     else if (!attn_q8) native_quantize_q8_1(v_.attn32_, v_.xq_, (int) (NH * HD), n, cs);
     dense_proj(16, wo->native_type, wo->native_data, v_.xq_, v_.bo_, (int) NHDF, (int) N, n, cs);
     return true;
