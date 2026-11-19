@@ -71,6 +71,26 @@ int main() {
                 (unsigned long long) (full_s >> 20), (unsigned long long) (card_s >> 20));
     ok(card_s < full_s && card_s > 0, "a card-geometry session is strictly cheaper (rank 1's carve fits the pair's card)");
 
+    // ---- the pair's device-local hyper-connection copies (32c-3b).  What is host-checkable here is the plan
+    // INVARIANT the twin's rebind pass stands on: every hc8 skip name is REPLICATED (tp_rank.cpp:72) and no rank's
+    // row slices ever name an hc matrix - so both tables keep the file table's one (rows, cols) per name and
+    // core::hc8_find resolves the twin's (r1->ne1, r1->ne0) exactly as rank 0's.  A sliced hc entry would make the
+    // twin's hc8_table_adopt return nullptr and the load refuse, so this pins the failure before a window pays it.
+    // The adoption itself is NOT host-testable and NOT exercised: hc8_table_adopt ends in hc8_upload, whose
+    // cudaMalloc needs a device - two distinct copy pointers for {rank0, rank1} cannot be produced (or keyed
+    // (device, pointer) in hc_fused.cu's registry) on a machine without running CUDA, which this slice forbids.
+    bool hc_replicated = true, hc_unsliced = true;
+    for (int64_t l = 0; l < g.n_layers; ++l)
+        for (const char* role : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight",
+                                 "hc_attn_inject.weight", "hc_ffn_inject.weight"})
+            for (const plan::FnRankPlan* p : {&p0, &p1})
+                hc_replicated = hc_replicated && p->placement(role, l) == plan::FnPlace::Replicated;
+    for (const plan::FnRankPlan* p : {&p0, &p1})
+        for (const auto& kv : plan::fn_row_slices(*p))
+            if (kv.first.find("hc_") != std::string::npos) hc_unsliced = false;   // keys are "blk.<l>.<role>"
+    ok(hc_replicated, "every hyper-connection matrix is Replicated (both cards hold it whole)");
+    ok(hc_unsliced, "no card's row slices name an hc matrix (the twin's hc8 entries keep the file table's shape)");
+
     std::printf("%s: tp pair sizing %s\n", failures ? "FAILURES" : "all ok", failures ? "FAILED" : "passed");
     return failures != 0;
 }
