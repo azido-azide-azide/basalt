@@ -78,12 +78,12 @@ bool Verifier::capture(int T, std::string& err) {
     else
         basalt::log::info("basalt verify", "captured the %d-token window (upload %s, sync %s)", T,
                      cudaGetErrorString(ue), cudaGetErrorString(us));
-    if (tp_ != nullptr)   // the pair's per-card capture line (32c-4): the recorder's MoE variant and the
-                          // card's mailbox-round count are only legal when both cards agree - the window
-                          // driver's totals line after each width is the pair's reading of this pair of lines
-        basalt::log::info("basalt verify", "tp capture: CUDA%d T=%d: %s variant, %zu MoE+mixer exchanges queued",
-                          device_, T, ar_on() ? "zero-doorbell" : "doorbell",
-                          (size_t) tp_->epi[tp_->rank]);
+    if (tp_ != nullptr)   // the pair's per-card capture line (32c-4): the window shapes are only legal when
+                          // both cards agree - layers recorded, mailbox rounds queued (mixer + MoE, the epi
+                          // counter) and the graph variant; the driver's totals line reads this pair of lines
+        basalt::log::info("basalt verify", "tp capture: CUDA%d T=%d: %d layers, %zu exchanges queued, %s variant",
+                          device_, T, (int) ((le_ < 0 ? g_->n_layers : le_) - lb_), (size_t) tp_->epi[tp_->rank],
+                          ar_on() ? "zero-doorbell" : "doorbell");
     return true;
 }
 
