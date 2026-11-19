@@ -76,8 +76,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     return true;
 }
 
-// The window's staging and launch, and the flags that need no host service.
-bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after) {
+// The window's staging and launch, and the flags that need no host service.  `launch=false` (the pair
+// driver, serve/tp_window.cpp) stages and captures and leaves the graph unlaunched: the law is
+// capture-both-then-launch (src/dense/forward.cpp:794-828), and tp_launch fires it back-to-back.
+bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after, bool launch) {
     using namespace basalt::kernels;
     const OnDevice on_device(device_);
     last_batch_ = false;
@@ -135,7 +137,8 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     set_head_keep(head_keep());
     if (!hs_launch(T, err)) return false;
-    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+    cudaError_t le = cudaSuccess;
+    if (launch) le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);   // (pair: tp_launch fires it)
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
@@ -192,6 +195,20 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     }
     fl_.ple_early = ple_early;
     }
+    return true;
+}
+
+// The pair driver's launch of a captured window: run_begin(T, ..., launch=false) staged and captured, and
+// this fires what it skipped.  The dense law (src/dense/forward.cpp:813-826): the peer card's graph goes
+// first - its exchanges may queue behind their spins while rank 0 is still working - then this card's,
+// back to back, with no host work and no event between them.
+bool Verifier::tp_launch(std::string& err) {
+    const OnDevice on_device(device_);
+    if (fl_.T == 0) { err = "verify: pair launch before its capture"; return false; }
+    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[fl_.T] : exec_[fl_.T], cs_);
+    decode_events().record(DecodeEvents::kVerifyPost, cs_);
+    (void) cudaStreamQuery(cs_);
+    if (le != cudaSuccess) { err = std::string("verify: pair launch: ") + cudaGetErrorString(le); return false; }
     return true;
 }
 

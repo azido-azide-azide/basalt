@@ -182,6 +182,25 @@ public:
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
 
+    // ================================ TENSOR PAIR WINDOW (serve/tp_window.cpp) ================================
+    // The pair's host loop must own BOTH cards' graphs before either launches (the dense pair's law,
+    // src/dense/forward.cpp:794-828), so run()'s three phases open up: tp_capture runs run_begin's staging
+    // and capture (capture/capture_commit run inside it, execution.cpp:91) and skips the graph launch;
+    // tp_launch fires what it skipped; tp_serve_once is one non-blocking ring poll; tp_end is run_end.
+    // Pair mode's windows are greedy, single-session and spec-off, so none of the post-launch sampling
+    // run_begin queues behind the graph is live here.
+    bool tp_capture(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+        return run_begin(T, tokens, pos0, err, nullptr, false);
+    }
+    bool tp_launch(std::string& err);   ///< the cudaGraphLaunch(tp_window.cpp:pair) that run_begin skipped
+    int tp_serve_once(PoolMultiFn pool, void* user, std::string& err) { return serve_poll(pool, user, err); }
+    bool tp_end(int32_t* out, std::string& err) { return run_end(out, err); }
+    /// clear this card's hand-off wake word before a pair window (run() does it for chain stages at
+    /// execution.cpp:65; the pair's rank is not a chain, so its driver calls this instead)
+    void tp_reset_hand() {
+        if (h_flag_ != nullptr) *(volatile uint32_t*) (h_flag_ + 12) = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
     /// Row `t` of the last window's head logits (n_vocab floats) to the host, every one exact. Valid after run().
     bool copy_logits(int t, float* host) const;
     /// Rows t0..t0+n of the last window's head: picks[t]'s log probability and the row's `top` likeliest tokens,
@@ -279,7 +298,10 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.  `parts`: 1 launches
     /// the commit graph, 2 advances `ss.ple_prev` (3: both, in that order).
-    bool commit(int n_keep, std::string& err, int parts = 3);
+    bool commit(int n_keep, std::string& err, int parts = 3, bool launch = true);
+    /// the pair's commit pair (serve/tp_window.cpp): launch the graph a `launch=false` commit staged, then wait it.
+    bool tp_launch_commit(std::string& err);
+    bool tp_wait_commit(std::string& err);
     /// the residency tables uploaded now (between windows) rather than at the next run()
     bool dm_presync(std::string& err) { return dm_ == nullptr || dm_sync(err); }
     /// Work queued on `s` after this call starts only once the window stream has run everything queued on it so far (the
@@ -451,7 +473,8 @@ private:
     std::string peer_released();           ///< after a release: whether the peer window ended (see dm_note)
     bool capture(int T, std::string& err);
     // run(), in three parts: the launch, the host's serving of the rings, the finish
-    bool run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after = nullptr);
+    bool run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after = nullptr,
+                   bool launch = true);   // launch=false: the pair driver launches the graph itself (tp_launch)
     bool run_serve(PoolMultiFn pool, void* user, std::string& err);
     bool run_end(int32_t* out, std::string& err);
     /// A Q8_0 head in bit planes runs two-stage in the window (q80p_vhead) with the exact list this long: the top_k of

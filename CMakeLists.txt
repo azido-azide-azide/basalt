@@ -183,6 +183,7 @@ add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwe
   src/models/qwen4exp/serve/tier_profile.cpp
   src/models/qwen4exp/serve/tiers.cpp
   src/models/qwen4exp/serve/verify.cpp
+  src/models/qwen4exp/serve/tp_window.cpp
   src/models/qwen4exp/serve/vision.cpp
   src/models/qwen4exp/measure/gpu_modes.cpp
   src/models/qwen4exp/measure/dump_set.cpp

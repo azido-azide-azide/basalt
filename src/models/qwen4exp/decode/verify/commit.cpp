@@ -156,7 +156,7 @@ bool Verifier::capture_commit(std::string& err) {
 
 void Verifier::set_commit_async(bool on) { g_commit_async = on; }
 
-bool Verifier::commit(int n_keep, std::string& err, int parts) {
+bool Verifier::commit(int n_keep, std::string& err, int parts, bool launch) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -171,7 +171,8 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         cudaEventRecord(ev_commit_go_, cs_);
         cudaStreamWaitEvent(cm_, ev_commit_go_, 0);
         decode_events().record(DecodeEvents::kCommitPre, cm_);
-        const cudaError_t le = cudaGraphLaunch(commit_exec_, cm_);
+        cudaError_t le = cudaSuccess;
+        if (launch) le = cudaGraphLaunch(commit_exec_, cm_);   // pair: tp_launch_commit fires it
         decode_events().record(DecodeEvents::kCommitPost, cm_);
         if (gs_split_ && gs_live_) {   // the peer's heads, on its stream behind its window
             const OnDevice on(gs_dev_);
@@ -183,7 +184,11 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         // h_pend_), and the drafter (its own stream) reads only this window's final rows and its own K/V.  h_commit_ is
         // next written after the next window's results are read, i.e. after this graph has run.  Everything else waits
         // on commit_done_ (wait_commit).
-        if (!g_commit_async || next_ != nullptr) {
+        //  (launch == false, the pair driver: the staged epoch waits on the stream until tp_launch_commit;
+        //  the async-commit bookkeeping is skipped with it - the pair's commit is waited by tp_wait_commit.)
+        if (!launch) {
+            // staged and waited by the pair driver (tp_launch_commit / tp_wait_commit)
+        } else if (!g_commit_async || next_ != nullptr) {
             const cudaError_t se = cudaStreamSynchronize(cm_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
@@ -201,7 +206,27 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    return next_ == nullptr || next_->commit(n_keep, err, parts);
+    return next_ == nullptr || next_->commit(n_keep, err, parts, launch);
+}
+
+// The pair's commit pair (serve/tp_window.cpp): run_tp_commit stages both cards with launch=false, fires
+// rank 0's commit graph, then rank 1's under OnDevice(pair dev) - the window's order, peer queued last so
+// its (short) commit trickles behind the pair's next capture, never between staging and launch - and waits
+// both streams.  No async-commit bookkeeping: pair windows are synchronous until the pair serves (32c-5).
+bool Verifier::tp_launch_commit(std::string& err) {
+    const OnDevice on_device(device_);
+    if (commit_exec_ == nullptr) { err = "verify: pair commit before its graph exists"; return false; }
+    const cudaError_t le = cudaGraphLaunch(commit_exec_, cm_);
+    if (le != cudaSuccess) { err = std::string("verify: pair commit launch: ") + cudaGetErrorString(le); return false; }
+    return true;
+}
+
+bool Verifier::tp_wait_commit(std::string& err) {
+    const OnDevice on_device(device_);
+    const cudaError_t se = cudaStreamSynchronize(cm_);
+    if (se != cudaSuccess) { err = std::string("verify: pair commit: ") + cudaGetErrorString(se); return false; }
+    if (commit_pending_ && cudaEventQuery(commit_done_) == cudaSuccess) commit_pending_ = false;
+    return true;
 }
 
 bool Verifier::wait_commit(std::string& err) {

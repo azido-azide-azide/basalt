@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/qfn_decode.cpp - Flash-Next's side of the window loop: verify windows, drafts, adaptive rounds.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
+#include "tp_window.hpp"
 #include "../../../program/serve/decode_loop.hpp"
 
 namespace basalt::models::qwen4exp::serve {
@@ -285,6 +286,11 @@ inline bool QfnRequest::run_window(int T, int e0, int& TB) {
         const bool ran_ok = held.on ? true
             : try_pair ? cv->run_pair(*ov, T, window.data(), p, guess, win_b.data(), TB, runtime_.win_pool_fn, user_c, user_o,
                                       outv.data(), runtime_.err)
+             // the tensor pair (qwen4exp --tp 2): both cards' windows, one host (serve/tp_window.cpp).  The
+             // pair's bring-up refuses the start before READY, so no request reaches this branch in this
+             // slice; run_tp_window's own pair_runnable check is the second guard under 32c-4's flip.
+                       : runtime_.fn_tp != nullptr ? run_tp_window(runtime_, T, window.data(), p,
+                                                                   runtime_.win_pool_fn, user_c, outv, runtime_.err)
                        : cv->run(T, window.data(), p, runtime_.win_pool_fn, user_c, outv.data(), runtime_.err);
     return ran_ok;
 }

@@ -66,7 +66,11 @@ public:
     bool after_accept(int T, int& a, int e0, bool from_sfx, bool held_run, bool paired, bool& hold);
     void note_draft_probs(bool from_sfx);
     void stamp_before_commit() { basalt::core::decode_events().stamp(9); }
-    bool commit(int keep, std::string& e, int phase) { return cv->commit(keep, e, phase); }
+    bool commit(int keep, std::string& e, int phase) {
+        // the tensor pair commits BOTH cards (serve/tp_window.cpp); like the window branch this is
+        // unreachable before 32c-4 (the bring-up refuses the start) and guarded twice.
+        return runtime_.fn_tp != nullptr ? run_tp_commit(runtime_, keep, e, phase) : cv->commit(keep, e, phase);
+    }
     void on_token(int32_t tok) { if (runtime_.o.suffix_draft > 0) runtime_.sfx->append(tok); }
     void count_round() { ++runtime_.rounds; }
     template <class After>
