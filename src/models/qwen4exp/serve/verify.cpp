@@ -152,6 +152,10 @@ int QfnRuntime::init_verify() {
         for (const auto& xpe : xpeers)
             if (xpe->valid()) ver.add_peer(xpe.get());
     if (fn_tp != nullptr) {
+        // pair-dbg (32c-3 bring-up segfault hunt): the handle was alive at hand-off; log it here, here, and
+        // in dispatch so the window log says WHICH hop lost it. Remove when the segfault is fixed.
+        basalt::log::error("basalt serve", "pair-dbg: at pair-block entry fn_tp=%p (&0x6F?%d) this=%p", (void*) fn_tp,
+                           (int) ((uintptr_t) fn_tp == 0x6F), (void*) this);
         // the pair does not run the persistent peer window: card 1 hosts rank 1's graph instead (the dense
         // pair's law, src/dense/forward.cpp:794-828).  The tier FILL is untouched - peer_experts placement
         // still ran at load - only the WINDOW-driving set_peer/add_peer above is skipped for rank 0.

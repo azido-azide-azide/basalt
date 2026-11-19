@@ -132,6 +132,12 @@ int dispatch(Context& context) {
     };
     if (!o.serve) report_expert_tiers();
     if (o.serve) {
+        // the generate phase's context under its OWN name: inside the aggregate below, the name `context`
+        // already refers to the serve::Context being declared (the point of declaration of a variable
+        // includes its own initializer), so a bare `context.field` there reads the new object's UNINITIALIZED
+        // member - which is how the pair's fn_tp arrived at init_verify as stack garbage (0x6F) and segfaulted
+        // its first dereference (window 2e, 2026-11-19).  All other designators name dispatch's own locals.
+        auto& gcontext = context;
         basalt::models::qwen4exp::serve::Context context{
             .o = o,
             .ppl_base = ppl_base,
@@ -153,7 +159,7 @@ int dispatch(Context& context) {
             .profile_loaded = profile_loaded,
             .pf_borrow = pf_borrow,
             .wt = wt,
-            .fn_tp = context.fn_tp,
+            .fn_tp = gcontext.fn_tp,   // NOT context.fn_tp: that names this very object (shadowed) - see above
             .d_mrope = d_mrope,
             .mrope_host = mrope_host,
             .cvec_summary = cvec_summary,

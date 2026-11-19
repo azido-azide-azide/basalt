@@ -175,6 +175,8 @@ int weights(Context& context) {
             }
         }
         context.fn_tp = &*fn_tp;  // the driver's bring-up borrows the pair
+        basalt::log::error("basalt generate", "pair-dbg: weights sets context.fn_tp=%p (card0=%p g_full=%p)",
+                           (void*) context.fn_tp, (void*) fn_tp->card0, (void*) fn_tp->g_full);   // pair-dbg
         // the pair's runtime twin is built by the serve init from here on (32c-3): the load reports and the
         // phases continue - the refusal to RUN moved to AFTER bring-up warms both cards' graphs (serve
         // verifies it in serve/verify.cpp's capture_windows; a bare generate --tp 2 refuses in dispatch()).
