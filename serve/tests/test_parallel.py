@@ -32,6 +32,7 @@ fail = "--fail-window" in args        # the first window over two slots fails
 ready = int(args[args.index("--ready") + 1]) if "--ready" in args else 4096
 MULTI = int(args[args.index("--multi") + 1]) if "--multi" in args else 3
 nopp = "--nopp" in args               # no PP lines while a prompt is read: a read beside the windows reports none
+nomatch = "--nomatch" in args         # no slot's held conversation covers the next prompt (a re-rendered prefix)
 STEP = 0.02
 s0 = "--slot0solo" in args           # slot 0 is the solo session: GEN copies the best slot's conversation over slot 0
 CH = 4096 if s0 else 32
@@ -99,6 +100,8 @@ def reply(ids):            # the rest of the reply after what the prompt already
 active = {}          # slot -> [tokens left, max_new, produced, the prompt's ids, every token it will answer]
 held_slot = {}       # slot -> the ids its idle conversation holds
 def match(b, ids):   # what a slot's idle conversation covers of a prompt: its whole stream when that starts the prompt
+    if nomatch:
+        return 0
     h = held_slot.get(b, [])
     return len(h) if h and len(h) < len(ids) and ids[:len(h)] == h else 0
 lp_top = {}          # slot (None: solo) -> the request's logprobs=K
@@ -306,14 +309,15 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [True] * 3
         self.assertIsNone(self.pick(e, [7, 8]))
         e.slot_busy = [False] * 3
-        self.assertEqual(self.pick(e, [1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
+        self.assertEqual(self.pick(e, [1, 2, 3]), 1)                 # with no match at all it falls back to an empty slot
+        self.assertEqual(e.pick_slot([3, 0, 0], 3), 0)               # a prompt that repeats a held one in full keeps it
 
 
 class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, windows=False):
+              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, windows=False, nomatch=False):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -332,6 +336,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--soloany"] if solo_any else []
         extra += ["--pms"] if pms else []
         extra += ["--windows"] if windows else []
+        extra += ["--nomatch"] if nomatch else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -924,6 +929,14 @@ class ParallelService(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())
 
+    def chat_messages(self, messages, headers=None, max_tokens=64):
+        """A chat completion with a full history, as a client resends it on every turn."""
+        body = {"model": "basalt", "messages": messages, "max_tokens": max_tokens, "reasoning_effort": "none"}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+
     def together(self, jobs):
         """Run every job at the same instant: a request alone on an idle engine runs solo without choosing a slot, so
         a slot is only picked (and a session only claimed) when requests overlap."""
@@ -975,6 +988,26 @@ class ParallelService(unittest.TestCase):
         for h in ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity",
                   "x-grok-conv-id", "x-grok-session-id"):
             self.assertIn("s-" + h, self.engine.session_slot, h)
+
+    def test_a_resend_that_matches_no_slot_keeps_its_slot(self):
+        """A re-rendered history with no held-prefix match must not move a single conversation between slots."""
+        self.start(3, slot0_solo=True, solo_any=True, nomatch=True)
+        first = [{"role": "user", "content": "the same first question"},
+                 {"role": "assistant", "content": "ok, done."},
+                 {"role": "user", "content": "second turn"}]
+        self.chat_messages(first)
+        keys = list(self.engine.session_slot)
+        self.assertEqual(len(keys), 1, keys)                 # the history names a session without a header
+        self.assertTrue(keys[0].startswith("chat:"), keys)
+        slot = self.engine.session_slot[keys[0]]
+        second = first + [{"role": "assistant", "content": "ok, done."},
+                          {"role": "user", "content": "third turn"}]
+        self.chat_messages(second)
+        self.assertEqual(self.engine.session_slot, {keys[0]: slot})
+        lines = self.log.read_text().splitlines()
+        slots = [int(l.split()[1]) for l in lines if l.startswith("SGEN ")]
+        self.assertEqual(len(slots), 2, lines)               # both turns took the solo run in a slot
+        self.assertEqual(set(slots), {slot}, lines)          # neither moved, with PMATCH = 0 on both
 
     def test_overlapping_requests_of_one_session_spread_over_slots(self):
         """A session's slot is busy with its first request: the second takes the normal pick and owns the slot after."""
