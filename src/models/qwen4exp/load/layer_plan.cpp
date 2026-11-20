@@ -221,9 +221,9 @@ int layer_plan(Context& context) {
             err = "qwen4exp: --tp does not run --vision yet";
             return fatal_start_error(err);
         }
-        // native shards stay WHOLE for now - their loader reads the pack's source region and cross-checks the
-        // table's (sliced) shapes, so a card's native upload must learn the plan's row runs before the pair
-        // runtime lets them run.  Nothing reaches that load while weights() refuses to run a TP card below.
+        // native shards are slice-aware since tp-07: the loader reads each row run's GGUF span and stacks them
+        // into the card's matrix, cross-checking the table's (sliced) shapes. The pair runtime's refusal moved
+        // to serve init (capture_windows); the load itself places both cards.
         if (const std::string tperr = basalt::plan::fn_tp_check(g, o.tp); !tperr.empty()) {
             err = tperr;
             return fatal_start_error(err);

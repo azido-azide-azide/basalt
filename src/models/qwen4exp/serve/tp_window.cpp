@@ -35,9 +35,15 @@ bool run_tp_window(QfnRuntime& rt, int T, const int32_t* tokens, int64_t p, basa
         if (!rt.ver_tp.tp_capture(T, tokens, p, err)) return false;
     }
     if (!rt.ver.tp_capture(T, tokens, p, err)) return false;
-    if (rt.fn_tp_role[0].epi[0] != rt.fn_tp_role[1].epi[1])
+    if (rt.fn_tp_role[0].epi[0] != rt.fn_tp_role[1].epi[1]) {
+        // refuse, not log: a dropped exchange on one card re-pairs the slots' epochs with the wrong rounds
+        // (the mailbox counts enqueued rounds only) - silent wrong residuals, no hang. The dense pair's
+        // log-only check carries the same hazard; the window must not launch on unequal counts.
         basalt::log::error("fn tp", "window T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
                            (long long) p, (int) rt.fn_tp_role[1].epi[1], (int) rt.fn_tp_role[0].epi[0]);
+        err = "fn tp: the cards queued unequal exchange counts (not lockstep)";
+        return false;
+    }
     // both cards' graphs exist and both hosts finished queueing: launch back to back, the pair's first
     // (its graph's exchanges wait for rank 0's flags, so it may queue behind them freely - forward_window:813-822)
     {
@@ -75,6 +81,12 @@ bool run_tp_window(QfnRuntime& rt, int T, const int32_t* tokens, int64_t p, basa
     if (!rt.ver_tp.tp_end(out1.data(), err)) return false;
     outv.resize((size_t) T);
     if (!rt.ver.tp_end(outv.data(), err)) return false;
+    // the mailbox's contract: hang_reported is read after the round's stream work - a mid-window timeout
+    // leaves the residual uncombined, and the picks would be silently wrong
+    if (mb.hang_reported()) {
+        err = "fn tp: an exchange diverged during the window; the pair's results have split";
+        return false;
+    }
     return true;
 }
 
