@@ -63,6 +63,9 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    size_t g_nodes = 0;   // the pair's capture line counts the graph (32c-4): rank 1's head skip (133d19b7,
+    if (tp_ != nullptr && graph != nullptr)   // record.cpp's tp_skip_head gate) must show as rank 1's graph
+        (void) cudaGraphGetNodes(graph, nullptr, &g_nodes);   // running SMALLER than rank 0's by the head's nodes
     const cudaError_t ie = cudaGraphInstantiateWithFlags(&exec_t, graph, cudaGraphInstantiateFlagUseNodePriority);
     cudaGraphDestroy(graph);
     if (ie != cudaSuccess) {
@@ -80,10 +83,11 @@ bool Verifier::capture(int T, std::string& err) {
                      cudaGetErrorString(ue), cudaGetErrorString(us));
     if (tp_ != nullptr)   // the pair's per-card capture line (32c-4): the window shapes are only legal when
                           // both cards agree - layers recorded, mailbox rounds queued (mixer + MoE, the epi
-                          // counter) and the graph variant; the driver's totals line reads this pair of lines
-        basalt::log::info("basalt verify", "tp capture: CUDA%d T=%d: %d layers, %zu exchanges queued, %s variant",
+                          // counter), the graph variant and the node count (rank 1 without its head)
+        basalt::log::info("basalt verify", "tp capture: CUDA%d T=%d: %d layers, %zu exchanges queued, %zu graph "
+                             "nodes, %s variant",
                           device_, T, (int) ((le_ < 0 ? g_->n_layers : le_) - lb_), (size_t) tp_->epi[tp_->rank],
-                          ar_on() ? "zero-doorbell" : "doorbell");
+                          g_nodes, ar_on() ? "zero-doorbell" : "doorbell");
     return true;
 }
 
