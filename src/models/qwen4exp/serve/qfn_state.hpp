@@ -241,11 +241,12 @@ private:
     basalt::core::Verifier::FnTp fn_tp_role[2]{};
     // ---- rank 1's window stack (32c-3): owned by the runtime, brought up by init_pair_rank1 under
     // OnDevice(fn_tp->dev).  Its session carves its own arena (`sbuf_tp`, `sbuf_tp_bytes` recorded) on the
-    // CARD geometry; its Verifier inits with `vh_tp` - an empty residency view, its expert tier's one
-    // arriving with the next slice's set_own_tier - `tp_hand` (mapped start rows rank 0's window graph
+    // CARD geometry; its Verifier inits with `vh_tp` - the REAL tier view since 32c-4 (its cache_base/
+    // slot_off name card 1's PeerExperts slots, its residency reaching dm through set_own_tier) -
+    // `tp_hand` (mapped start rows rank 0's window graph
     // publishes) and its own `tp_stream` (created like the sessions phase's main stream).  `pair_runnable`
-    // stays false until the MoE exchange lands (32c-4): the driver refuses on it, and the bring-up's refusal
-    // keeps any window from ever reaching it before then.
+    // came up with the MoE partial-sum exchange (32c-4): capture_windows flips it after both cards' graphs
+    // warmed with equal epi totals, and the driver (run_tp_window) refuses every window without it.
     basalt::core::SessionState ss_tp{};
     basalt::core::Verifier ver_tp{};
     basalt::core::VerifyHits vh_tp{};

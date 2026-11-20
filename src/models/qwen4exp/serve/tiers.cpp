@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/tiers.cpp - tiers operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
+#include "../load/fn_tp_pair.hpp"   // the pair handle for dm_presync_pair's twin upload (qfn_state.hpp only forward-declares)
 
 namespace basalt::models::qwen4exp::serve {
 
