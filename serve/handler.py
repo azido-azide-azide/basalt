@@ -1,6 +1,7 @@
 """The HTTP server and its request handler: routes, authentication, CORS and streaming."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import select
@@ -83,13 +84,29 @@ def make_handler(target: Service | Router):
                            "x-grok-conv-id", "x-grok-session-id")
 
         def _session_id(self, req) -> str | None:
-            """The conversation this request belongs to, or None when it names no session (admission is prompt-only)."""
+            """The conversation this request belongs to, or None when it names no session.
+
+            A multi-turn chat also identifies itself by its first user message: clients that resend the whole
+            history keep one slot even when a turn's re-rendered prompt matches none of the held K/V.
+            """
             for h in self.SESSION_HEADERS:
                 v = (self.headers.get(h) or "").strip()
                 if v:
                     return v
             v = req.get("session_id") if isinstance(req, dict) else None
-            return v if isinstance(v, str) and v else None
+            if isinstance(v, str) and v:
+                return v
+            messages = req.get("messages") if isinstance(req, dict) else None
+            if isinstance(messages, list) and len(messages) > 1:
+                for m in messages:
+                    if not isinstance(m, dict) or m.get("role") != "user":
+                        continue
+                    content = m.get("content")
+                    text = content if isinstance(content, str) else json.dumps(content, sort_keys=True, ensure_ascii=False)
+                    if isinstance(text, str) and text:
+                        return "chat:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+                    break
+            return None
 
         def log_message(self, fmt, *args):
             pass

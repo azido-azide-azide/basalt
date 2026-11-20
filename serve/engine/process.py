@@ -1547,7 +1547,8 @@ class ProcessEngine:
             return own
 
         def held_prefix(b):
-            return meet[b] if 0 < meet[b] < size else 0
+            # a prompt that repeats a held conversation in full is the strongest match, not no match
+            return meet[b] if 0 < meet[b] <= size else 0
         pool = [b for b in free if b not in self.slot_owner] or free   # slot_owner is keyed by slot
         best = max(pool, key=held_prefix)
         return best if held_prefix(best) > 0 else min(pool, key=lambda b: (self.slot_held[b] > 0, self.slot_used[b]))
