@@ -42,7 +42,9 @@ int QfnRuntime::init_verify() {
         // chain would give the cards different work, so those modes stay refused until the pair is proven.
         const char* off = o.batch > 1 ? "--batch > 1" : o.spec >= 2 ? "--spec >= 2" : pipe_want ? "--pipeline"
                           : !split_devs.empty() ? "--layer-split / a second stage"
-                          : multi_gpu ? "--gpu with a peer device (the pair IS the second card)" : nullptr;
+                          : multi_gpu ? "--gpu with a peer device (the pair IS the second card)"
+                          : o.vision ? "--vision (the encoder and its prompt path are rank-0 phases the pair has not wired)"
+                          : o.suffix_draft > 0 ? "--suffix-draft (its lookup windows are not paired yet)" : nullptr;
         if (off != nullptr) {
             basalt::log::error("basalt serve", "tensor pair: pair mode is solo, spec-off, single-session - %s is not paired yet", off);
             return 1;
