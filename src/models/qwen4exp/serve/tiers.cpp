@@ -108,7 +108,11 @@ bool QfnRuntime::dm_presync_pair(std::string& perr) {
     bool ok = ver.dm_presync(perr);
     if (fn_tp != nullptr) {
         const basalt::core::OnDevice on_tp(fn_tp->dev);
-        ok = ver_tp.dm_presync(perr) && ok;
+        std::string e1;   // the twin's error joins the main card's instead of overwriting it: the adapt thread
+        if (!ver_tp.dm_presync(e1)) {   // warns once per round, and a lost first error hides which card failed
+            ok = false;
+            perr = perr.empty() ? e1 : perr + "; " + e1;
+        }
     }
     return ok;
 }
