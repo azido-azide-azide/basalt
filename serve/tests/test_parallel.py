@@ -41,6 +41,7 @@ ready = int(args[args.index("--ready") + 1]) if "--ready" in args else 4096
 MULTI = int(args[args.index("--multi") + 1]) if "--multi" in args else 3
 nopp = "--nopp" in args               # no PP lines while a prompt is read: a read beside the windows reports none
 bwait = int(args[args.index("--bwait") + 1]) if "--bwait" in args else 0   # admissions beside a running slot answered BWAIT
+fullcover = "--fullcover" in args       # a slot holding a prompt whole reports it covered (an identical resend)
 STEP = 0.02
 s0 = "--slot0solo" in args           # slot 0 is the solo session: GEN copies the best slot's conversation over slot 0
 CH = 4096 if s0 else 32
@@ -110,6 +111,8 @@ held_slot = {}       # slot -> the ids its idle conversation holds
 def match(b, ids):   # what a slot's idle conversation continues of a prompt: its whole stream when that starts the
     # prompt, else 0 - a shared head alone is another conversation, as the engine reports it
     h = held_slot.get(b, [])
+    if fullcover and len(h) >= len(ids) and h[:len(ids)] == ids:
+        return len(ids)     # the prompt is what the slot holds, to its last token: the engine says so
     return len(h) if h and len(h) < len(ids) and ids[:len(h)] == h else 0
 lp_top = {}          # slot (None: solo) -> the request's logprobs=K
 def lp_fields(t, k):
@@ -321,14 +324,15 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [True] * 3
         self.assertIsNone(self.pick(e, [7, 8]))
         e.slot_busy = [False] * 3
-        self.assertEqual(self.pick(e, [1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
+        self.assertEqual(self.pick(e, [1, 2, 3]), 1)                 # with no match at all it falls back to an empty slot
+        self.assertEqual(e.pick_slot([3, 0, 0], 3), 0)               # a prompt that repeats a held one in full keeps it
 
 
 class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
 
     def start(self, slots, fit=None, slot_cache=False, fail=False, ready=None, multi=None, drafts=False, counts=False,
-              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, windows=False, bwait=0):
+              nopp=False, reuse=False, slot0_solo=False, solo_any=False, pms=False, windows=False, fullcover=False, bwait=0):
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_engine.py"
         script.write_text(FAKE_BATCH, encoding="utf-8")
@@ -348,6 +352,7 @@ class ParallelService(unittest.TestCase):
         extra += ["--pms"] if pms else []
         extra += ["--windows"] if windows else []
         extra += ["--bwait", str(bwait)] if bwait else []
+        extra += ["--fullcover"] if fullcover else []
         with mock.patch.object(subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = ProcessEngine("basalt", extra)
@@ -974,6 +979,14 @@ class ParallelService(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())
 
+    def chat_messages(self, messages, headers=None, max_tokens=64):
+        """A chat completion with a full history, as a client resends it on every turn."""
+        body = {"model": "basalt", "messages": messages, "max_tokens": max_tokens, "reasoning_effort": "none"}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+
     def together(self, jobs):
         """Run every job at the same instant: a request alone on an idle engine runs solo without choosing a slot, so
         a slot is only picked (and a session only claimed) when requests overlap."""
@@ -1029,6 +1042,26 @@ class ParallelService(unittest.TestCase):
         for h in ("x-llm-flow-id", "x-claude-code-session-id", "x-session-id", "x-session-affinity",
                   "x-grok-conv-id", "x-grok-session-id"):
             self.assertIn("s-" + h, owners, h)
+
+    def test_a_resend_that_repeats_a_held_prompt_keeps_its_slot(self):
+        """A request the engine still holds whole - the client sent the same turn twice - keeps the slot holding it:
+        the prompt matches no slot's conversation as a START (the slot holds more than the prompt asks), and giving it
+        another slot would re-read from scratch and give the session a second slot for one conversation."""
+        self.start(3, slot0_solo=True, solo_any=True, fullcover=True)
+        msgs = [{"role": "user", "content": "the same question " * 6},
+                {"role": "assistant", "content": "ok, done."},
+                {"role": "user", "content": "and again"}]
+        self.chat_messages(msgs)
+        keys = {o for o in self.engine.slot_owner.values() if o.startswith("chat:")}
+        self.assertEqual(len(keys), 1, keys)                 # the history names a session without a header
+        key = next(iter(keys))
+        slot = next(iter(self.slots_of(key)))
+        self.chat_messages(msgs)                             # the identical resend
+        self.assertEqual(self.slots_of(key), {slot})
+        lines = self.log.read_text().splitlines()
+        slots = [int(l.split()[1]) for l in lines if l.startswith("SGEN ")]
+        self.assertEqual(len(slots), 2, lines)               # both turns ran solo in a slot
+        self.assertEqual(set(slots), {slot}, lines)          # and the second stayed where the K/V sits
 
     def test_overlapping_requests_of_one_session_spread_over_slots(self):
         """A session's slot is busy with its first request: the second takes a free slot of its own, without giving
