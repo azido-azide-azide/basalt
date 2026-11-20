@@ -174,8 +174,31 @@ inline int QfnRequest::before_window(int T, int64_t) {
 }
 
 inline void QfnRequest::spawn_adapt(bool early) {
-        
-            if (runtime_.adapt_fast) {   // a round, or the next step of the one in flight, beside the draft
+        if (runtime_.fn_tp != nullptr) {   // the pair's rounds land at the window boundary, on THIS thread:
+            // both cards' dm tables must snapshot ONE residency state - run_tp_window's two run_begins sync
+            // rank 1 then rank 0, and an adapt thread mutating host_res/the tier between those syncs tears
+            // the kDmSkip partition (an expert computed by both cards or by neither).  Solo tolerates
+            // mid-round staleness (an under-claim falls to the CPU pool); the pair's two views must agree.
+            // The round's cost rides the loop every adapt_every rounds - async adapt under a snapshot lock
+            // is the pair's perf item, not its correctness path.
+            if (runtime_.adapt_fast) {
+                if (!do_adapt && runtime_.xq_stage == 0) return;
+                if (do_adapt) adapt_age = 0;
+                adapt_ok = runtime_.xq_stage != 0 ? runtime_.xq_advance(false) : runtime_.xq_round(nullptr);
+                std::string perr;
+                if (adapt_ok && !runtime_.dm_presync_pair(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+            } else {
+                if (!do_adapt) return;
+                adapt_age = 0;
+                adapt_ok = runtime_.adapt();
+                if (adapt_ok) {
+                    std::string perr;
+                    if (!runtime_.dm_presync_pair(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                }
+            }
+            return;
+        }
+        if (runtime_.adapt_fast) {   // a round, or the next step of the one in flight, beside the draft
                 if (!do_adapt && runtime_.xq_stage == 0) return;
                 if (do_adapt) adapt_age = 0;
                 basalt::core::decode_events().tag(1u << 0);
