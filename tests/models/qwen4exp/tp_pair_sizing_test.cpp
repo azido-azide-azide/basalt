@@ -74,7 +74,8 @@ int main() {
         if (core::is_qsa_layer(g, l)) ++n_qsa;   // the mixer split the totals line names: GDN + QSA = layers
     const int64_t exch_moe = g.n_layers;         // one partial-sum exchange after each layer's combine
     const int64_t exch_all = exch + exch_moe;
-    ok(n_qsa + (g.n_layers - n_qsa) == g.n_layers && exch_all == 2 * g.n_layers && exch_all % 2 == 0,
+    ok(g.qsa_interval == 4 && n_qsa == g.n_layers / g.qsa_interval && n_qsa == 12 &&
+       exch_all == 2 * g.n_layers && exch_all % 2 == 0,
        "per-window exchanges = (" + std::to_string(g.n_layers - n_qsa) + " GDN + " + std::to_string(n_qsa) +
        " QSA) mixers + " + std::to_string(exch_moe) + " MoE = " + std::to_string(exch_all) +
        ", even (both cards' totals and parities agree at every width)");
