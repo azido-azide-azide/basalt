@@ -221,7 +221,10 @@ bool QfnRuntime::gpu_sync_ok() {
 bool QfnRuntime::checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts, bool defer, ConvCheckpoint::Source source) {
     ckpt_why.clear();
     ckd_finish();
-    if (o.prompt_cache <= 0 || L < 1) return true;
+    // the pair's checkpoint transfer is not wired (window 3 try5: "checkpoint transfer snapshot: invalid
+    // argument" - the snapshot's device transfer assumes the solo stream layout); saves only feed features
+    // pair mode already refuses (conversation-cache restore, relax re-reads, batch yield), so skip them.
+    if (fn_tp != nullptr || o.prompt_cache <= 0 || L < 1) return true;
     if (touch_check(L, source)) return true;
     ConvCheckpoint c;
     c.source = source;
