@@ -10,6 +10,7 @@
 #include "basalt/models/qwen4exp/decode/session.hpp"            // session_bytes (pure arithmetic, safe to price)
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"    // basalt::kernels::kVerifyMaxT
 #include "basalt/models/qwen4exp/plan/tp_rank.hpp"              // the card plans
+#include "basalt/models/qwen4exp/decode/layout.hpp"             // is_qsa_layer (the mixer split, pure)
 #include "basalt/core/tp_mailbox.hpp"                           // kVecBytes/kVecsPerLane (the unit rounding)
 
 #include <cstdio>
@@ -54,11 +55,29 @@ int main() {
     ok(hand > 0, "the pair hand buffer prices to " + std::to_string(hand) + " B (mapped, one block, both windows)");
 
     // one mixer exchange per layer (the pair's assembly before each replicated output projection):
-    // every window queues n_layers exchanges, an EVEN count -> the 2-slot alternation returns to slot 0 at
+    // every window queues n_layers exchanges, an EVEN count -> the 2-slot alternation comes back to slot 0 at
     // the next window on both cards, which is what the driver's per-window epi reset (forward_window law)
     // assumes.  The plan's card halves never change this count (the mixers are one per layer per card).
     const int64_t exch = g.n_layers;
     ok(exch % 2 == 0, "per-window mixer exchanges are even (slot parity re-aligns at every window start)");
+
+    // ---- 32c-4 adds ONE MORE exchange per layer per card: the FP32 MoE PARTIAL SUM after each card's
+    // combine (record_moe.cpp's dm branch, exchange_f32 over the T*N bo_ rows through the same alternating
+    // slots).  Two things must hold host-side: the f32 payload at the widest window is a WHOLE number of
+    // mailbox payload units (the exchange's n_agree compares per-card value counts at enqueue - a rounded
+    // site would have to round identically on both cards, and there is no reason for 2560*4 to come out
+    // whole if the unit ever changed); and the per-window TOTAL, mixers + MoE, stays EVEN, so the slot
+    // alternation still lands back on slot 0 at every window start on both cards.  48 mixers + 48 MoE = 96.
+    ok(f32_moe % (int64_t) unit == 0, "the f32 MoE payload is a whole number of mailbox payload units");
+    int64_t n_qsa = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l)
+        if (core::is_qsa_layer(g, l)) ++n_qsa;   // the mixer split the totals line names: GDN + QSA = layers
+    const int64_t exch_moe = g.n_layers;         // one partial-sum exchange after each layer's combine
+    const int64_t exch_all = exch + exch_moe;
+    ok(n_qsa + (g.n_layers - n_qsa) == g.n_layers && exch_all == 2 * g.n_layers && exch_all % 2 == 0,
+       "per-window exchanges = (" + std::to_string(g.n_layers - n_qsa) + " GDN + " + std::to_string(n_qsa) +
+       " QSA) mixers + " + std::to_string(exch_moe) + " MoE = " + std::to_string(exch_all) +
+       ", even (both cards' totals and parities agree at every width)");
     ok(p0.card.n_head * 2 == g.n_head && p1.card.ssm_value_dim * 2 == g.ssm_value_dim,
        "card halves are exact (the roles the pair was loaded and checked against)");
 
