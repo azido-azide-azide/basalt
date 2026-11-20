@@ -334,6 +334,8 @@ public:
                                       cudaMemcpyDeviceToHost, st_.stream);
         cudaMemcpyAsync(h_picks_, st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream);
         if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        if (m_.tp && m_.tp->mb.hang_reported())   // the round's work is done: a timeout now means the picks are wrong
+            return fail(m_.o.arch + ": dense tp: an exchange diverged during the window; the pair's results have split");
         if (r.row_tokens) std::copy(h_picks_, h_picks_ + T, r.row_tokens);
         if (r.next_token) *r.next_token = h_picks_[T - 1];
         return {};
@@ -393,6 +395,8 @@ public:
             cudaMemcpyAsync(se.h_picks_, se.st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
         }
         if (cudaStreamSynchronize(s) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        if (m_.tp && m_.tp->mb.hang_reported())   // the batch's work is done: a timeout now means the picks are wrong
+            return fail(m_.o.arch + ": dense tp: an exchange diverged during the batch; the pair's results have split");
         for (int i = 0; i < n; ++i) {
             Session& se = *ss[(size_t) i];
             const model::DecodeRequest& r = reqs[i];
@@ -424,6 +428,8 @@ public:
             std::string err;
             if (!forward_chunk(m_, st_, r.tokens + at, nullptr, n, p, pos3.data(), err)) return fail(err);
             if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+            if (m_.tp && m_.tp->mb.hang_reported())   // the chunk's rounds are done: a timeout now means the cells are wrong
+                return fail(m_.o.arch + ": dense tp: an exchange diverged during the chunk; the pair's results have split");
             at += n;
             if (r.progress) r.progress(at);
             if (at < r.n_tokens && r.stop && r.stop()) break;
@@ -479,6 +485,8 @@ public:
             std::string err;
             if (!forward_chunk(m_, st_, nullptr, rows + (size_t) at * g_.n_embd, n, pos + at, pos3.data(), err)) return fail(err);
             if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+            if (m_.tp && m_.tp->mb.hang_reported())   // the chunk's rounds are done: a timeout now means the cells are wrong
+                return fail(m_.o.arch + ": dense tp: an exchange diverged during the chunk; the pair's results have split");
             at += n;
         }
         if (grid) st_.rope_delta += std::max(nx, ny) - n_rows;

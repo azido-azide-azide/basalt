@@ -16,9 +16,12 @@ std::string check(const Geometry& g, int tp) {
     if (g.n_kv % tp) return "key-value heads must divide the cards";
     if (half(g.n_head) % half(g.n_kv)) return "the per-card head grouping would not be whole";
     if (half(g.n_head) / half(g.n_kv) > 8) return "the per-card head grouping exceeds 8";
+    if (g.gdn_k_heads <= 0 || g.gdn_v_heads <= 0) return "GDN head counts must be positive";   // half(0) below would divide by zero
     if (g.gdn_k_heads % tp) return "GDN key heads must divide the cards";
     if (g.gdn_v_heads % tp) return "GDN value heads must divide the cards";
     if (half(g.gdn_v_heads) % half(g.gdn_k_heads)) return "the per-card GDN value grouping would not be whole";
+    if (half(g.gdn_v_heads) != 48 && half(g.gdn_v_heads) != 24)
+        return "the per-card GDN value heads must be 24 or 48 (the gating projection's widths, dense_ops.cu's gdn_gating_proj)";
     if (g.n_ff % tp || half(g.n_ff) % 256) return "the FFN's per-card units must be whole 256-value blocks";
     if ((int64_t) half(g.n_kv) * g.head_dim % 128) return "the per-card k/v rows must be whole NVFP4 row tiles";
     return {};

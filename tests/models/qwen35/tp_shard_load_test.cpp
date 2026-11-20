@@ -1,10 +1,10 @@
 // tests/models/qwen35/tp_shard_load_test.cpp - the tensor-parallel load of the real 27B pack: the adapter slices
 // every layer tensor per card (rank 0 and rank 1 together hold each payload exactly once - the fragments of both
-// cards, scattered back to their source offsets, rebuild the pack byte for byte), rank 0 alone holds the head and
-// embedding, the load builds and pairs both card models, and each card's freed memory matches what the tensor
-// table says its slices must take.  A load that asks for the drafter on a pair refuses, as does --tp together
-// with --diag-split-at.  Needs a 27B pack (argument or BASALT_QWEN35_PACK) and two GPUs (the load puts a card's
-// slices on each); exits 77 without them.
+// cards, scattered back to their source offsets, rebuild the pack byte for byte), rank 0 alone holds the head,
+// embedding and the block drafter (#28, f9ac9a56: the pair runs it on rank 0; rank 1's card takes no drafter
+// bytes), the load builds and pairs both card models, and each card's freed memory matches what the tensor
+// table says its slices must take.  --tp together with --diag-split-at refuses.  Needs a 27B pack (argument or
+// BASALT_QWEN35_PACK) and two GPUs (the load puts a card's slices on each); exits 77 without them.
 #include "basalt/core/model_file.hpp"
 #include "basalt/dense/tp.hpp"
 #include "basalt/model/adapter.hpp"
@@ -107,9 +107,9 @@ int64_t axis_len(const std::vector<core::GdnRun>& runs) {
     return n;
 }
 
-bool on_card_like(const std::string& name, dense::Drafter drafter, int rank) {
+bool on_card_like(const std::string& name, int rank) {
     if (name.starts_with("blk.")) return true;
-    return rank == 0 && (name.starts_with("output") || (drafter == dense::Drafter::Block && name.starts_with("dflash.")));
+    return rank == 0 && name.starts_with("output");   // the drafter's bytes ride on top, unpriced (the load rounds them)
 }
 
 // one card's free device memory
@@ -121,8 +121,9 @@ long long card_free(int dev) {
     return (long long) free_b;
 }
 
-// run one load: the no-drafter load must build and pair both card models, taking (within the scratch on top) what
-// the tensor table says; the drafter on a pair refuses; and both cards' fragment coverage of every layer tensor
+// run one load: both card models build and pair, taking (within the scratch on top) what the tensor table says;
+// with the block drafter the load still succeeds (#28, f9ac9a56) and rank 1's bytes stay the layer slices' - the
+// drafter is rank 0's alone; and both cards' fragment coverage of every layer tensor
 void try_load(const model::ModelAdapter& a, const std::string& pack, bool draft) {
     model::LoadRequest req;
     req.paths = {pack};
@@ -133,20 +134,13 @@ void try_load(const model::ModelAdapter& a, const std::string& pack, bool draft)
     req.spec = draft ? 16 : 0;
     std::unique_ptr<model::LoadedModel> loaded;
     const std::string tag = draft ? " with the block drafter" : "";
-    if (draft) {
-        const model::Result rd = a.load(req, loaded);
-        check(!rd.ok() && rd.message.find("drafter") != std::string::npos,
-              "a --tp 2 load with the drafter refuses" + tag + ": " + rd.message);
-        return;
-    }
-
-    // expected bytes from the tensor table, and the two cards' fragments per tensor
+    // expected bytes from the tensor table, and the two cards' fragments per tensor (the layer slices do not
+    // depend on the drafter; rank 0's head is priced, its drafter rides on top)
     std::string err;
     const GgufFile gg(pack);
     const dense::Geometry g = geometry_of(gg, err);
     if (!err.empty()) die("geometry", err);
     const dense::tp::RankPlan p0 = dense::tp::rank_plan(g, 2, 0, err), p1 = dense::tp::rank_plan(g, 2, 1, err);
-    const auto drafter = draft ? dense::Drafter::Block : dense::Drafter::None;
     uint64_t want0 = 0, want1 = 0;
     int fd = platform::open_fd_utf8(pack);
     if (fd < 0) die("open", pack);
@@ -160,8 +154,8 @@ void try_load(const model::ModelAdapter& a, const std::string& pack, bool draft)
             c = plan_tensor(t.type, rows, cols, t.name, g, p0);
             d = plan_tensor(t.type, rows, cols, t.name, g, p1);
         }
-        if (on_card_like(t.name, drafter, 0)) want0 += c.sliced ? dense::tp::shard_bytes(c.frags) : tensor_payload_bytes(t);
-        if (on_card_like(t.name, drafter, 1)) want1 += d.sliced ? dense::tp::shard_bytes(d.frags) : tensor_payload_bytes(t);
+        if (on_card_like(t.name, 0)) want0 += c.sliced ? dense::tp::shard_bytes(c.frags) : tensor_payload_bytes(t);
+        if (on_card_like(t.name, 1)) want1 += d.sliced ? dense::tp::shard_bytes(d.frags) : tensor_payload_bytes(t);
         if (!c.sliced || !d.sliced) continue;
         ++sliced_tensors;
         // read the full payload; the two cards' fragments must cover every source byte exactly once
@@ -194,13 +188,19 @@ void try_load(const model::ModelAdapter& a, const std::string& pack, bool draft)
     if (!r.ok()) return;
     const long long used0 = free0 - card_free(0), used1 = free1 - card_free(1);
     const long long slop = 3LL << 30;
-    check(used0 >= (long long) want0 && used0 <= (long long) want0 + slop,
-          "rank 0's card holds " + std::to_string(used0 >> 20) + " MiB, the table's slices say " + std::to_string(want0 >> 20) +
-          " or a little more");
     check(used1 >= (long long) want1 && used1 <= (long long) want1 + slop,
           "rank 1's card holds " + std::to_string(used1 >> 20) + " MiB, the table's slices say " + std::to_string(want1 >> 20) +
-          " or a little more");
-    check(want1 * 2 > want0 && want1 * 2 < want0 * 5, "rank 1 holds about half of rank 0 minus the head");
+          " or a little more" + (draft ? " (no drafter bytes: the drafter is rank 0's alone)" : ""));
+    if (draft) {
+        // the drafter's bytes ride on top of rank 0's slices (the load rounds its Q8_0 projections, so the
+        // table's bytes are not the loaded bytes - a lower bound only)
+        check(used0 > (long long) want0, "rank 0 holds the block drafter on top of its slices");
+    } else {
+        check(used0 >= (long long) want0 && used0 <= (long long) want0 + slop,
+              "rank 0's card holds " + std::to_string(used0 >> 20) + " MiB, the table's slices say " + std::to_string(want0 >> 20) +
+              " or a little more");
+        check(want1 * 2 > want0 && want1 * 2 < want0 * 5, "rank 1 holds about half of rank 0 minus the head");
+    }
     loaded.reset();   // the pair's memory goes back before the next case
     (void) axis_len;
 }

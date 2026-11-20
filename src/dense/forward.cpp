@@ -161,8 +161,10 @@ void prod_add(Model& m, const Linear& l, const void* yq, uint16_t* x, int T, cud
             if (l.scale) kernels::scale_values(part, l.scale, (int64_t) T * l.rows, s);
         }
         std::string e;
-        if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, x, (size_t) T * l.rows, s, e))
+        if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, x, (size_t) T * l.rows, s, e)) {
             basalt::log::error("dense tp", "%s", e.c_str());
+            m.tp->mb.poison();   // the rounds no longer pair: the driver refuses the launch, the sync refuses the picks
+        }
         return;
     }
     if (on_wg(l.type)) {
@@ -357,8 +359,10 @@ uint16_t* bf(float* p) { return reinterpret_cast<uint16_t*>(p); }
 void tp_chunk_add(Model& m, float* part, int64_t n, int T, cudaStream_t s) {
     (void) T;
     std::string e;
-    if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, residual(m.cs), (size_t) n, s, e))
+    if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, residual(m.cs), (size_t) n, s, e)) {
         basalt::log::error("dense tp", "%s", e.c_str());
+        m.tp->mb.poison();   // the chunk's rounds no longer pair: the caller's sync refuses the read
+    }
 }
 
 // x += W . a for a chunk's output projection on other matrix types (FP32 a): NVFP4 planes add into the BF16 residual in
@@ -806,11 +810,23 @@ bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, in
             if (!launch_window(*m.tp->peer, *st.peer, tokens, T, pos, pos3, err, false)) return false;
         }
         if (!launch_window(m, st, tokens, T, pos, pos3, err, false)) return false;
-        if (m.tp->epi[0] != m.tp->epi[1])
-            basalt::log::error("dense tp", "window T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
-                               (long long) pos, (int) m.tp->epi[1], (int) m.tp->epi[0]);
+        if (m.tp->epi[0] != m.tp->epi[1]) {
+            err = "dense tp: window T=" + std::to_string(T) + " pos=" + std::to_string((long long) pos) + ": cards queued " +
+                  std::to_string((int) m.tp->epi[1]) + " and " + std::to_string((int) m.tp->epi[0]) + " exchanges (not lockstep)";
+            m.tp->mb.poison();
+            return false;
+        }
+        if (m.tp->epi[0] & 1) {   // the two slots alternate across the window's reset: an odd count reuses a slot back to back
+            err = "dense tp: window T=" + std::to_string(T) + ": a body must queue an even number of exchanges";
+            m.tp->mb.poison();
+            return false;
+        }
+        if (m.tp->mb.hang_reported()) {   // an exchange failed while the graphs were captured: launching would wedge the pair
+            err = "dense tp: an exchange diverged while the window's graphs were captured";
+            return false;
+        }
         {
-            // both cards' graphs exist and both hosts finished queueing: release the gate and queue back to back
+            // both cards' graphs exist and both hosts finished queueing: queue back to back
             const core::OnDevice on(m.tp->peer_dev);
             if (cudaGraphLaunch(*window_graph(*m.tp->peer, *st.peer, T), st.peer->stream) != cudaSuccess)
                 return cuda_ok("dense tp peer window graph", err) && false;
@@ -1022,9 +1038,21 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
             if (!launch_batch(*m.tp->peer, ps.data(), S, tokens, pos3, err, false)) return false;
         }
         if (!launch_batch(m, segs, S, tokens, pos3, err, false)) return false;
-        if (m.tp->epi[0] != m.tp->epi[1])
-            basalt::log::error("dense tp", "batch S=%d: cards queued %d and %d exchanges (not lockstep)", S,
-                               (int) m.tp->epi[1], (int) m.tp->epi[0]);
+        if (m.tp->epi[0] != m.tp->epi[1]) {
+            err = "dense tp: batch S=" + std::to_string(S) + ": cards queued " + std::to_string((int) m.tp->epi[1]) + " and " +
+                  std::to_string((int) m.tp->epi[0]) + " exchanges (not lockstep)";
+            m.tp->mb.poison();
+            return false;
+        }
+        if (m.tp->epi[0] & 1) {   // the two slots alternate across the batch's reset: an odd count reuses a slot back to back
+            err = "dense tp: batch S=" + std::to_string(S) + ": a body must queue an even number of exchanges";
+            m.tp->mb.poison();
+            return false;
+        }
+        if (m.tp->mb.hang_reported()) {   // an exchange failed while the graphs were captured: launching would wedge the pair
+            err = "dense tp: an exchange diverged while the batch's graphs were captured";
+            return false;
+        }
         {
             const core::OnDevice on(m.tp->peer_dev);
             if (cudaGraphLaunch(*batch_graph(*m.tp->peer, ps.data(), S), ps[0].st->stream) != cudaSuccess)
@@ -1186,17 +1214,40 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
         // enqueue thread cannot block on a full stream while its peer's matching exchange still waits to be queued
         // (a stream's pending-launch capacity is finite; a whole eager chunk's body exceeds it)
         const bool block = m.o.drafter == Drafter::Block;
+        // the last layer's rows are read alike on both cards or on neither: rank 0's drafter decides (its state
+        // alone carries mtp_kc or the taps), and the peer's body must queue the same exchanges - a read on one
+        // card only leaves its o-projection and FFN-down rounds unpaired (the peer takes the cells-only exit)
+        const bool read_last =
+            st.mtp_kc != nullptr ||
+            (block && std::find(m.w.dflash.target_layers.begin(), m.w.dflash.target_layers.end(), m.g.n_layers - 1) !=
+                          m.w.dflash.target_layers.end());
         for (int il = 0; il < m.g.n_layers; ++il) {
             {
                 const core::OnDevice on(m.tp->peer_dev);
-                chunk_layers(*m.tp->peer, *st.peer, T, pos, il, il + 1, nullptr, false, m.g.n_layers);
+                chunk_layers(*m.tp->peer, *st.peer, T, pos, il, il + 1, nullptr, read_last, m.g.n_layers);
             }
-            chunk_layers(m, st, T, pos, il, il + 1, block ? &m.w.dflash : nullptr, false, m.g.n_layers);
+            chunk_layers(m, st, T, pos, il, il + 1, block ? &m.w.dflash : nullptr, read_last, m.g.n_layers);
         }
-        if (m.tp->epi[0] != m.tp->epi[1])
-            basalt::log::error("dense tp", "chunk T=%d pos=%lld: cards queued %d and %d exchanges (not lockstep)", T,
-                               (long long) pos, (int) m.tp->epi[1], (int) m.tp->epi[0]);
+        if (m.tp->epi[0] != m.tp->epi[1]) {
+            err = "dense tp: chunk T=" + std::to_string(T) + " pos=" + std::to_string((long long) pos) + ": cards queued " +
+                  std::to_string((int) m.tp->epi[1]) + " and " + std::to_string((int) m.tp->epi[0]) + " exchanges (not lockstep)";
+            m.tp->mb.poison();
+            return false;
+        }
+        if (m.tp->epi[0] & 1) {   // the two slots alternate across the chunk's reset: an odd count reuses a slot back to back
+            err = "dense tp: chunk T=" + std::to_string(T) + ": a body must queue an even number of exchanges";
+            m.tp->mb.poison();
+            return false;
+        }
+        if (m.tp->mb.hang_reported()) {   // an exchange failed to enqueue: the rounds already queued no longer pair
+            err = "dense tp: an exchange diverged while the chunk was enqueued";
+            return false;
+        }
         if (!cuda_ok("dense tp chunk", err)) return false;
+        // the block drafter's context: the chunk's rows become its ring cells on rank 0 (its projections post no
+        // exchanges, and the residual the taps read is the pair's combined one). The MTP drafter's history stays
+        // unwired on a pair: its products would post exchanges only rank 0 queues (the load refuses it).
+        if (block && !chunk_finish(m, st, T, pos, err)) return false;
         return true;
     }
     if (!m.ensure_chunk(err)) return false;

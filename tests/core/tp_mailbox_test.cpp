@@ -1,7 +1,9 @@
 // tests/core/tp_mailbox_test.cpp - the two-card mailbox exchange gives the same bits on both cards for every
-// payload shape (BF16 sum, fused residual add, FP32 sum), survives CUDA-graph capture and replay, finishes a
-// lost-peer exchange by reporting the hang word, and carries each payload size through a loose time bound.
-// Needs two GPUs; exits 77 without them.
+// payload shape (BF16 sum, fused residual add, FP32 sum), survives CUDA-graph capture and replay, refuses a
+// round whose cards disagree on its geometry, finishes a lost-peer exchange by reporting the hang word, and
+// carries each payload size through a loose time bound.  Every round enqueues rank 1 first - the protocol's
+// order (tp_mailbox.cu's n_agree: rank 1 writes the slot's geometry, rank 0's compares), and the graphs are
+// captured and launched rank 1 first as the pair's drivers do.  Needs two GPUs; exits 77 without them.
 #include "basalt/core/tp_mailbox.hpp"
 
 #include <cuda_bf16.h>
@@ -89,12 +91,12 @@ int main() {
         bool ok = true;
         for (int round = 0; round < 4 && ok; ++round) {
             slot = (slot + 1) % 16;
-            cudaSetDevice(0);
-            if (!mb.exchange_bf16(0, slot, p0, nbf * 2, s0, err)) { ok = false; break; }
             cudaSetDevice(1);
             if (!mb.exchange_bf16(1, slot, p1, nbf * 2, s1, err)) { ok = false; break; }
-            cudaStreamSynchronize(s0);
+            cudaSetDevice(0);
+            if (!mb.exchange_bf16(0, slot, p0, nbf * 2, s0, err)) { ok = false; break; }
             cudaStreamSynchronize(s1);
+            cudaStreamSynchronize(s0);
             for (size_t i = 0; i < nbf; ++i) {
                 const uint16_t s = rn_bf16(to_f(a[i]) + to_f(b[i]));
                 a[i] = b[i] = s;
@@ -141,12 +143,12 @@ int main() {
         bool ok = true;
         for (int round = 0; round < 3; ++round) {
             slot = (slot + 1) % 16;
-            cudaSetDevice(0);
-            ok = ok && mb.exchange_add_bf16(0, slot, d0, b0, nval, s0, err);
             cudaSetDevice(1);
             ok = ok && mb.exchange_add_bf16(1, slot, d1, b1, nval, s1, err);
-            cudaStreamSynchronize(s0);
+            cudaSetDevice(0);
+            ok = ok && mb.exchange_add_bf16(0, slot, d0, b0, nval, s0, err);
             cudaStreamSynchronize(s1);
+            cudaStreamSynchronize(s0);
             for (size_t i = 0; i < nval; ++i)
                 want[i] = base[i] = rn_bf16(to_f(base[i]) + to_f(rn_bf16(m0[i])) + to_f(rn_bf16(m1[i])));
         }
@@ -192,12 +194,12 @@ int main() {
         cudaMemcpy(d1, f1.data(), nval * 4, cudaMemcpyHostToDevice);
         slot = (slot + 1) % 16;
         bool ok = true;
-        cudaSetDevice(0);
-        ok = ok && mb.exchange_f32(0, slot, d0, o0, nval, s0, err);
         cudaSetDevice(1);
         ok = ok && mb.exchange_f32(1, slot, d1, o1, nval, s1, err);
-        cudaStreamSynchronize(s0);
+        cudaSetDevice(0);
+        ok = ok && mb.exchange_f32(0, slot, d0, o0, nval, s0, err);
         cudaStreamSynchronize(s1);
+        cudaStreamSynchronize(s0);
         std::vector<float> r(nval);
         cudaSetDevice(0);
         cudaMemcpy(r.data(), d0, nval * 4, cudaMemcpyDeviceToHost);
@@ -216,7 +218,8 @@ int main() {
         cudaFree(o1);
     }
 
-    // CUDA graph capture: four chained exchanges of alternating slots captured on each card, replayed twice.
+    // CUDA graph capture: four chained exchanges of alternating slots, captured rank 1 first (the drivers'
+    // order: the deep card's graph exists before the other's enqueue), replayed twice, launched rank 1 first.
     {
         const size_t nbf = 640 * 8;
         std::vector<uint16_t> h0(nbf), h1(nbf);
@@ -235,27 +238,27 @@ int main() {
         cudaGraphExec_t g0 = nullptr, g1 = nullptr;
         bool ok = true;
         cudaGraph_t gr;
-        cudaSetDevice(0);
-        ok = ok && cudaStreamBeginCapture(s0, cudaStreamCaptureModeRelaxed) == cudaSuccess;
-        for (int k = 0; k < 4; ++k)
-            ok = ok && mb.exchange_bf16(0, size_t(k), p0, nbf * 2, s0, err);
-        ok = ok && cudaStreamEndCapture(s0, &gr) == cudaSuccess && cudaGraphInstantiate(&g0, gr, 0) == cudaSuccess;
-        cudaGraphDestroy(gr);
         cudaSetDevice(1);
         ok = ok && cudaStreamBeginCapture(s1, cudaStreamCaptureModeRelaxed) == cudaSuccess;
         for (int k = 0; k < 4; ++k)
             ok = ok && mb.exchange_bf16(1, size_t(k), p1, nbf * 2, s1, err);
         ok = ok && cudaStreamEndCapture(s1, &gr) == cudaSuccess && cudaGraphInstantiate(&g1, gr, 0) == cudaSuccess;
         cudaGraphDestroy(gr);
+        cudaSetDevice(0);
+        ok = ok && cudaStreamBeginCapture(s0, cudaStreamCaptureModeRelaxed) == cudaSuccess;
+        for (int k = 0; k < 4; ++k)
+            ok = ok && mb.exchange_bf16(0, size_t(k), p0, nbf * 2, s0, err);
+        ok = ok && cudaStreamEndCapture(s0, &gr) == cudaSuccess && cudaGraphInstantiate(&g0, gr, 0) == cudaSuccess;
+        cudaGraphDestroy(gr);
         for (int replay = 0; replay < 2 && ok; ++replay) {
-            cudaSetDevice(0);
-            ok = ok && cudaGraphLaunch(g0, s0) == cudaSuccess;
             cudaSetDevice(1);
             ok = ok && cudaGraphLaunch(g1, s1) == cudaSuccess;
             cudaSetDevice(0);
-            cudaStreamSynchronize(s0);
+            ok = ok && cudaGraphLaunch(g0, s0) == cudaSuccess;
             cudaSetDevice(1);
             cudaStreamSynchronize(s1);
+            cudaSetDevice(0);
+            cudaStreamSynchronize(s0);
             for (int k = 0; k < 4; ++k)
                 for (size_t i = 0; i < nbf; ++i) a[i] = b[i] = rn_bf16(to_f(a[i]) + to_f(b[i]));
         }
@@ -289,13 +292,13 @@ int main() {
             std::vector<double> times;
             for (int k = 0; k < 24; ++k) {
                 slot = (slot + 1) % 16;
-                cudaSetDevice(0);
-                mb.exchange_bf16(0, slot, p0, bytes, s0, err);
-                auto t0 = std::chrono::steady_clock::now();
                 cudaSetDevice(1);
                 mb.exchange_bf16(1, slot, p1, bytes, s1, err);
-                cudaStreamSynchronize(s1);
+                auto t0 = std::chrono::steady_clock::now();
+                cudaSetDevice(0);
+                mb.exchange_bf16(0, slot, p0, bytes, s0, err);
                 cudaStreamSynchronize(s0);
+                cudaStreamSynchronize(s1);
                 times.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
             }
             const double med = median(times);
@@ -309,22 +312,61 @@ int main() {
         }
     }
 
-    // lost peer: one card's exchange alone must give up and set the hang word.
+    // geometry disagreement: rank 1 says one payload size, rank 0 another - rank 0's call must refuse before
+    // it enqueues (n_agree), and the unpaired rank-1 kernel reports the hang once its spin budget runs out.
+    // Its own mailbox: the hang word is sticky, and the sections above must keep turning.
     {
-        const size_t nbf = 64 * 8;
-        uint16_t* p0;
-        cudaSetDevice(0);
-        cudaMalloc(&p0, nbf * 2);
-        cudaMemset(p0, 0, nbf * 2);
-        slot = (slot + 1) % 16;
-        const auto t0 = std::chrono::steady_clock::now();
-        mb.exchange_bf16(0, slot, p0, nbf * 2, s0, err);
-        cudaStreamSynchronize(s0);
-        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        check(mb.hang_reported(), "a peerless exchange reports the hang");
-        check(secs < 30.0, "the peerless exchange gave up promptly");
-        std::printf("note: peerless exchange gave up after %.2f s\n", secs);
-        cudaFree(p0);
+        TpMailbox bad;
+        if (!bad.open(0, 1, 2, kBytes, err)) {
+            check(false, "the disagreement mailbox opens: " + err);
+        } else {
+            const size_t na = 64 * 8, nb = 640 * 8;
+            uint16_t *pa, *pb;
+            cudaSetDevice(1);
+            cudaMalloc(&pa, na * 2);
+            cudaMemset(pa, 0, na * 2);
+            cudaSetDevice(0);
+            cudaMalloc(&pb, nb * 2);
+            cudaMemset(pb, 0, nb * 2);
+            cudaSetDevice(1);
+            const bool ok1 = bad.exchange_bf16(1, 0, pa, na * 2, s1, err);
+            cudaSetDevice(0);
+            const bool ok0 = bad.exchange_bf16(0, 0, pb, nb * 2, s0, err);
+            check(ok1 && !ok0 && err.find("disagree") != std::string::npos,
+                  "a round whose cards disagree on the payload is refused: " + err);
+            cudaStreamSynchronize(s1);   // the unpaired rank-1 kernel spins out its budget (~2 s)
+            cudaStreamSynchronize(s0);
+            check(bad.hang_reported(), "the unpaired round reports the hang");
+            cudaSetDevice(1);
+            cudaFree(pa);
+            cudaSetDevice(0);
+            cudaFree(pb);
+            bad.close();
+        }
+    }
+
+    // lost peer: one card's exchange alone must give up and set the hang word (a fresh mailbox: the word is
+    // sticky, and a slot the pair already used would carry its geometry).
+    {
+        TpMailbox lost;
+        if (!lost.open(0, 1, 1, kBytes, err)) {
+            check(false, "the lost-peer mailbox opens: " + err);
+        } else {
+            const size_t nbf = 64 * 8;
+            uint16_t* p0;
+            cudaSetDevice(0);
+            cudaMalloc(&p0, nbf * 2);
+            cudaMemset(p0, 0, nbf * 2);
+            const auto t0 = std::chrono::steady_clock::now();
+            lost.exchange_bf16(0, 0, p0, nbf * 2, s0, err);
+            cudaStreamSynchronize(s0);
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            check(lost.hang_reported(), "a peerless exchange reports the hang");
+            check(secs < 30.0, "the peerless exchange gave up promptly");
+            std::printf("note: peerless exchange gave up after %.2f s\n", secs);
+            cudaFree(p0);
+            lost.close();
+        }
     }
 
     cudaStreamDestroy(s0);

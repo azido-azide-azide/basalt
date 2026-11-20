@@ -194,14 +194,19 @@ struct SumF32 {
     }
 };
 
-// Enqueue-time agreement: the pair's cards must say the same size every round (the grids' warp counts key off
-// it, and a round where they disagree wedges the pair's flags forever). Rank 1's call for a round comes first
-// (the drivers queue the deep card's step ahead); rank 0's compares. Zero: off (a reopen clears it).
-bool n_agree(size_t* last, size_t slot, int rank, size_t n, std::string& err) {
-    if (rank != 0) { last[slot] = n; return true; }
-    if (last[slot] != 0 && last[slot] != n) {
-        err = "tp mailbox: slot " + std::to_string(slot) + "'s round carries " + std::to_string(last[slot]) +
-              " values on card 1 and " + std::to_string(n) + " on card 0 (the cards disagree; the pair will not turn)";
+// Enqueue-time agreement: the pair's cards must say the same geometry every round - the same value count AND
+// the same exchange kind, since the kinds' warp grids differ at equal counts (bf16/add: n/8 vectors, f32: n/4).
+// Rank 1's call for a round comes first (the drivers queue the deep card's step ahead); rank 0's compares.
+// Zero: off (a reopen clears it). The kind rides above the count: no payload reaches kKindUnit values.
+constexpr size_t kKindUnit = size_t(1) << 48;
+const char* kind_name(size_t kind) { return kind == 0 ? "bf16" : kind == 1 ? "add" : "f32"; }
+bool n_agree(size_t* last, size_t slot, int rank, size_t n, size_t kind, std::string& err) {
+    const size_t key = n + kind * kKindUnit;
+    if (rank != 0) { last[slot] = key; return true; }
+    if (last[slot] != 0 && last[slot] != key) {
+        err = "tp mailbox: slot " + std::to_string(slot) + "'s round carries " + std::to_string(last[slot] % kKindUnit) +
+              " values (" + kind_name(last[slot] / kKindUnit) + ") on card 1 and " + std::to_string(n) + " values (" +
+              kind_name(kind) + ") on card 0 (the cards disagree; the pair will not turn)";
         return false;
     }
     return true;
@@ -261,6 +266,12 @@ void TpMailbox::post_gate(uint32_t token, void* stream) {
     if (!gate_) return;
     tp_gate_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<volatile uint32_t*>(gate_), token);
+}
+
+// The driver's divergence mark: an exchange that failed to enqueue leaves the cards' rounds unpaired, so the
+// pair's results have split before any kernel spins. Sticky, as a kernel's timeout is (a reopen clears it).
+void TpMailbox::poison() {
+    if (hang_ != nullptr) std::atomic_ref<uint32_t>{*hang_}.store(1u, std::memory_order_relaxed);
 }
 
 bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_bytes, std::string& err) {
@@ -340,6 +351,7 @@ void TpMailbox::close() {
     n_slots_ = 0;
     slot_bytes_ = line_bytes_ = 0;
     dev0_ = dev1_ = -1;
+    last_n_.clear();   // a reopen starts the agreement check off, as its comment says
 }
 
 bool TpMailbox::exchange_bf16(int rank, size_t slot, void* partial, size_t bytes, void* stream,
@@ -350,7 +362,7 @@ bool TpMailbox::exchange_bf16(int rank, size_t slot, void* partial, size_t bytes
     }
     const size_t vecs = bytes / kVecBytes;
     if (last_n_.size() < n_slots_) last_n_.assign(n_slots_, 0);
-    if (!n_agree(last_n_.data(), slot, rank, bytes / kVecBytes * 8, err)) return false;
+    if (!n_agree(last_n_.data(), slot, rank, bytes / kVecBytes * 8, 0, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
@@ -377,7 +389,7 @@ bool TpMailbox::exchange_add_bf16(int rank, size_t slot, const float* mine, uint
         return false;
     }
     if (last_n_.size() < n_slots_) last_n_.assign(n_slots_, 0);
-    if (!n_agree(last_n_.data(), slot, rank, n, err)) return false;
+    if (!n_agree(last_n_.data(), slot, rank, n, 1, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_add_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
@@ -404,7 +416,7 @@ bool TpMailbox::exchange_f32(int rank, size_t slot, float* partial, uint16_t* bf
         return false;
     }
     if (last_n_.size() < n_slots_) last_n_.assign(n_slots_, 0);
-    if (!n_agree(last_n_.data(), slot, rank, n, err)) return false;
+    if (!n_agree(last_n_.data(), slot, rank, n, 2, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_f32_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(

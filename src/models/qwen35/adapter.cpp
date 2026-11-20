@@ -193,9 +193,14 @@ public:
                 err = "qwen35: --tp and --diag-split-at do not mix (a layer split and a card split are different cuts)";
                 return false;
             }
-            // the drafter runs on rank 0 alone (its weights are rank-0 tensors and its kernels post no
+            if (want_mtp) {   // its history (mtp_chunk) and draft passes (mtp_window) run the drafter's layer
+                              // through prod_add, which posts exchanges only rank 0 queues - the pair would
+                              // wedge on the first settled window (forward.cpp's prod_add, session.cpp's settle)
+                err = "qwen35: --tp does not run the MTP drafter yet (its draft passes post exchanges only rank 0 queues)";
+                return false;
+            }
+            // the block drafter runs on rank 0 alone (its weights are rank-0 tensors and its kernels post no
             // exchanges); the pair's verify windows carry its candidates through both cards' bodies
-
             if (o.vision) {
                 err = "qwen35: --tp does not run --vision yet";
                 return false;
@@ -358,8 +363,12 @@ public:
             // the pair's session and scratch rooms, card by card
             const uint64_t reserve = (uint64_t) std::max(req.vram_reserve_mib, 0) << 20;
             const dense::Geometry& g0 = plan0->geom;
+            // rank 0's session prices its drafter: init_state allocates the MTP cells or the block ring on the
+            // head card (session.cpp), so the headroom gate must count them too
             const uint64_t need0 = dense::shared_bytes(g0, o.max_context, o.kv_int8, o.kv_resident) +
-                                   (uint64_t) o.sessions * dense::session_bytes(g0, o.max_context, false, o.kv_int8, o.kv_resident, 0, 0);
+                                   (uint64_t) o.sessions *
+                                       (dense::session_bytes(g0, o.max_context, o.drafter == dense::Drafter::Mtp, o.kv_int8, o.kv_resident, 0, 0) +
+                                        (o.drafter == dense::Drafter::Block ? dense::block_session_bytes(g0, w.dflash) : 0));
             if (need0 + reserve + (512ull << 20) > free_b) {
                 err = "qwen35: rank 0 needs " + std::to_string((unsigned long long) (need0 >> 20)) +
                       " MiB of session room on CUDA0, " + std::to_string((unsigned long long) (free_b >> 20)) +
