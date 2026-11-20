@@ -276,6 +276,14 @@ int QfnRuntime::init_prompt() {
         return 2;
     }
 
+    if (fn_tp != nullptr) {   // the pair reads prompts as windows (prompt_windows.cpp): the batched path stays
+        // initialized but unused - small own buffers, no prompt-time split on the twin card (its slots are
+        // rank 1's expert tier), no peer prefill ring.  Per-rank chunked prefill is a later slice.
+        o.prefill_chunk = 256;
+        split_stages = 0;
+        basalt::log::info("basalt serve", "tensor pair: prompts read as verify windows (the batched prompt path is not paired yet)");
+    }
+
     borrow = nullptr;
     borrow_bytes = 0;
     lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -395,6 +403,13 @@ int QfnRuntime::init_prompt() {
     }
     any_loan = borrow != nullptr;
     for (size_t i = 1; i < pf_parts.size(); ++i) any_loan = any_loan || pf_parts[i].first >= 0;
+    if (fn_tp != nullptr) {   // no loan: lend() only runs for batched reads, and the pair never takes one -
+        // a borrowed region would never be marked missing (its slots still hold experts the windows read),
+        // so the unused prompt path's buffers must be its own
+        borrow = nullptr; borrow_bytes = 0; lend_first = -1;
+        for (PfPart& p : pf_parts) { p.first = -1; p.first_now = -1; }
+        any_loan = false;
+    }
     if (any_loan) {
         if (borrow != nullptr)
             basalt::log::info("basalt serve", "the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)",
@@ -484,8 +499,8 @@ int QfnRuntime::init_prompt() {
                                  "context, or read prompts in smaller chunks (--prefill 512)");
         return 1;
     }
-    if (peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);
-    if (peer.valid() && !o.no_peer_prefill) {
+    if (fn_tp == nullptr && peer.valid() && o.peer_exclusive) sp.set_ring_peer(&peer);   // the pair's prompt path never runs sp
+    if (fn_tp == nullptr && peer.valid() && !o.no_peer_prefill) {
         if (!sp.set_peer(&peer, peer_streamed_share, err)) {
             basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
             err.clear();
