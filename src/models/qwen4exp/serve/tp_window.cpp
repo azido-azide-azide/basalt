@@ -51,7 +51,8 @@ bool run_tp_window(QfnRuntime& rt, int T, const int32_t* tokens, int64_t p, basa
     // (32c-4: the route's kDmSkip left rank 0 exactly the experts card 1 does not hold); rank 1's runs
     // with no pool at all (its rings still need their plans published).
     bool done0 = false, done1 = false;
-    std::vector<int32_t> out1((size_t) T, 0);   // rank 1's picks: read for its head to have written, then dropped
+    std::vector<int32_t> out1((size_t) T, 0);   // rank 1's run_end needs an out buffer; it records no head
+                                               // (tp_skip_head), so these rows stay unwritten and are dropped
     while (!done0 || !done1) {
         if (!done0) {
             const int r = rt.ver.tp_serve_once(pool, user, err);
