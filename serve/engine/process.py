@@ -1581,7 +1581,8 @@ class ProcessEngine:
             return None
 
         def held_prefix(b):
-            return meet[b] if 0 < meet[b] < size else 0
+            # a prompt that repeats a held conversation in full is the strongest match, not no match
+            return meet[b] if 0 < meet[b] <= size else 0
 
         def best(pool: list[int]) -> int:
             top = max(pool, key=held_prefix)
