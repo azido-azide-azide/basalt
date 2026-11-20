@@ -169,6 +169,7 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
     out = 0;
     uint64_t pool = 0, compact = 0;
     int align = 0;
+    std::set<std::string> seen;   // ghost slice names: sizing must refuse what load refuses
     while (f.next(line, sizeof line)) {
         if (line[0] == '#') {
             unsigned long long p = 0;
@@ -182,6 +183,7 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
         int i1 = 0, i2 = 0;
         if (std::sscanf(line, "%255s %d %d %llu %llu %llu %llu", name, &i1, &i2, &dummy, &dummy, &dummy, &dst_bytes) != 7)
             continue;
+        seen.insert(name);
         if (skip != nullptr && skip->count(name)) continue;
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
         if (slices != nullptr && slices->count(name)) {
@@ -193,6 +195,9 @@ bool WeightTable::pool_bytes(const PackFiles& pack, uint64_t& out, std::string& 
         compact += (dst_bytes + a - 1) / a * a;
     }
     if (pool == 0) { err = "no '# align ... pool ...' header in " + path; return false; }
+    if (slices != nullptr)
+        for (const auto& kv : *slices)
+            if (!seen.count(kv.first)) { err = kv.first + ": the row slice names no index row"; return false; }
     out = (skip != nullptr || slices != nullptr) ? compact : pool;
     return true;
 }
@@ -311,6 +316,22 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
             if (it->second.empty() || runs_total(it->second) > r.ne1) {
                 err = r.name + ": the row slice covers more rows than the tensor (or none)";
                 return false;
+            }
+            {   // per-run bounds + disjointness: the header promises a hard error on a misaligned or over-large
+                // run list - a single run past ne1 with a small total, or overlapping runs, used to slip through
+                // and read past the tensor into the next tensor's source bytes
+                auto rs = it->second;
+                std::sort(rs.begin(), rs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+                uint64_t end = 0;
+                for (const auto& run : rs) {
+                    if (run.first < 0 || run.second <= 0 ||
+                        (uint64_t) run.first + (uint64_t) run.second > (uint64_t) r.ne1) {
+                        err = r.name + ": a row-slice run is outside the tensor";
+                        return false;
+                    }
+                    if ((uint64_t) run.first < end) { err = r.name + ": overlapping row-slice runs"; return false; }
+                    end = (uint64_t) run.first + (uint64_t) run.second;
+                }
             }
             uint64_t stored_dst = 0;
             if (r.code_bits != 0) {
@@ -471,12 +492,24 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
         // hold the stored sizes; the spans hold the file offsets and lengths, relative to src_off).
         const bool sliced_row = !r.c_spans.empty() || !r.s_spans.empty() || !r.o_spans.empty();
         if (sliced_row && r.code_bits != 0) {
-            for (const auto& sp : r.c_spans) segs.push_back(Seg{sp.first, sp.second, 0, sp.second, Conv::Copy});
-            for (const auto& sp : r.s_spans)
-                segs.push_back(Seg{sp.first, sp.second, r.codes_bytes, sp.second * (r.scales_fp16 ? 2 : 1),
+            // each plane's spans tile that plane in run order: a per-plane cursor, NOT a fixed plane base -
+            // with >1 run a fixed base overwrites the earlier spans inside the plane (the byte totals still
+            // match, so the sum guard below cannot see it). One run: identical segments to the fixed base.
+            uint64_t at_c = 0, at_s = 0, at_o = 0;
+            for (const auto& sp : r.c_spans) {
+                segs.push_back(Seg{sp.first, sp.second, at_c, sp.second, Conv::Copy});
+                at_c += sp.second;
+            }
+            for (const auto& sp : r.s_spans) {
+                const uint64_t dlen = sp.second * (r.scales_fp16 ? 2 : 1);
+                segs.push_back(Seg{sp.first, sp.second, r.codes_bytes + at_s, dlen,
                                    r.scales_fp16 ? Conv::WidenF16 : Conv::Copy});
-            for (const auto& sp : r.o_spans)
-                segs.push_back(Seg{sp.first, sp.second, r.codes_bytes + r.scales_bytes, sp.second, Conv::Copy});
+                at_s += dlen;
+            }
+            for (const auto& sp : r.o_spans) {
+                segs.push_back(Seg{sp.first, sp.second, r.codes_bytes + r.scales_bytes + at_o, sp.second, Conv::Copy});
+                at_o += sp.second;
+            }
         } else if (sliced_row) {
             const uint64_t dst_per_src = r.src_bytes > 0 ? r.dst_bytes * 1000 / r.src_bytes : 1000;
             uint64_t at = 0;

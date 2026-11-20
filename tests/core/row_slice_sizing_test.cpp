@@ -85,6 +85,7 @@ int main() {
 
     WeightTable::RowSlices ghost;
     ghost["blk.7.no_there.weight"] = {{0, 2}};
+    err.clear();   // the assertion must read THIS call's refusal, not the previous check's
     ok(!WeightTable::pool_bytes(p, shared, err, nullptr, &ghost) || !err.empty(),
        "a slice naming no index row is refused");
 

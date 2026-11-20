@@ -95,7 +95,7 @@ bool NativeDense::plan_bytes(const std::vector<std::string>& shards, bool includ
                         }
                         uint64_t rows = 0;
                         for (const auto& run : s->second) {
-                            if (!run.second || run.first + run.second > tensor.shape[1]) {
+                            if (run.first < 0 || !run.second || run.first + run.second > tensor.shape[1]) {
                                 err = "native dense: a row run of " + tensor.name + " is outside the file's matrix";
                                 return false;
                             }
@@ -302,7 +302,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     }
                     row_bytes = full / tensor.shape[1];
                     for (const auto& run : runs) {
-                        if (!run.second || run.first + run.second > tensor.shape[1]) {
+                        if (run.first < 0 || !run.second || run.first + run.second > tensor.shape[1]) {
                             err = "native dense: a row run of " + tensor.name + " is outside the file's matrix";
                             return false;
                         }
