@@ -297,6 +297,50 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     check_launch("copy_from_mapped");
 }
 
+// The tensor pair's hand-off publish (device -> mapped host): write-through stores, so the rows reach system
+// memory before the hand-off flag instead of sitting dirty in the writer's L2. A plain store + __threadfence_system
+// (signal_flag) does not evict them on this platform - the peer reads stale rows and computes from a wrong start
+// state (the stale-read trap the mailbox's release/.cv protocol avoids). st.global.wt is the proven fix.
+__global__ void copy_to_mapped_wt_kernel(float4* dst, const float4* __restrict__ src, int64_t n4) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        const float4 v = src[i];
+        asm volatile("st.global.wt.v4.f32 [%0], {%1, %2, %3, %4};"
+                     :: "l"(dst + i), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w) : "memory");
+    }
+}
+
+void copy_to_mapped_wt(float* dst, const float* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        basalt::log::error("basalt", "copy_to_mapped_wt: n must be a multiple of 4 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    const int64_t n4 = n / 4;
+    const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+    copy_to_mapped_wt_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const float4*) src, n4);
+    check_launch("copy_to_mapped_wt");
+}
+
+// The tensor pair's hand-off consume (mapped host -> device): cache-volatile loads, so the reader bypasses its
+// own stale L2 lines and sees the peer's write-through rows. Mirrors the mailbox's __ldcv peer reads.
+__global__ void copy_from_mapped_cv_kernel(float4* __restrict__ dst, const float4* src, int64_t n4) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        dst[i] = __ldcv(src + i);
+    }
+}
+
+void copy_from_mapped_cv(float* dst, const float* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        basalt::log::error("basalt", "copy_from_mapped_cv: n must be a multiple of 4 and both pointers 16-byte aligned");
+        std::exit(1);
+    }
+    const int64_t n4 = n / 4;
+    const int blocks = (int) ((n4 + 255) / 256 < 64 ? (n4 + 255) / 256 : 64);
+    copy_from_mapped_cv_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const float4*) src, n4);
+    check_launch("copy_from_mapped_cv");
+}
+
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {

@@ -76,9 +76,15 @@ bool Verifier::WindowRecorder::inputs() {
     if (v_.lb_ > 0 || (v_.tp_ != nullptr && v_.tp_->rank == 1 && v_.hand_in_ != nullptr)) {
         if (!v_.batch_rec_) wait_flag_ge(v_.m_flag_ + 12, 1, cs);   // the previous stage's graph raised it after its hand-off
         const float* hin = v_.hand_in_ + (size_t) hrow0 * HB;   // the group's rows: [R][bo][inj] contiguous
-        copy_from_mapped(v_.R_, hin, (int64_t) T * HC * N, cs);
-        copy_from_mapped(v_.bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
-        copy_from_mapped(v_.inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
+        if (v_.tp_ != nullptr && v_.tp_->rank == 1) {   // the pair reads the peer's write-through rows cache-volatile
+            copy_from_mapped_cv(v_.R_, hin, (int64_t) T * HC * N, cs);
+            copy_from_mapped_cv(v_.bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
+            copy_from_mapped_cv(v_.inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
+        } else {
+            copy_from_mapped(v_.R_, hin, (int64_t) T * HC * N, cs);
+            copy_from_mapped(v_.bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
+            copy_from_mapped(v_.inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
+        }
     } else if (const NativeEmbed* ne = native_embed()) {   // the GGUF-form table
         ne->gather_dev(v_.tok_, T, v_.emb_, cs);
         broadcast_streams(v_.emb_, v_.R_, N, (int) HC, T, cs);
@@ -105,9 +111,11 @@ bool Verifier::WindowRecorder::inputs() {
     // start state; both arenas then rotate identically and the exchange's equal-bits invariant stands.
     if (v_.tp_ != nullptr && v_.tp_->rank == 0 && v_.hand_out_ != nullptr) {
         float* hout = v_.hand_out_ + (size_t) hrow0 * HB;
-        copy_from_mapped(hout, v_.R_, (int64_t) T * HC * N, cs);
-        copy_from_mapped(hout + (size_t) T * HC * N, v_.bo_, (int64_t) T * N, cs);
-        copy_from_mapped(hout + (size_t) T * (HC + 1) * N, v_.inj2_, (int64_t) T * HC, cs);
+        // write-through: the rows must be in system memory before the flag below wakes rank 1 (a plain copy leaves
+        // them dirty in this card's L2 and rank 1 reads a stale start state - the pair's first-token garbage)
+        copy_to_mapped_wt(hout, v_.R_, (int64_t) T * HC * N, cs);
+        copy_to_mapped_wt(hout + (size_t) T * HC * N, v_.bo_, (int64_t) T * N, cs);
+        copy_to_mapped_wt(hout + (size_t) T * (HC + 1) * N, v_.inj2_, (int64_t) T * HC, cs);
         if (v_.tp_->hand_flag != nullptr) signal_flag(v_.tp_->hand_flag, 1, cs);   // wakes rank 1's wait_flag_ge above
     }
 

@@ -100,6 +100,13 @@ void signal_flag(uint32_t* flag, uint32_t value, void* stream);
 /// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
 /// operation, which is submitted separately and costs a flush per node).
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
+/// The tensor pair's hand-off publish: device -> mapped host with write-through stores (st.global.wt), so the rows
+/// reach system memory before the hand-off flag (a plain store + threadfence_system leaves them dirty in the writer's
+/// L2 and the peer reads stale rows). n a multiple of 4, both pointers 16-byte aligned.
+void copy_to_mapped_wt(float* dst, const float* src, int64_t n, void* stream);
+/// The tensor pair's hand-off consume: mapped host -> device with cache-volatile loads (__ldcv), bypassing the
+/// reader's stale L2 lines. n a multiple of 4, both pointers 16-byte aligned.
+void copy_from_mapped_cv(float* dst, const float* src, int64_t n, void* stream);
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).  With
