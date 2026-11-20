@@ -1,5 +1,7 @@
 #include "common.hpp"
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/on_device.hpp"
+#include "basalt/kernels/elementwise.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include <algorithm>
@@ -89,6 +91,22 @@ bool Verifier::capture(int T, std::string& err) {
                           device_, T, (int) ((le_ < 0 ? g_->n_layers : le_) - lb_), (size_t) tp_->epi[tp_->rank],
                           g_nodes, ar_on() ? "zero-doorbell" : "doorbell");
     return true;
+}
+
+// The pair's commit-graph warm (window 3's first-request death): the commit path's copy kernel lives in a
+// module a pair card may never have loaded OUTSIDE capture - rank 1 runs no elastic-KV or prompt kernels
+// before its first window, and CUDA refuses a lazy module load inside capture ("copy_i32_from_mapped
+// launch: invalid argument"). One plain launch on the card's own commit stream loads the module; the
+// commit graph then captures at bring-up like the window graphs, not at the first request.
+bool Verifier::warm_commit(std::string& err) {
+    const OnDevice on_device(device_);
+    basalt::kernels::copy_i32_from_mapped(commit_, m_commit_, 2 + max_t_, cm_);
+    const cudaError_t se = cudaStreamSynchronize(cm_);
+    if (se != cudaSuccess) {
+        err = std::string("verify: commit warm: ") + cudaGetErrorString(se);
+        return false;
+    }
+    return capture_commit(err);
 }
 
 }  // namespace basalt::core

@@ -280,6 +280,7 @@ int QfnRuntime::init_prompt() {
         // initialized but unused - small own buffers, no prompt-time split on the twin card (its slots are
         // rank 1's expert tier), no peer prefill ring.  Per-rank chunked prefill is a later slice.
         o.prefill_chunk = 256;
+        o.prefill_auto = false;   // the auto scan would re-price the chunk upward (window 3 try4: 1024 -> 512)
         split_stages = 0;
         basalt::log::info("basalt serve", "tensor pair: prompts read as verify windows (the batched prompt path is not paired yet)");
     }

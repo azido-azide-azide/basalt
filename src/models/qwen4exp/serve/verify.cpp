@@ -402,6 +402,18 @@ int QfnRuntime::capture_windows() {
             basalt::log::info("basalt serve", "tp warm T=%d: CUDA%d queued %zu exchanges, CUDA0 %zu", T, fn_tp->dev,
                               fn_tp_role[1].epi[1], fn_tp_role[0].epi[0]);
         }
+        {   // the commit graphs warm at bring-up too, rank 1 first (the pair's order): the first request's
+            // commit capture died in a lazy module load inside capture (window 3) - warm_commit preloads
+            const basalt::core::OnDevice on_tp(fn_tp->dev);
+            if (!ver_tp.warm_commit(err)) {
+                basalt::log::error("basalt serve", "tensor pair: CUDA%d's commit warm failed: %s", fn_tp->dev, err.c_str());
+                return 1;
+            }
+        }
+        if (!ver.warm_commit(err)) {
+            basalt::log::error("basalt serve", "tensor pair: CUDA0's commit warm failed: %s", err.c_str());
+            return 1;
+        }
     }
     // every window width's graph is captured before READY, not by the first request that needs it
     if (o.serve && fn_tp == nullptr && stages.empty() && !ver.warm_graphs(err)) {

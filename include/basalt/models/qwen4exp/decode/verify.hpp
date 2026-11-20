@@ -220,6 +220,11 @@ public:
         refresh_ar();
         return capture(T, err);
     }
+    /// the pair's commit-graph warm (defined with capture): one plain launch preloads the commit path's
+    /// copy-kernel module on this card - CUDA refuses a lazy module load INSIDE capture, and rank 1 runs
+    /// no elastic-KV/prompt kernels that would load it beforehand (window 3's first-request death) - then
+    /// captures the commit graph at bring-up, not at the first request. Solo never calls it.
+    bool warm_commit(std::string& err);
     bool tp_launch(std::string& err);   ///< the cudaGraphLaunch(tp_window.cpp:pair) that run_begin skipped
     int tp_serve_once(PoolMultiFn pool, void* user, std::string& err) { return serve_poll(pool, user, err); }
     bool tp_end(int32_t* out, std::string& err) { return run_end(out, err); }
