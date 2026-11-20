@@ -5,10 +5,10 @@
 // first and this card back to back - the streams are never joined by events, the mailbox's per-round waits
 // are the pair's only true dependencies.
 //
-// Structurally complete, not yet exercised: run_tp_window refuses unless `pair_runnable`, and the pair's
-// bring-up itself refuses the start (serve/verify.cpp's capture_windows) until the MoE pair exchange lands
-// (32c-4) - so no request can reach this file's code in this slice.  The refusal is the guard; the
-// choreography is what the next window must not have to re-derive.
+// Live since 32c-4: run_tp_window refuses unless `pair_runnable`, which capture_windows flips only after
+// both cards' graphs warmed with equal mailbox totals (48 mixer BF16 + 48 MoE FP32 partial-sum exchanges
+// per window per card).  The refusal stays as the guard; the choreography below is what a window must not
+// have to re-derive.
 #pragma once
 
 #include "qfn_state.hpp"

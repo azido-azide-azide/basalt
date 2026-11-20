@@ -14,8 +14,9 @@ namespace basalt::models::qwen4exp::serve {
 bool run_tp_window(QfnRuntime& rt, int T, const int32_t* tokens, int64_t p, basalt::core::PoolMultiFn pool,
                    void* user, std::vector<int32_t>& outv, std::string& err) {
     if (rt.fn_tp == nullptr || !rt.pair_runnable) {
-        // defense in depth: the pair's bring-up refuses the start before READY (serve/verify.cpp), so no
-        // request reaches a pair window until 32c-4 flips pair_runnable and lifts that refusal with it.
+        // defense in depth: pair_runnable comes up only with both cards' windows warmed and the MoE
+        // partial-sum exchange in their graphs (32c-4, serve/verify.cpp's capture_windows) - a pair that
+        // did not bring BOTH cards up never reaches this driver.
         err = "fn tp: the pair's driver windows are not run-able yet";
         return false;
     }
@@ -46,7 +47,8 @@ bool run_tp_window(QfnRuntime& rt, int T, const int32_t* tokens, int64_t p, basa
     if (!rt.ver.tp_launch(err)) return false;
     // ONE host, both cards' rings: each poll is non-blocking (serve_poll returns 0 while the next doorbell
     // is in flight), so neither card's spin waits on the host's ordering.  Rank 0's poll drives the CPU
-    // expert pool - which keeps working alone until 32c-4 folds the pair's MoE partials; rank 1's runs
+    // expert pool - rank 0's CPU share of the split experts, folded into its partial like any other tier
+    // (32c-4: the route's kDmSkip left rank 0 exactly the experts card 1 does not hold); rank 1's runs
     // with no pool at all (its rings still need their plans published).
     bool done0 = false, done1 = false;
     std::vector<int32_t> out1((size_t) T, 0);   // rank 1's picks: read for its head to have written, then dropped

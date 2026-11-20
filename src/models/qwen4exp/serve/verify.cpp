@@ -415,7 +415,7 @@ int QfnRuntime::capture_windows() {
             cudaMemGetInfo(&free_tp, &total_tp);
         }
         basalt::log::info("basalt serve", "tensor pair: CUDA0+CUDA%d bring-up complete (mailbox %zu slots x %zu B, "
-                             "graphs warm T=1..%d); the MoE pair exchange lands in the next slice",
+                             "graphs warm T=1..%d, MoE partial-sum exchanges in both cards' windows)",
                      fn_tp->dev, fn_tp->mb.slots(), fn_tp->mb.slot_bytes(), std::max({o.spec, o.batch, 2}));
         // the one-line budget the next window reads (32c-3 item 7): what each card holds and what card 1 has left.
         basalt::log::info("basalt serve", "tensor pair budget: CUDA%d arena %llu MiB + native %llu MiB + rank1 "
@@ -431,10 +431,13 @@ int QfnRuntime::capture_windows() {
             std::fflush(stdout);
             std::exit(0);   // the bring-up line above is the test's assertion; teardown would add nothing
         }
-        basalt::log::error("basalt serve", "the tensor pair's driver windows are not run-able yet - the MoE pair "
-                             "exchange lands in the next slice; this build brought the pair up and warmed both "
-                             "cards' graphs");
-        return 1;
+        // 32c-4 lifts the refusal: the MoE partial-sum exchange is in both cards' graphs (48 mixer + 48 FP32
+        // per window per card, interleaved widths so the mailbox's enqueue-time agreement sees equal counts),
+        // both cards' dm tails came up (the guard above), and the driver's own pair_runnable check now
+        // passes.  dispatch()'s bare-generate refusal stays: generate mode still has no pair driver.
+        pair_runnable = true;
+        basalt::log::info("basalt serve", "tensor pair: windows live (mixer BF16 + MoE FP32 exchanges, %zu per "
+                             "window per card)", fn_tp_role[1].epi[1]);
     }
     // the solo windows of every slot session, so a lone request in any slot runs the solo path in place
     if (o.serve && slot0_is_solo && o.batch > 1) {
