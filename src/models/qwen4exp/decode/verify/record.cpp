@@ -37,15 +37,45 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 // The pair's card turns its own heads' activation rows into both cards' whole rows: its values land at their
 // model head slot (zeros elsewhere), the mailbox sums the two cards' placements (x + 0 = x: one rounding, equal
 // bits on both cards), and the widened row quantizes as every single-card window quantizes its projection input.
+//
+// `gdn_heads` says the rows are a GDN layer's, which changes ONLY where a row lands.  A GDN card's value heads
+// come from a key-head-group cut (core::gdn_head_split: value head v reads key head v % h_k), so its packed
+// head p is model head (p / nk) * h_k + k0 + p % nk and belongs at THAT head's columns of the replicated
+// output projection.  The plain `off = rank * half` is the model slot only when the card's heads are
+// contiguous (h_v == h_k, one run); with 48 heads over 16 key heads it hands the projection heads in the wrong
+// order - 32 of 48 of them - which is deterministic, bit-for-bit equal on both cards, and wrong from the first
+// window's first layer: the pair's token salad.
 bool Verifier::WindowRecorder::tp_assemble(int64_t half_dim, int64_t full_dim, const void* src, bool src_bf16,
-                                              int site) {
+                                              int site, bool gdn_heads) {
     using namespace basalt::kernels;
     FnTp* tp = v_.tp_;
     const int64_t off = (int64_t) tp->rank * half_dim;
-    if (src_bf16)
-        tp_place_bf16_bf16(v_.mixb_, (const uint16_t*) src, half_dim, full_dim, off, T, cs);
-    else
-        tp_place_bf16_f32(v_.mixb_, (const float*) src, half_dim, full_dim, off, T, cs);
+    int64_t sg = 0, dg = 0, base = 0;
+    if (gdn_heads) {
+        const GdnHeadSlice& gs = tp->gdn;
+        if (gs.nk <= 0 || gs.h_k <= 0 || gs.h_v <= 0 || gs.s <= 0 || gs.nv() * gs.s != half_dim ||
+            (int64_t) gs.h_v * gs.s != full_dim || gs.h_v % gs.h_k != 0 || gs.nv() % gs.nk != 0 ||
+            gs.h_v / gs.h_k != gs.nv() / gs.nk) {
+            err = "tp mixer exchange [call site line " + std::to_string(site) +
+                  "]: the card's GDN head slice does not describe these rows (nk=" + std::to_string(gs.nk) +
+                  " h_k=" + std::to_string(gs.h_k) + " h_v=" + std::to_string(gs.h_v) +
+                  " s=" + std::to_string(gs.s) + " half=" + std::to_string((long long) half_dim) +
+                  " full=" + std::to_string((long long) full_dim) + ")";
+            return false;
+        }
+        gdn_place_groups(gs, sg, dg, base);
+    }
+    if (src_bf16) {
+        if (gdn_heads)
+            tp_place_bf16_bf16_grouped(v_.mixb_, (const uint16_t*) src, half_dim, full_dim, sg, dg, base, T, cs);
+        else
+            tp_place_bf16_bf16(v_.mixb_, (const uint16_t*) src, half_dim, full_dim, off, T, cs);
+    } else {
+        if (gdn_heads)
+            tp_place_bf16_f32_grouped(v_.mixb_, (const float*) src, half_dim, full_dim, sg, dg, base, T, cs);
+        else
+            tp_place_bf16_f32(v_.mixb_, (const float*) src, half_dim, full_dim, off, T, cs);
+    }
     std::string e;
     if (!tp->mb->exchange_bf16(tp->rank, tp->epi[tp->rank]++ & 1, v_.mixb_, (size_t) T * full_dim * 2, cs, e)) {
         err = "tp mixer exchange [call site line " + std::to_string(site) + "] half=" + std::to_string((long long) half_dim) +
@@ -69,6 +99,10 @@ bool Verifier::WindowRecorder::run() {
     if (!pre(v_.lb_)) return false;
     for (int64_t l = v_.lb_; l < v_.le_; ++l) {
         if (!post(l)) return false;
+        if (v_.tp_diag_ != nullptr) {   // BASALT_TP_DIAG: residual + the pair-added MoE norm after each layer
+            basalt::kernels::diag_norm(Rt(0), (int) N, v_.tp_diag_ + 8 * l, cs);
+            basalt::kernels::diag_norm(v_.bo_, (int) N, v_.tp_diag_ + 8 * l + 1, cs);
+        }
         if (l + 1 < v_.le_ && !pre(l + 1)) return false;
     }
     if (lz_open) cudaStreamWaitEvent(cs, v_.lz_join_, 0);

@@ -122,9 +122,12 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     const bool read_q8 = dec_hc && hc_fused_q8_rows_ok();
     const WeightRef* w_router = v.get("ffn_gate_inp.weight");
     const bool router_multi = w_router != nullptr && NE == 512 && K == 10;
-    // the GDN mixer split by key head: the layer's q8_1 rows and a doorbell for the peer's key heads; in a batch
-    // window CUDA0 runs the whole layer and the doorbell only passes
-    const bool gs_ring = dm && v_.gs_nk0_ > 0 && !is_qsa_layer(g, l);
+    // The GDN mixer split by key head: the layer's q8_1 rows and a doorbell for the peer's key heads; in a batch
+    // window CUDA0 runs the whole layer and the doorbell only passes.  Never in a TENSOR PAIR window: both pair
+    // cards record and gs_plan is rank-blind (observed: both claim "CUDA0 8 of 16 key heads"), so the pair keeps
+    // the GDN whole per card and joins heads through the y16 exchange - the gate is here because the pair's FnTp
+    // lands on the verifier AFTER its first expert-resources pass (init-time gates run with tp_ == nullptr).
+    const bool gs_ring = dm && v_.gs_nk0_ > 0 && !is_qsa_layer(g, l) && !v_.tp_;
     const bool gs_split = gs_ring && !v_.batch_rec_;
     // a GDN layer's middle as one persistent kernel (mid_chain.hpp) between the layer's two hc reads: the qkv + z pair,
     // the recurrence and the output projection, bitwise the kernels it replaces
@@ -178,7 +181,15 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
                                v_.qs_[0] != nullptr;
             }
             h.pf[0] = wn[1]->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float);
+            if (v_.tp_diag_bits_ != nullptr && l < 3) {   // v6b: the read's live input head + folded prev rows, pre-launch
+                basalt::kernels::diag_copy_i32((const int32_t*) h.R, v_.tp_diag_bits_ + l * 288 + 24, 8, cs);
+                if (h.bo_prev != nullptr)
+                    basalt::kernels::diag_copy_i32((const int32_t*) h.bo_prev, v_.tp_diag_bits_ + l * 288 + 32, 8, cs);
+            }
             hc_fused_read(h, cs);
+            if (v_.tp_diag_bits_ != nullptr && l < 3 && v_.tp_ord_ == 0) {   // v12: the attn mixer's own output
+                basalt::kernels::diag_copy_i32((const int32_t*) v_.mixed_, v_.tp_diag_bits_ + l * 288 + 60, 4, cs);
+            }
         } else {
             gr_read_group(0, pending, v_.inj2_, v_.inj_);
         }
@@ -264,6 +275,11 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             if (l + 1 < g.n_layers) next_norm = LayerView(wt, l + 1).get("hc_attn_norm.weight");
             else next_norm = wt.find("output_hc_norm.weight");
             if (next_norm != nullptr) { h.pf[0] = next_norm->data; h.pf_bytes[0] = (size_t) HC * N * sizeof(float); }
+            if (v_.tp_diag_bits_ != nullptr && l < 3) {   // v8: the ffn read's fold input + the router's weight bytes
+                basalt::kernels::diag_copy_i32((const int32_t*) h.R, v_.tp_diag_bits_ + l * 288 + 40, 8, cs);
+                if (h.bo_prev != nullptr)
+                    basalt::kernels::diag_copy_i32((const int32_t*) h.bo_prev, v_.tp_diag_bits_ + l * 288 + 48, 8, cs);
+            }
             hc_fused_read(h, cs);
         } else {
             gr_read_group(1, true, v_.inj_, v_.inj2_);

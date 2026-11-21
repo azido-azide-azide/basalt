@@ -55,7 +55,9 @@ bool Verifier::finisher_on() const {
            fin_blocks_ > 0;
 }
 
-bool Verifier::lazy_on() const { return finisher_on() && dm_ != nullptr && gs_nk0_ == 0 && lz_s_ != nullptr; }
+// The pair keeps the eager commit: the lazy stage-commit was never recorded beside the pair's per-layer exchanges
+// (before the mixer split was gated off for the pair, gs_nk0_ > 0 held it off implicitly - this keeps that).
+bool Verifier::lazy_on() const { return finisher_on() && dm_ != nullptr && gs_nk0_ == 0 && lz_s_ != nullptr && tp_ == nullptr; }
 
 // the stage's GDN layers after its first, the lazy ones
 basalt::kernels::GdnCommitLayers Verifier::commit_gdn_lazy_args() const {
@@ -174,7 +176,7 @@ bool Verifier::commit(int n_keep, std::string& err, int parts, bool launch) {
         cudaError_t le = cudaSuccess;
         if (launch) le = cudaGraphLaunch(commit_exec_, cm_);   // pair: tp_launch_commit fires it
         decode_events().record(DecodeEvents::kCommitPost, cm_);
-        if (gs_split_ && gs_live_) {   // the peer's heads, on its stream behind its window
+        if (gs_split_ && gs_live_ && tp_ == nullptr) {   // the peer's heads, on its stream behind its window
             const OnDevice on(gs_dev_);
             gs_ca_.n_keep = h_commit_;
             basalt::kernels::gdn_commit_layers(gs_ca_, dm_->ps, kCommitBlocks);

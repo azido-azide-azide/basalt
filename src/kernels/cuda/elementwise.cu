@@ -341,6 +341,47 @@ void copy_from_mapped_cv(float* dst, const float* src, int64_t n, void* stream) 
     check_launch("copy_from_mapped_cv");
 }
 
+// diagnostic (BASALT_TP_DIAG): out[0] = sum(x[i]^2), one block - capturable, overwrites (no accumulate)
+__global__ void diag_norm_kernel(const float* x, int n, float* out) {
+    __shared__ float s[256];
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += x[i] * x[i];
+    s[threadIdx.x] = acc;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) s[threadIdx.x] += s[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = s[0];
+}
+void diag_norm(const float* x, int n, float* out, void* stream) {
+    diag_norm_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(x, n, out);
+    check_launch("diag_norm");
+}
+__global__ void diag_hash_u8_kernel(const uint8_t* p, size_t bpu, int units, int32_t* out) {
+    const int u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= units) return;
+    int32_t h = 0;
+    const uint8_t* q = p + (size_t) u * bpu;
+    for (size_t i = 0; i < bpu; i += 4) {
+        uint32_t w = ((uint32_t) q[i]) | ((uint32_t) q[i + 1] << 8) | ((uint32_t) q[i + 2] << 16) |
+                     ((uint32_t) (i + 3 < bpu ? q[i + 3] : 0) << 24);
+        h = h * 16777619 + (int32_t) w;
+    }
+    out[u] = h;
+}
+void diag_hash_u8(const uint8_t* p, size_t bytes_per_unit, int units, int32_t* out, void* stream) {
+    diag_hash_u8_kernel<<<(unsigned) ((units + 31) / 32), 32, 0, (cudaStream_t) stream>>>(p, bytes_per_unit, units, out);
+}
+
+__global__ void diag_copy_i32_kernel(const int32_t* src, int32_t* dst, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = src[i];
+}
+void diag_copy_i32(const int32_t* src, int32_t* dst, int n, void* stream) {
+    diag_copy_i32_kernel<<<64, 256, 0, (cudaStream_t) stream>>>(src, dst, n);
+    check_launch("diag_copy_i32");
+}
+
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {

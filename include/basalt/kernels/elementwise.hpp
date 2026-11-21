@@ -107,6 +107,10 @@ void copy_to_mapped_wt(float* dst, const float* src, int64_t n, void* stream);
 /// The tensor pair's hand-off consume: mapped host -> device with cache-volatile loads (__ldcv), bypassing the
 /// reader's stale L2 lines. n a multiple of 4, both pointers 16-byte aligned.
 void copy_from_mapped_cv(float* dst, const float* src, int64_t n, void* stream);
+/// diagnostic: out[0] = sum of squares of x[0..n) (one block, capturable)
+void diag_norm(const float* x, int n, float* out, void* stream);
+void diag_copy_i32(const int32_t* src, int32_t* dst, int n, void* stream);
+void diag_hash_u8(const uint8_t* p, size_t bytes_per_unit, int units, int32_t* out, void* stream);
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 /// multi-GPU: dst[rows[r] * width ..] = src[r * width ..] for r < n (float4; dst may be mapped host memory).  With

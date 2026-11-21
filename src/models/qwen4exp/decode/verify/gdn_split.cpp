@@ -346,6 +346,8 @@ void Verifier::gs_free() {
 }
 
 bool Verifier::gs_move(bool to_peer, std::string& err) {
+    if (tp_ != nullptr) return true;   // the tensor pair never activates the mixer split (record_layer gs_ring):
+                                       // its state ping-pong would move slices no pair recorder ever produced
     using basalt::core::GdnHeadSlice;
     const ModelGeometry& g = *g_;
     const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
@@ -391,6 +393,116 @@ bool Verifier::gs_move(bool to_peer, std::string& err) {
         basalt::log::info("basalt verify", "the GDN state slice moved %s in %.1f ms (%.0f MiB)", to_peer ? "to the peer" : "back",
                           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
                           (double) (full_n + part_n) * 4 / (1 << 20));
+    return true;
+}
+
+// The pair card's GDN head-parameter rows, in ITS packed head order.
+//
+// The plan keeps ssm_alpha/ssm_beta (one n_embd row per model VALUE head) and ssm_dt.bias/ssm_a (one value
+// each) REPLICATED on both cards, because the head-slicing machinery works on rows the activations also slice.
+// The pair's windows then run the recurrence with the CARD's geometry (head_map's nk == 0 branch, where the
+// launch's value head IS the card's local head), and read those tables at `hv0 = rank * HV + local` - which
+// assumes the card's heads are the model's contiguous block [rank * 24, rank * 24 + 24).  They are not: the
+// cut is by key-head group (core::gdn_head_split: value head v reads key head v % h_k), so rank 0 owns model
+// heads [0,8) + [16,24) + [32,40) and rank 1 [8,16) + [24,32) + [40,48).  32 of the 48 heads therefore ran on
+// ANOTHER head's decay (A), beta and dt bias - deterministic, identical on both cards, wrong in the first
+// window of the first layer, and invisible to every head-offset audit that checked the offsets against the
+// contiguous assumption instead of the plan.  (The dense pair never had this exposure: its plan slices these
+// very rows with v_rows(1) - include/basalt/dense/tp.hpp names them - and sums column-sliced out-projection
+// partials instead of assembling a full-width row.)
+//
+// Gathering the card's own rows once at bring-up lets the recurrence keep indexing its local head and offset
+// nothing: the table it reads is already in its order.
+bool Verifier::tp_gather_gdn_params(WeightTable& table, std::string& err) {
+    if (tp_ == nullptr) return true;   // solo: the recurrence reads the full tables and maps model heads itself
+    const GdnHeadSlice& sl = tp_->gdn;
+    if (tp_->g_full == nullptr || sl.nk <= 0 || sl.h_k <= 0 || sl.h_v <= 0 || sl.s <= 0 ||
+        sl.h_v % sl.h_k != 0 || sl.nv() % sl.nk != 0 || sl.h_v / sl.h_k != sl.nv() / sl.nk) {
+        err = "verify: the pair card has no usable GDN head slice to gather its head parameters by";
+        return false;
+    }
+    const ModelGeometry& gf = *tp_->g_full;
+    const int64_t row_alpha = gf.n_embd * 2;   // fp16 rows of ssm_alpha / ssm_beta
+    const int64_t row_scal = 4;                // fp32 entries of ssm_dt.bias / ssm_a
+    const uint64_t n_gdn = (uint64_t) gf.n_gdn_layers();
+    const std::vector<GdnRun> rows = gdn_vhead_runs(sl, 1);   // the card's model-head rows, in packed order
+    const uint64_t block = n_gdn * (uint64_t) sl.nv() * (uint64_t) (2 * row_alpha + 2 * row_scal);
+    if (tp_gdn_par_ != nullptr) { cudaFree(tp_gdn_par_); tp_gdn_par_ = nullptr; }
+    if (cudaMalloc(&tp_gdn_par_, (size_t) block) != cudaSuccess) {
+        cudaGetLastError();
+        err = "verify: the pair card's GDN head-parameter gather block (" + std::to_string(block / 1048576) +
+              " MiB) did not allocate";
+        return false;
+    }
+    auto* out = static_cast<uint8_t*>(tp_gdn_par_);
+    tp_->gdn_par.assign((size_t) n_gdn, FnGdnPar{});
+    uint64_t off = 0;
+    int64_t gi = 0;
+    for (int64_t l = 0; l < gf.n_layers; ++l) {
+        if (is_qsa_layer(gf, l)) continue;
+        const LayerView v(table, l);
+        struct Item { const char* name; int64_t row_bytes; int64_t heads; };
+        const Item items[4] = {{"ssm_alpha.weight", row_alpha, gf.ssm_v_heads},
+                               {"ssm_beta.weight", row_alpha, gf.ssm_v_heads},
+                               {"ssm_dt.bias", row_scal, gf.ssm_v_heads},
+                               {"ssm_a", row_scal, gf.ssm_v_heads}};
+        FnGdnPar& P = tp_->gdn_par[(size_t) gi];
+        for (int it = 0; it < 4; ++it) {
+            const WeightRef* w = v.get(items[it].name);
+            const int64_t rb = items[it].row_bytes;
+            // ssm_alpha/beta are [n_embd][heads] (ne1 == heads); ssm_dt.bias/ssm_a are 1-D float[heads]
+            // (ne1 == 0, ne0 == heads).  bytes == heads * row_bytes validates BOTH layouts; do not
+            // require ne1 == heads, which rejects the valid 1-D scalars.
+            const bool layout_ok = w != nullptr && w->data != nullptr &&
+                w->bytes == (uint64_t) items[it].heads * (uint64_t) rb &&
+                (w->ne1 == items[it].heads || (w->ne1 <= 1 && w->ne0 == items[it].heads));
+            if (!layout_ok) {
+                err = "verify: pair GDN layer " + std::to_string(l) + " has no full head table for " +
+                      items[it].name + " to gather (bytes=" + std::to_string(w ? (long long) w->bytes : -1) +
+                      ", ne1=" + std::to_string(w ? (long long) w->ne1 : -1) + ", want heads=" +
+                      std::to_string(items[it].heads) + ")";
+                return false;
+            }
+            uint8_t* dst = out + off;
+            int64_t got = 0;
+            for (const GdnRun& r : rows) {
+                const void* src = static_cast<const uint8_t*>(w->data) + (uint64_t) r.start * (uint64_t) rb;
+                if (cudaMemcpy2DAsync(dst + (uint64_t) got * (uint64_t) rb, (size_t) rb, src, (size_t) rb,
+                                      (size_t) rb, (size_t) r.len, cudaMemcpyDeviceToDevice,
+                                      (cudaStream_t) cs_) != cudaSuccess) {
+                    err = "verify: the pair card could not gather " + std::string(items[it].name) + " of GDN layer " +
+                          std::to_string(l) + ": " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                got += r.len;
+            }
+            if (got != sl.nv()) {
+                err = "verify: the pair's head-row runs gathered " + std::to_string(got) + " rows of " +
+                      items[it].name + ", the card holds " + std::to_string(sl.nv());
+                return false;
+            }
+            if (it == 0) P.alpha = reinterpret_cast<const uint16_t*>(dst);
+            else if (it == 1) P.beta = reinterpret_cast<const uint16_t*>(dst);
+            else if (it == 2) P.dt = reinterpret_cast<const float*>(dst);
+            else P.a = reinterpret_cast<const float*>(dst);
+            off += (uint64_t) sl.nv() * (uint64_t) rb;
+        }
+        ++gi;
+    }
+    if ((uint64_t) gi != n_gdn || off != block) {
+        err = "verify: the pair's GDN head-parameter gather sized " + std::to_string(off) + " bytes for " +
+              std::to_string(gi) + " layers, the block is " + std::to_string(block) + " for " +
+              std::to_string(n_gdn);
+        return false;
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: the pair's GDN head-parameter gather did not land: " +
+              std::string(cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    basalt::log::info("basalt verify", "tensor pair: CUDA%d holds its own %lld of every GDN head row (%lld layers, "
+                           "%.1f MiB) in its packed head order",
+                      device_, (long long) sl.nv(), (long long) gi, (double) block / 1048576.0);
     return true;
 }
 

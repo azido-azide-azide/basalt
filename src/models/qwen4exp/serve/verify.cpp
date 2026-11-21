@@ -183,6 +183,20 @@ int QfnRuntime::init_verify() {
         // the runtime member does).
         fn_tp_role[0] = {&fn_tp->mb, 0, fn_tp->g_full, {0, 0}, nullptr, &peer.residency()};
         fn_tp_role[1] = {&fn_tp->mb, 1, fn_tp->g_full, {0, 0}, nullptr, &host_res};
+        // each card's GDN head range is THE cut the loader sliced its rows by (plan::fn_rank_plan, the same
+        // call load/layer_plan.cpp made for rank 0 and load/weights.cpp for rank 1), so the recorder's
+        // activation-first exchange and the head-parameter gather can neither invent nor re-derive which model
+        // heads the card holds - re-deriving "the card holds heads [rank * 24, rank * 24 + 24)" is what made
+        // the pair's attention output wrong on both cards from the first window.
+        for (int r = 0; r < 2; ++r) {
+            std::string perr;
+            const basalt::plan::FnRankPlan rp = basalt::plan::fn_rank_plan(*fn_tp->g_full, 2, r, perr);
+            if (!perr.empty()) {
+                basalt::log::error("basalt serve", "tensor pair: no GDN head plan for card %d: %s", r, perr.c_str());
+                return 1;
+            }
+            fn_tp_role[r].gdn = rp.gdn;
+        }
         ver.set_tp(&fn_tp_role[0]);   // before init: init carves the exchange's scratch for the full rows (32c-2)
     }
     ver.set_cpu_warm(drive.d.pool, drive.d.src);
@@ -215,6 +229,10 @@ int QfnRuntime::init_verify() {
     }
     if (pipe_on && !ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err)) {
         basalt::log::error("basalt serve", "pipelined windows: %s", err.c_str());
+        return 1;
+    }
+    if (fn_tp != nullptr && !ver.tp_gather_gdn_params(wt, err)) {   // rank 0's GDN head rows, in its packed order
+        basalt::log::error("basalt serve", "tensor pair, CUDA0: %s", err.c_str());
         return 1;
     }
     if (fn_tp != nullptr && !init_pair_rank1())   // rank 1's session, verifier and roles (32c-3)
@@ -359,6 +377,12 @@ bool QfnRuntime::init_pair_rank1() {
     ver_tp.set_own_tier(&peer);   // before init: dm_init's residency gate and res0/ptab0 source (32c-4)
     ver_tp.set_tp(&fn_tp_role[1]);   // before init, like rank 0's (init carves the exchange scratch)
     if (!ver_tp.init(fn_tp->wt, cg, ss_tp, vh_tp, nullptr, std::max({o.spec, o.batch, 2}), err)) {
+        basalt::log::error("basalt serve", "tensor pair, CUDA%d: %s", fn_tp->dev, err.c_str());
+        return false;
+    }
+    // rank 1's GDN head rows come from ITS table (the twin's arena holds the replicated 48-head vectors);
+    // this runs inside the function's OnDevice(fn_tp->dev) scope, like its init
+    if (!ver_tp.tp_gather_gdn_params(fn_tp->wt, err)) {
         basalt::log::error("basalt serve", "tensor pair, CUDA%d: %s", fn_tp->dev, err.c_str());
         return false;
     }

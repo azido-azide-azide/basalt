@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <cstdlib>
 
 namespace basalt::core {
 using namespace verify_detail;
@@ -66,6 +67,7 @@ Verifier::~Verifier() {
     for (auto& kv : commit_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
     if (arena_b_) cudaFree(arena_b_);
+    if (tp_gdn_par_) cudaFree(tp_gdn_par_);   // the pair's gathered GDN head rows (not this card's current device: cudaFree is not bound)
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (row_bias_device_) cudaFree(row_bias_device_);
     if (lp_buf_) cudaFree(lp_buf_);
@@ -288,6 +290,27 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const size_t np = (size_t) g.n_layers * kProfPer + 8;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
+    }
+    if (std::getenv("BASALT_TP_DIAG") != nullptr) {   // per-layer residual-norm probe (pair debugging)
+        if (cudaMalloc((void**) &tp_diag_, (size_t) g.n_layers * 8 * sizeof(float)) != cudaSuccess) {
+            tp_diag_ = nullptr; cudaGetLastError();
+        }
+        if (cudaMalloc((void**) &tp_diag_ent_, (size_t) 3 * 10 * sizeof(float)) != cudaSuccess) {
+            tp_diag_ent_ = nullptr; cudaGetLastError();
+        }
+        if (cudaMalloc((void**) &tp_diag_plan_, (size_t) g.n_layers * (sizeof(basalt::kernels::DmPlan) / 4) * sizeof(int32_t)) != cudaSuccess) {
+            tp_diag_plan_ = nullptr; cudaGetLastError();
+        }
+        if (cudaMalloc((void**) &tp_diag_res_,
+                       ((size_t) 3 * 2 * g.n_expert + 3 * 16) * sizeof(int32_t)) != cudaSuccess) {   // res rows + w_ bits
+            tp_diag_res_ = nullptr; cudaGetLastError();
+        }
+        if (cudaMalloc((void**) &tp_diag_bits_, (size_t) 3 * 288 * sizeof(int32_t)) != cudaSuccess) {   // v7 bits
+            tp_diag_bits_ = nullptr;
+        }
+        if (cudaMalloc((void**) &tp_diag_h1_, (size_t) 3 * 96 * sizeof(int32_t)) != cudaSuccess) {   // v17 hashes
+            tp_diag_h1_ = nullptr; cudaGetLastError();
+        }
     }
     Bump real;
     real.base = (uint8_t*) arena_;

@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <utility>
 #include <vector>
@@ -277,6 +278,63 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             if (pool != nullptr)
                 pool(user, dm_->h_x + (size_t) k * dm_->x_stride, R.ids, n, ss.k, h_ymiss_, l);
             sink_.ext_kind = nullptr;
+            if (tp_diag_ != nullptr) {   // BASALT_TP_DIAG: did the CPU pool fill its miss rows? (host buffer)
+                double sy = 0; const int64_t yn = (int64_t) n * ss.k * g.n_embd;
+                for (int64_t i = 0; i < yn; ++i) sy += (double) h_ymiss_[i] * h_ymiss_[i];
+                basalt::log::raw("TPPOOL rank=%d l=%lld n_vram=%d n_peer=%d pool=%d ymiss=%.6f",
+                                 tp_ != nullptr ? tp_->rank : -1, (long long) l, (int) R.n_vram, (int) R.n_peer,
+                                 pool != nullptr, std::sqrt(sy));
+                int k0 = 0, k1 = 0, kcpu = 0, kskip = 0, kpeer = 0;
+                for (int i = 0; i < n * ss.k; ++i) {
+                    const int kd = R.kind[i];
+                    if (kd == 0) ++k0; else if (kd == 1) ++k1; else if (kd == -1) ++kcpu;
+                    else if (kd == 8) ++kskip; else if (kd >= 2) ++kpeer;
+                }
+                basalt::log::raw("TPKIND rank=%d l=%lld k0=%d k1=%d cpu=%d skip=%d peer=%d",
+                                 tp_ != nullptr ? tp_->rank : -1, (long long) l, k0, k1, kcpu, kskip, kpeer);
+                const auto* hp = reinterpret_cast<const basalt::kernels::DmPlan*>(h_plan_);
+                char kbuf[160] = {0}, dbuf[160] = {0}; int ko = 0, dd = 0;
+                for (int i = 0; i < ss.k; ++i) {
+                    ko += std::snprintf(kbuf + ko, sizeof(kbuf) - ko, "%d ", hp->kind[i]);
+                    dd += std::snprintf(dbuf + dd, sizeof(dbuf) - dd, "%d ", hp->dst[i]);
+                }
+                basalt::log::raw("TPPLAN rank=%d l=%lld cnt=[%d,%d,%d,%d] kind=[%s] dst=[%s]",
+                                 tp_ != nullptr ? tp_->rank : -1, (long long) l,
+                                 hp->counts[0], hp->counts[1], hp->counts[2], hp->counts[3], kbuf, dbuf);
+                if (n == 1 && ss.k == 10 && l < 3) {   // the ring's rows: ids, the TRUE ring tiers, the pool's row norms
+                    const int rank = tp_ != nullptr ? tp_->rank : -1;
+                    char ib[128], yb[160], rb[64]; int io = 0, yo = 0, ro = 0;
+                    for (int i = 0; i < 10; ++i) {
+                        io += std::snprintf(ib + io, sizeof(ib) - io, "%d ", R.ids[i]);
+                        ro += std::snprintf(rb + ro, sizeof(rb) - ro, "%d ", R.kind[i]);
+                        double s = 0;
+                        for (int64_t c = 0; c < g.n_embd; ++c) {
+                            const double q = h_ymiss_[(size_t) i * g.n_embd + c];
+                            s += q * q;
+                        }
+                        yo += std::snprintf(yb + yo, sizeof(yb) - yo, "%.4f ", std::sqrt(s));
+                    }
+                    basalt::log::raw("TPENTS rank=%d ord=%llu l=%lld ring=%d ids=[%s] ringk=[%s] yrows=[%s]",
+                                     rank, (unsigned long long) (tp_ord_ + 1), (long long) l, (int) k, ib, rb, yb);
+                    if (!dm_->shadow0.empty()) {   // the two cards' residency tables, as the route read them
+                        const int ne = (int) g.n_expert;
+                        const int32_t* s0 = dm_->shadow0.data() + (size_t) l * ne;
+                        const int32_t* s1 = dm_->shadow1.size() >= (size_t) (l + 1) * ne
+                                                ? dm_->shadow1.data() + (size_t) l * ne : nullptr;
+                        int both = 0, only0 = 0, only1 = 0;
+                        for (int e = 0; e < ne; ++e) {
+                            const bool h0 = s0[e] >= 0, h1 = s1 != nullptr && s1[e] >= 0;
+                            both += h0 && h1; only0 += h0 && !h1; only1 += !h0 && h1;
+                        }
+                        char a0[128], a1[128]; int o0 = 0, o1 = 0;
+                        for (int i = 0; i < 10 && s1 != nullptr; ++i)
+                            o0 += std::snprintf(a0 + o0, sizeof(a0) - o0, "%d ", s0[R.ids[i]]),
+                            o1 += std::snprintf(a1 + o1, sizeof(a1) - o1, "%d ", s1[R.ids[i]]);
+                        basalt::log::raw("TPTIER rank=%d l=%lld both=%d onlyOwn=%d onlyTwin=%d own=[%s] twin=[%s]",
+                                         rank, (long long) l, both, only0, only1, a0, a1);
+                    }
+                }
+            }
         } else if (pool != nullptr)
             pool(user, h_x_, h_ids_, n, ss.k,
                  h_ymiss_, l);
@@ -373,6 +431,142 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
         return false;
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (tp_diag_ != nullptr) {   // BASALT_TP_DIAG: dump this window's per-layer norms (rank -1 = solo)
+        std::vector<float> nd((size_t) g.n_layers * 8);
+        cudaMemcpy(nd.data(), tp_diag_, nd.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        const int rank = tp_ != nullptr ? tp_->rank : -1;
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            basalt::log::raw("TPDIAG rank=%d T=%d pos=%lld l=%lld nR=%.6f nBo=%.6f nParts=%.6f nW=%.6f nBoPre=%.6f nMix=%.6f nLogits=%.6f",
+                             rank, T, (long long) pos0,
+                             (long long) l, std::sqrt((double) nd[8 * l]), std::sqrt((double) nd[8 * l + 1]),
+                             std::sqrt((double) nd[8 * l + 2]), std::sqrt((double) nd[8 * l + 3]),
+                             std::sqrt((double) nd[8 * l + 4]), std::sqrt((double) nd[8 * l + 6]),
+                             std::sqrt((double) nd[8 * l + 7]));
+        if (tp_diag_ent_ != nullptr && T == 1 && g.n_expert == 512) {   // the entry rows the pass wrote
+            std::vector<float> ed(3 * 10);
+            cudaMemcpy(ed.data(), tp_diag_ent_, ed.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            for (int64_t l = 0; l < 3; ++l) {
+                char b[256]; int o = 0;
+                for (int j = 0; j < 10; ++j)
+                    o += std::snprintf(b + o, sizeof(b) - o, "%.4f ", std::sqrt((double) ed[10 * l + j]));
+                basalt::log::raw("TPENT rank=%d pos=%lld l=%lld rows=[%s]", rank, (long long) pos0, (long long) l, b);
+            }
+        }
+        if (tp_diag_plan_ != nullptr) {   // the device plans the combine reads: layers 0..2, the window's first entries
+            std::vector<int32_t> pd((size_t) g.n_layers * (sizeof(basalt::kernels::DmPlan) / 4));
+            cudaMemcpy(pd.data(), tp_diag_plan_, pd.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+            const int rank = tp_ != nullptr ? tp_->rank : -1;
+            for (int64_t l = 0; l < 3; ++l) {
+                const auto* P = reinterpret_cast<const basalt::kernels::DmPlan*>(
+                    pd.data() + l * (sizeof(basalt::kernels::DmPlan) / 4));
+                char kb[128], db[128], tb[128], sb[96]; int ko = 0, do_ = 0, to = 0, so = 0;
+                for (int j = 0; j < 10; ++j) {
+                    ko += std::snprintf(kb + ko, sizeof(kb) - ko, "%d ", P->kind[j]);
+                    do_ += std::snprintf(db + do_, sizeof(db) - do_, "%d ", P->dst[j]);
+                    to += std::snprintf(tb + to, sizeof(tb) - to, "%d ", P->tok[j]);
+                }
+                for (int j = 0; j <= 4; ++j) so += std::snprintf(sb + so, sizeof(sb) - so, "%d ", P->start[j]);
+                basalt::log::raw("TPPLAN2 rank=%d pos=%lld l=%lld cnt=[%d,%d,%d,%d] kind=[%s] dst=[%s] tok=[%s] start=[%s]",
+                                 rank, (long long) pos0, (long long) l, P->counts[0], P->counts[1], P->counts[2],
+                                 P->counts[3], kb, db, tb, sb);
+            }
+            if (tp_diag_res_ != nullptr && T == 1 && g.n_expert == 512 && lb_ == 0) {
+                if (tp_diag_bits_ != nullptr) {   // v6: raw fp32 bits of the router logits + mix + xn heads
+                    std::vector<int32_t> bd(3 * 288);
+                    std::vector<int32_t> h1(3 * 96);
+                    if (tp_diag_h1_ != nullptr) cudaMemcpy(h1.data(), tp_diag_h1_, h1.size() * 4, cudaMemcpyDeviceToHost);
+                    const bool gdn_f = tp_ord_ < 8 || tp_ord_ == 78;   // v15: GDN fields only on real early windows
+                    cudaMemcpy(bd.data(), tp_diag_bits_, bd.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                    for (int64_t l = 0; l < 3; ++l) {
+                        char bb[1100];
+                        int o = 0;
+                        for (int q = 0; q < 8; ++q) {
+                            float f;
+                            std::memcpy(&f, &bd[l * 288 + 120 + q], 4);
+                            o += std::snprintf(bb + o, sizeof(bb) - o, "%.7g ", f);
+                        }
+                        o += std::snprintf(bb + o, sizeof(bb) - o, "| wM=");
+                        for (int q = 0; q < 4; ++q)
+                            o += std::snprintf(bb + o, sizeof(bb) - o, "%08x", (unsigned) bd[l * 288 + 56 + q]);
+                        o += std::snprintf(bb + o, sizeof(bb) - o, " xqM=");
+                        for (int q = 0; q < 4; ++q)
+                            o += std::snprintf(bb + o, sizeof(bb) - o, "%08x", (unsigned) bd[l * 288 + 60 + q]);
+                        o += std::snprintf(bb + o, sizeof(bb) - o, "| rffn=");
+                        for (int q = 0; q < 8; ++q) {
+                            float f;
+                            std::memcpy(&f, &bd[l * 288 + 40 + q], 4);
+                            o += std::snprintf(bb + o, sizeof(bb) - o, "%.6g ", f);
+                        }
+                        o += std::snprintf(bb + o, sizeof(bb) - o, "| boA=");
+                        for (int q = 0; q < 8; ++q) {
+                            float f;
+                            std::memcpy(&f, &bd[l * 288 + 48 + q], 4);
+                            o += std::snprintf(bb + o, sizeof(bb) - o, "%.6g ", f);
+                        }
+                        o += std::snprintf(bb + o, sizeof(bb) - o, "| wRt=%08x%08x%08x%08x",
+                                           (unsigned) bd[l * 288 + 56], (unsigned) bd[l * 288 + 57],
+                                           (unsigned) bd[l * 288 + 58], (unsigned) bd[l * 288 + 59]);
+                        if (gdn_f)
+                            o += std::snprintf(bb + o, sizeof(bb) - o, "| mxA=%08x%08x%08x%08x| qkv=%08x%08x%08x%08x zH=%08x%08x%08x%08x mA=%08x%08x%08x%08x mB=%08x%08x%08x%08x wout=%08x%08x%08x%08x xq=%08x%08x%08x%08x%08x%08x%08x%08x y16=%08x%08x%08x%08x y16t=%08x%08x%08x%08x y168=%08x%08x%08x%08x y1623=%08x%08x%08x%08x",
+                            (unsigned) bd[l * 288 + 60], (unsigned) bd[l * 288 + 61], (unsigned) bd[l * 288 + 62], (unsigned) bd[l * 288 + 63],
+                            (unsigned) bd[l * 288 + 64], (unsigned) bd[l * 288 + 65], (unsigned) bd[l * 288 + 66], (unsigned) bd[l * 288 + 67],
+                            (unsigned) bd[l * 288 + 72], (unsigned) bd[l * 288 + 73], (unsigned) bd[l * 288 + 74], (unsigned) bd[l * 288 + 75],
+                            (unsigned) bd[l * 288 + 80], (unsigned) bd[l * 288 + 81], (unsigned) bd[l * 288 + 82], (unsigned) bd[l * 288 + 83],
+                            (unsigned) bd[l * 288 + 88], (unsigned) bd[l * 288 + 89], (unsigned) bd[l * 288 + 90], (unsigned) bd[l * 288 + 91],
+                            (unsigned) bd[l * 288 + 96], (unsigned) bd[l * 288 + 97], (unsigned) bd[l * 288 + 98], (unsigned) bd[l * 288 + 99],
+                            (unsigned) bd[l * 288 + 104], (unsigned) bd[l * 288 + 105], (unsigned) bd[l * 288 + 106], (unsigned) bd[l * 288 + 107],
+                            (unsigned) bd[l * 288 + 108], (unsigned) bd[l * 288 + 109], (unsigned) bd[l * 288 + 110], (unsigned) bd[l * 288 + 111],
+                            (unsigned) bd[l * 288 + 112], (unsigned) bd[l * 288 + 113], (unsigned) bd[l * 288 + 114], (unsigned) bd[l * 288 + 115],
+                            (unsigned) bd[l * 288 + 116], (unsigned) bd[l * 288 + 117], (unsigned) bd[l * 288 + 118], (unsigned) bd[l * 288 + 119],
+                            (unsigned) bd[l * 288 + 120], (unsigned) bd[l * 288 + 121], (unsigned) bd[l * 288 + 122], (unsigned) bd[l * 288 + 123],
+                            (unsigned) bd[l * 288 + 124], (unsigned) bd[l * 288 + 125], (unsigned) bd[l * 288 + 126], (unsigned) bd[l * 288 + 127]);
+                        basalt::log::raw("TPBITS rank=%d ord=%llu pos=%lld l=%lld bo8=[%s]", rank,
+                                         (unsigned long long) (tp_ord_ + 1), (long long) pos0, (long long) l, bb);
+                        {
+                            char xb[1300]; int xo = 0;
+                            xo += std::snprintf(xb + xo, sizeof(xb) - xo, "TPXQ rank=%d ord=%llu pos=%lld l=%lld xqr=", rank,
+                                                (unsigned long long) (tp_ord_ + 1), (long long) pos0, (long long) l);
+                            for (int q = 0; q < 144; ++q) xo += std::snprintf(xb + xo, sizeof(xb) - xo, "%08x", (unsigned) bd[l * 288 + 128 + q]);
+                            basalt::log::raw("%s", xb);
+                        }
+                        {
+                            char hb[900]; int ho = 0;
+                            ho += std::snprintf(hb + ho, sizeof(hb) - ho, "xq=");
+                            for (int q = 0; q < 48; ++q) ho += std::snprintf(hb + ho, sizeof(hb) - ho, "%08x", (unsigned) h1[l * 96 + q]);
+                            ho += std::snprintf(hb + ho, sizeof(hb) - ho, " wt=");
+                            for (int q = 0; q < 40; ++q) ho += std::snprintf(hb + ho, sizeof(hb) - ho, "%08x", (unsigned) h1[l * 96 + 48 + q]);
+                            ho += std::snprintf(hb + ho, sizeof(hb) - ho, " ptr=%08x%08x", (unsigned) h1[l * 96 + 88], (unsigned) h1[l * 96 + 89]);
+                            basalt::log::raw("TPHASH rank=%d ord=%llu pos=%lld l=%lld %s", rank,
+                                             (unsigned long long) (tp_ord_ + 1), (long long) pos0, (long long) l, hb);
+                        }
+                    }
+                    {   // HARNESS SELF-CHECK: the raw-byte slots must still hold exactly the bytes the probe
+                        // hashed.  Runs 20-23 each chased a phantom capture and drew conclusions from data that
+                        // could not be validated; the cause was a writer left on the old 128-slot stride, which
+                        // landed layer 1's router logits INSIDE layer 0's captured head rows.  A unit the probe
+                        // zeroed (the gs serve's heads past its own row) has no bytes to compare: skipped.
+                        static const int kSelfHeads[4] = {0, 8, 24, 32};
+                        auto fnv_unit = [](const int32_t* w) {
+                            int32_t h = 0;
+                            for (int i = 0; i < 36; ++i) h = h * 16777619 + w[i];   // diag_hash_u8 over 144 B
+                            return h;
+                        };
+                        int self_ok = 0, self_tot = 0;
+                        for (int64_t l = 0; l < 3; ++l)
+                            for (int q = 0; q < 4; ++q) {
+                                const int32_t want = h1[l * 96 + kSelfHeads[q]];
+                                if (want == 0) continue;
+                                ++self_tot;
+                                if (fnv_unit(bd.data() + l * 288 + 128 + 36 * q) == want) ++self_ok;
+                            }
+                        basalt::log::raw("TPSELF rank=%d ord=%llu ok=%d/%d", rank,
+                                         (unsigned long long) (tp_ord_ + 1), self_ok, self_tot);
+                    }
+                }
+                ++tp_ord_;
+            }
+        }
+    }
     if (!ar_plan_intact(err)) return false;
     constexpr int64_t wstat_every = 200;   // windows per report
     if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == wstat_every)) {

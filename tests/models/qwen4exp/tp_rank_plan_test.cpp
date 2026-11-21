@@ -146,6 +146,81 @@ int main() {
     p0.placement("mystery.thing.weight", 0, &unk);
     ok(unk, "unknown names are named as unknown");
 
+    // ---- the head map a PAIR RUNTIME owes the plan (tp-10) ---------------------------------------------
+    // The plan cuts GDN value heads by KEY-head group (core::gdn_head_split: value head v reads key head
+    // v % h_k), so a card's packed local head p is model head (p / nk) * h_k + k0 + p % nk - NOT
+    // rank * nv + p.  Everywhere the pair touches a REPLICATED full-width object (a per-head parameter row
+    // of ssm_alpha / ssm_beta / ssm_dt.bias / ssm_a, or the replicated ssm_out's columns) it must address
+    // that model head.  Two places did the contiguous arithmetic instead, which is the pair's token salad:
+    // the recurrence's `hv0 = rank * HV` offset, and tp_assemble's `off = rank * half`.
+    {
+        const core::GdnHeadSlice* cards[2] = {&p0.gdn, &p1.gdn};
+        ok(p0.gdn.h_k == 16 && p0.gdn.h_v == 48 && p0.gdn.nk == 8 && p0.gdn.nv() == 24 && p0.gdn.s == 128,
+           "the pair's GDN slice: 16 model key heads with 8 per card, 48 value heads with 24 per card");
+        std::vector<char> named((size_t) g.ssm_v_heads, 0);
+        bool once = true;
+        for (const core::GdnHeadSlice* c : cards)
+            for (int64_t p = 0; p < c->nv(); ++p) {
+                const int64_t h = core::gdn_local_head(*c, p);
+                if (h < 0 || h >= (int64_t) g.ssm_v_heads || named[(size_t) h]++) once = false;
+            }
+        ok(once, "the two cards' packed local heads name every model value head exactly once");
+
+        bool agrees = true;
+        for (const core::GdnHeadSlice* c : cards) {
+            int64_t at = 0;
+            for (const core::GdnRun& r : core::gdn_vhead_runs(*c, 1))
+                for (int64_t i = 0; i < r.len; ++i, ++at)
+                    if (core::gdn_local_head(*c, at) != r.start + i) agrees = false;
+        }
+        ok(agrees, "gdn_local_head reproduces gdn_vhead_runs' packed order, element for element");
+
+        int moved = 0;
+        for (int r = 0; r < 2; ++r)
+            for (int64_t p = 0; p < cards[r]->nv(); ++p)
+                if (core::gdn_local_head(*cards[r], p) != (int64_t) r * cards[r]->nv() + p) ++moved;
+        ok(moved == 32, "a key-head-group cut moves 32 of the 48 heads off the contiguous block (the damage "
+                        "a rank * nv offset did)");
+
+        bool placed = true;
+        std::vector<char> owned((size_t) g.ssm_value_dim, 0);
+        for (int r = 0; r < 2; ++r) {
+            const core::GdnHeadSlice& c = *cards[r];
+            int64_t sg = 0, dg = 0, base = 0;
+            core::gdn_place_groups(c, sg, dg, base);
+            ok(sg == (int64_t) c.nk * c.s && dg == (int64_t) c.h_k * c.s && base == (int64_t) c.k0 * c.s,
+               "the group strides are nk * s, h_k * s and k0 * s");
+            for (int64_t p = 0; p < c.nv() && placed; ++p)
+                for (int64_t e = 0; e < c.s; ++e)
+                    if (core::gdn_grouped_src_col(core::gdn_local_col(c, p) + e, sg, dg, base) != p * c.s + e)
+                        placed = false;
+            for (int64_t col = 0; col < (int64_t) c.h_v * c.s; ++col) {
+                const int64_t src = core::gdn_grouped_src_col(col, sg, dg, base);
+                if (src < 0) continue;
+                if (src >= (int64_t) c.nv() * c.s || owned[(size_t) col]++) placed = false;
+            }
+        }
+        ok(placed, "every card head lands on its OWN columns of the full row, and no column lands twice");
+        bool covers = owned.size() == (size_t) g.ssm_value_dim;
+        for (char o : owned)
+            if (o != 1) covers = false;
+        ok(covers, "the pair's grouped placements partition the replicated projection's column axis exactly once");
+
+        {   // with one value head per key head the cut IS contiguous: the two forms must agree, so this fix
+            // cannot change a model whose GDN has no key-head grouping
+            const core::GdnHeadSlice one{8, 8, 128, 4, 4};
+            int64_t sg = 0, dg = 0, base = 0;
+            core::gdn_place_groups(one, sg, dg, base);
+            bool same = true;
+            for (int64_t col = 0; col < (int64_t) one.h_v * one.s; ++col) {
+                const int64_t grouped = core::gdn_grouped_src_col(col, sg, dg, base);
+                const int64_t plain = (col >= base && col < base + (int64_t) one.nv() * one.s) ? col - base : -1;
+                if (grouped != plain) same = false;
+            }
+            ok(same, "with h_v == h_k the grouped placement and rank * half are the same function");
+        }
+    }
+
     std::printf(failures ? "FAILED\n" : "all ok\n");
     return failures ? 1 : 0;
 }

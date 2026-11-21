@@ -48,8 +48,11 @@ struct Verifier::WindowRecorder {
     const int64_t ZVF = gf.ssm_value_dim, NHDF = (int64_t) gf.n_head * gf.head_dim;
     /// Activation-first mixer exchange: place the card's `half_dim`-wide head rows (`src`, bf16 or fp32, row
     /// stride half_dim) at the model's head slot of a full row, sum the pair's rows over the mailbox, widen
-    /// and quantize the result (full_dim wide) into xq_ for the replicated projection.
-    bool tp_assemble(int64_t half_dim, int64_t full_dim, const void* src, bool src_bf16, int site);
+    /// and quantize the result (full_dim wide) into xq_ for the replicated projection.  A GDN layer's rows pass
+    /// `gdn_heads`: its card's heads are a key-head-group cut, so their model slots are strided, not the
+    /// contiguous `rank * half_dim` (see tp_assemble's comment in record.cpp).
+    bool tp_assemble(int64_t half_dim, int64_t full_dim, const void* src, bool src_bf16, int site,
+                     bool gdn_heads = false);
     const kernels::QsaShapes s = verify_detail::shapes_of(g);
     const kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +

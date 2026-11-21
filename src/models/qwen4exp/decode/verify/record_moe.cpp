@@ -132,6 +132,37 @@ bool Verifier::WindowRecorder::post(int64_t l) {
         stamp(l, 20);
         stamp(l, 21);
         stamp(l, 22);
+        if (v_.tp_diag_ != nullptr) {   // BASALT_TP_DIAG: VRAM expert rows + router weights norms
+            basalt::kernels::diag_norm(v_.parts_, (int) (n * K * N), v_.tp_diag_ + 8 * l + 2, cs);
+            basalt::kernels::diag_norm(v_.w_, (int) (n * K), v_.tp_diag_ + 8 * l + 3, cs);
+            if (v_.shared_ != nullptr)   // the shared expert's row this combine adds (rank 1: never written)
+                basalt::kernels::diag_norm(v_.shared_, (int) (n * N), v_.tp_diag_ + 8 * l + 5, cs);
+            // v5: the layer's FFN input row and the router's full logits — the pre-MoE fingerprints that
+            // localize a pair-vs-solo divergence to the attention/mixer stage instead of the experts.
+            basalt::kernels::diag_norm(v_.mixed_, (int) (n * N), v_.tp_diag_ + 8 * l + 6, cs);
+            if (v_.logits_ != nullptr && g.n_expert == 512)
+                basalt::kernels::diag_norm(v_.logits_, (int) (n * g.n_expert), v_.tp_diag_ + 8 * l + 7, cs);
+        }
+        if (v_.tp_diag_res_ != nullptr && l < 3) {   // the rows the route read, verbatim, + this layer's w_ bits
+            basalt::kernels::diag_copy_i32(v_.dm_->res0 + l * (int64_t) g.n_expert,
+                                           v_.tp_diag_res_ + (2 * l) * g.n_expert, (int) g.n_expert, cs);
+            if (v_.dm_->res1 != nullptr)
+                basalt::kernels::diag_copy_i32(v_.dm_->res1 + l * (int64_t) g.n_expert,
+                                               v_.tp_diag_res_ + (2 * l + 1) * g.n_expert, (int) g.n_expert, cs);
+            basalt::kernels::diag_copy_i32((const int32_t*) v_.w_,
+                                           v_.tp_diag_res_ + 3 * 2 * g.n_expert + l * 16, (int) (n * K), cs);
+        }
+        if (v_.tp_diag_bits_ != nullptr && l < 3) {   // v6b: router logits + the mixer output (xn was always zero)
+            basalt::kernels::diag_copy_i32((const int32_t*) v_.logits_, v_.tp_diag_bits_ + l * 288, 16, cs);
+            basalt::kernels::diag_copy_i32((const int32_t*) v_.mixed_, v_.tp_diag_bits_ + l * 288 + 16, 8, cs);
+        }
+        if (v_.tp_diag_ent_ != nullptr && n == 1 && K == 10 && l < 3)   // the 10 expert rows' own norms: which
+            for (int j = 0; j < 10; ++j)                                 // entry index the pass really wrote
+                basalt::kernels::diag_norm(v_.parts_ + (size_t) j * N, (int) N, v_.tp_diag_ent_ + 10 * l + j, cs);
+        if (v_.tp_diag_plan_ != nullptr)   // BASALT_TP_DIAG: snapshot the device plan the combine reads
+            basalt::kernels::diag_copy_i32((const int32_t*) v_.dm_->plan,
+                                           v_.tp_diag_plan_ + l * (sizeof(basalt::kernels::DmPlan) / 4),
+                                           (int) (sizeof(basalt::kernels::DmPlan) / 4), cs);
     } else if (v_.ar_on()) {
         stamp(l, 19);
         grouped(p_ptr, p_start, p_counts, 0, parts_out);
@@ -198,6 +229,8 @@ bool Verifier::WindowRecorder::post(int64_t l) {
                             ring, cs, !v_.dm_->tags, tag_done, v_.dm_->tags ? v_.m_flag_ : nullptr, v_.dm_->cseen,
                             sh_read ? v_.sh_g_ : nullptr);
         } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        if (v_.tp_diag_ != nullptr)   // BASALT_TP_DIAG: the card's own MoE partial BEFORE the pair's FP32 add
+            basalt::kernels::diag_norm(v_.bo_, (int) (n * N), v_.tp_diag_ + 8 * l + 4, cs);
         // the pair's symmetric FP32 MoE partial-sum exchange (32c-4): each card's bo_ rows are now its
         // PARTIAL of this layer's MoE output (every routed expert entered exactly one card's plan by the
         // route kernel's kDmSkip partition, the shared expert only rank 0's combine).  Enqueued right after

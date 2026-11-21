@@ -25,6 +25,7 @@
 #include <cstdio>
 
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/gdn_head_split.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
 #include "basalt/kernels/sampler.hpp"
@@ -123,6 +124,14 @@ public:
     /// A further peer card's expert tier, served like the first by a persistent kernel of its own (its own ring,
     /// doorbell and done word); only with the device-planned MoE tail.  Before init, after set_peer.
     void add_peer(PeerExperts* peer) { xpeers_.push_back(peer); }
+    /// The card's own head rows of one GDN layer's head-indexed parameter tables, gathered into its PACKED
+    /// head order (see FnTp::gdn_par).  `alpha`/`beta` are n_embd halves per head, `dt`/`a` one float.
+    struct FnGdnPar {
+        const uint16_t* alpha = nullptr;
+        const uint16_t* beta = nullptr;
+        const float* dt = nullptr;
+        const float* a = nullptr;
+    };
     /// The card's role on a tensor-parallel pair (qwen4exp --tp 2): its rank and the pair's mailbox, and the
     /// FULL model's geometry - read only for the two replicated output projections' input widths, since the
     /// activation-first exchange hands every card the whole head rows.  Before init: init carves the
@@ -145,8 +154,30 @@ public:
         /// host_res.  Null off the pair; the blob addresses behind it stay on the twin's own card - this
         /// card only ever asks whether the twin holds the expert.
         const std::vector<int32_t>* twin_residency = nullptr;
+
+        /// THIS card's GDN key-head range, straight out of the plan the LOADER sliced its rows by
+        /// (basalt::plan::fn_rank_plan(g_full, tp, rank).gdn).  The recorder's activation-first exchange needs
+        /// it because the cut is by key-head GROUP: the card's packed value head p is model head
+        /// (p / nk) * h_k + k0 + p % nk, so a replicated full-width object (the output projection's columns, a
+        /// per-head parameter row) is addressed through it and never through `rank * nv + p`.
+        basalt::core::GdnHeadSlice gdn;
+        /// One GDN layer's per-head parameter rows for THIS card's heads, in the card's packed order.  The
+        /// recurrence indexes alpha/beta/dt/ssm_a by its CARD-LOCAL head (head_map's nk == 0 branch), while the
+        /// model's tables hold one row per MODEL head; a contiguous `hv0 = rank * HV` offset into those puts
+        /// 32 of the 48 heads on another head's decay, beta and dt.  The pair therefore gets the rows gathered
+        /// once at bring-up (Verifier::tp_gather_gdn_params) and offsets nothing.  Indexed by the recorder's GDN
+        /// ordinal (record_gdn.cpp's `gi`); empty off the pair.
+        std::vector<FnGdnPar> gdn_par;
     };
     void set_tp(FnTp* tp) { tp_ = tp; if (tp_skip_head()) head_sampling_ = false; }   // the head off-switch, see tp_skip_head
+    /// The pair card's GDN head-parameter rows, gathered into ITS packed head order (FnTp::gdn_par).  Called
+    /// after set_tp and init, on the card's own device, with the table that card's windows read (rank 1's is
+    /// the twin's, not the main one).  Reads the four head-indexed tables the plan keeps REPLICATED -
+    /// ssm_alpha/ssm_beta (one n_embd row per model value head) and ssm_dt.bias/ssm_a (one value each) - and
+    /// copies the card's rows, in `core::gdn_vhead_runs` order, into one device block.  Refuses (false + err)
+    /// unless `tp_` is set with a usable head slice and every GDN layer's four tensors have the model-head
+    /// shape: a pair that cannot gather must not serve heads on the wrong decay.  Off the pair: no-op true.
+    bool tp_gather_gdn_params(WeightTable& table, std::string& err);
     /// True on the pair's SECOND card: the LM head and its sampling stay rank 0's (design line "PLE + LM head +
     /// embedding: rank0-only"), so a rank-1 window records no head and queues no sampler - the twin's
     /// output.weight entry has no bytes on its card (verified: window 2h's rank-1 capture died in the head's
@@ -485,6 +516,7 @@ private:
     PeerExperts* peer_ = nullptr;
     PeerExperts* own_tier_ = nullptr;   ///< the pair's card's OWN VRAM expert tier (set_own_tier; null: VerifyHits, solo)
     FnTp* tp_ = nullptr;   ///< the tensor pair's role (set_tp; null = the card runs the whole model)
+    void* tp_gdn_par_ = nullptr;   ///< this card's gathered GDN head-parameter rows (tp_gather_gdn_params)
     uint64_t arena_bytes_ = 0;   ///< the device arena init carved (tp_arena_bytes; the pair's budget line)
     std::vector<PeerExperts*> xpeers_;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
@@ -754,6 +786,13 @@ private:
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
     uint16_t *y16_ = nullptr, *mixb_ = nullptr;               // tp: this card's bf16 head halves; the assembled
+    float* tp_diag_ = nullptr;   // BASALT_TP_DIAG: per-layer [nR, nBo(post-exch), nParts, nW, nBoPre, nShared, nMix, nLogits]
+    int32_t* tp_diag_plan_ = nullptr;   // BASALT_TP_DIAG: per-layer DmPlan snapshot
+    float* tp_diag_ent_ = nullptr;      // BASALT_TP_DIAG: layers 0..2 x the 10 window entries: ||parts_ row||
+    int32_t* tp_diag_res_ = nullptr;    // BASALT_TP_DIAG: layers 0..2: [res0 | res1] rows + the layer's w_ bits
+    int32_t* tp_diag_bits_ = nullptr;
+    int32_t* tp_diag_h1_ = nullptr;   // v17: per-head xq + table-extent FNV hashes + ptr fingerprint   // BASALT_TP_DIAG: layers 0..2: 16 logits + 8 mixed + 8 xn bits (v6)
+    uint64_t tp_ord_ = 0;               // BASALT_TP_DIAG: window ordinal for cross-record alignment
     float* mixf_ = nullptr;                                   //     full row; its fp32 widening for the quantizer
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
     float *z_ = nullptr, *y_ = nullptr;

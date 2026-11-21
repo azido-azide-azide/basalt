@@ -18,6 +18,18 @@ void tp_place_bf16_f32(uint16_t* full, const float* src, int64_t half, int64_t t
 void tp_place_bf16_bf16(uint16_t* full, const uint16_t* src, int64_t half, int64_t total, int64_t off, int n,
                         void* stream);
 
+/// THE GDN FORM of the same step.  A GDN card's rows are its value heads in PACKED order (core::gdn_head_split:
+/// the cut is by key-head group, so packed head p is model head (p / nk) * h_k + k0 + p % nk - the card's rows
+/// stride the model's head axis in steps of h_k, they do not sit side by side at `rank * half`).  Placing them
+/// at `off = rank * half` of a replicated output projection's column axis pairs each head with ANOTHER head's
+/// columns, which is the pair's whole wrong-attention-output defect: card-symmetric, first window, first layer.
+/// These variants place them at their model head columns; the group strides come from
+/// core::gdn_place_groups and the index law is core::gdn_grouped_src_col (ONE place, host-checkable).
+void tp_place_bf16_f32_grouped(uint16_t* full, const float* src, int64_t half, int64_t total, int64_t src_group,
+                               int64_t dst_group, int64_t base, int n, void* stream);
+void tp_place_bf16_bf16_grouped(uint16_t* full, const uint16_t* src, int64_t half, int64_t total,
+                                int64_t src_group, int64_t dst_group, int64_t base, int n, void* stream);
+
 /// `row` (bf16, n values) widened in place to fp32 in `out` (which may be the same buffer only if it is 2x sized -
 /// the pair passes distinct buffers).
 void tp_bf16_widen(float* out, const uint16_t* row, int64_t n, void* stream);

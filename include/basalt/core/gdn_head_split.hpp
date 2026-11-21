@@ -12,6 +12,12 @@
 #include <cstring>
 #include <vector>
 
+#if defined(__CUDACC__)
+#define GDN_HEAD_SPLIT_HD __host__ __device__
+#else
+#define GDN_HEAD_SPLIT_HD
+#endif
+
 namespace basalt::core {
 
 struct GdnHeadSlice {
@@ -40,6 +46,43 @@ inline std::vector<GdnRun> gdn_vhead_runs(const GdnHeadSlice& g, int64_t per) {
     std::vector<GdnRun> r;
     for (int j = 0; j < g.rep(); ++j) r.push_back({(int64_t) (j * g.h_k + g.k0) * per, g.nk * per});
     return r;
+}
+
+/// THE SAME CUT READ AS A HEAD MAP: the model value head behind one of the card's PACKED local heads.  The
+/// packed order is `gdn_vhead_runs`' own - run j holds model heads [j * h_k + k0, j * h_k + k0 + nk) - so
+/// packed head p = j * nk + i is model head j * h_k + k0 + i.
+///
+/// Everything that couples a card's sliced activations to a FULL-width object (a replicated per-head
+/// parameter row, a replicated output projection's columns) is addressed through THIS, never through
+/// `rank * nv + p`: a key-head-group cut is not a contiguous one, because value head v reads key head
+/// v % h_k, so the card's heads stride the model's head axis in steps of h_k.  With h_v / h_k == 1 the two
+/// agree and the distinction vanishes; with 48 value heads over 16 key heads it does not.
+GDN_HEAD_SPLIT_HD inline int64_t gdn_local_head(const GdnHeadSlice& g, int64_t p) {
+    return (p / g.nk) * g.h_k + g.k0 + p % g.nk;
+}
+
+/// the column of the FULL value row (h_v * s wide) where the card's packed local head p belongs
+GDN_HEAD_SPLIT_HD inline int64_t gdn_local_col(const GdnHeadSlice& g, int64_t p) {
+    return gdn_local_head(g, p) * g.s;
+}
+
+/// that placement as the three strides a kernel walking the full row needs: the card's rows arrive in runs
+/// of `src_group` = nk * s elements and land inside runs of `dst_group` = h_k * s, at `base` = k0 * s.
+GDN_HEAD_SPLIT_HD inline void gdn_place_groups(const GdnHeadSlice& g, int64_t& src_group, int64_t& dst_group,
+                                               int64_t& base) {
+    src_group = (int64_t) g.nk * g.s;
+    dst_group = (int64_t) g.h_k * g.s;
+    base = (int64_t) g.k0 * g.s;
+}
+
+/// the source column a grouped placement draws for full-row column `c`, or -1 where the card holds no value
+/// (the placement's index law in ONE place: `tp_place_*_grouped` runs it on the device, a host test runs it
+/// against `gdn_local_col` - the pair's wrong-output defect was exactly these two views disagreeing)
+GDN_HEAD_SPLIT_HD inline int64_t gdn_grouped_src_col(int64_t c, int64_t src_group, int64_t dst_group,
+                                                     int64_t base) {
+    const int64_t grp = c / dst_group, rem = c - grp * dst_group;
+    if (rem < base || rem >= base + src_group) return -1;
+    return grp * src_group + (rem - base);
 }
 
 inline int64_t gdn_runs_len(const std::vector<GdnRun>& runs) {

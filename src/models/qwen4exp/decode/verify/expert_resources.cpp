@@ -199,7 +199,13 @@ bool Verifier::dm_init(std::string& err) {
     }
     if (d->pdev >= 0) {
         hs_init();
-        gs_init();
+        // The driven-peer GDN split assumes CUDA0 alone records: gs_plan keeps heads [0, nk0) for whoever calls
+        // it.  In the tensor pair BOTH cards record and each takes the same rank-blind first slice (observed:
+        // both logs claim "CUDA0 8 of 16 key heads" in one pair serve), and each card's driven peer moves state
+        // the other card's recorder never produced — the mixer halves and stale-heads collide with the pair's own
+        // exchanges (pair-vs-solo divergence from window 1, layer 0).  For the pair the GDN stays whole per card
+        // and its heads join through the y16 bf16 exchange - the path the dense pair runs.
+        if (tp_ == nullptr) gs_init();
     }
     if (cpu_warm && codes_ok) {
         CpuWarm* w = new CpuWarm;
