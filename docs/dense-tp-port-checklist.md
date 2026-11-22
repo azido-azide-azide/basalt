@@ -180,6 +180,8 @@ Consequences of `main`'s phase split:
       rank 0 carries the block drafter, and `--tp` + `--diag-split-at` refuses.
 - [x] `qwen35_tp_forward_test` (27B + 2 GPUs) — **all ok**: chunk prefill and six window decodes
       ran on the pair.
+- [x] `load_progress_two_starts_test` — **ok**; it reports 3 failures on the unpatched header
+      (wrong total, done going backwards, the warning) and passes with the fix below.
 
 ### Phase 7 — live gates (2× 5060 Ti, 27B)
 - [x] **Solo bitwise vs main's binary**: same pack/config, 5 greedy prompts @256 tok — **5/5
@@ -199,7 +201,30 @@ Consequences of `main`'s phase split:
 
 ---
 
-## 6. Gauntlet result (the TP-over-TS measurement)
+## 6. The over-placement warning (found while gating, fixed)
+
+The shard-load log carried `basalt load: warning: placed more than the announced total
+(19738567812 of 19725443200 bytes so far)` — 13,124,612 bytes over. It is **not** the port's
+slicing: the test's own coverage check proves every sliced tensor's two cards' fragments are
+in-bounds and cover each source byte exactly once, and within one start `placed()` telescopes
+exactly to `counted()`.
+
+It is a pre-existing bug in `include/basalt/core/load_progress.hpp` (present on `main`):
+`announce_total()` set the new total but left `placed`/`done`/`last_done`/`miscounted`/`into`
+from the previous start, and `LoadProgress` is a process-wide singleton. A second `place_start`
+in one process therefore accumulated onto the first and tripped the warning on its first byte.
+`qwen35_tp_shard_load_test` loads twice in one process, so it hit exactly that. The final
+`weights` line was already clamped to the total, so no weight was ever misplaced — the load's
+own accounting was right; only the bar was wrong.
+
+Fix: `announce_total()` resets the per-start counters. Production model swaps re-spawn the
+engine (`serve/engine/process.py` `unload()` -> `__init__`), so they were never exposed; any
+in-process second load was. Pinned by `tests/core/load_progress_two_starts_test.cpp`, which
+fails 3 ways on the unpatched header.
+
+---
+
+## 7. Gauntlet result (the TP-over-TS measurement)
 
 2× RTX 5060 Ti, Qwen3.8-27B-QUASAR-NVFP4, greedy `temp=0`, Berlin-tested 2026-11-22.
 TS = the layer split (what `--diag-split-at`/auto-plan picks); TP = `--tp 2` (the port).
