@@ -194,7 +194,8 @@ Consequences of `main`'s phase split:
 
 ### Phase 8 — publish
 - [x] Push `dense-tp-main-1122` (`7c4b1d7c`).
-- [ ] Open PR against `main` — **awaiting Leon's explicit go for the PR act**.
+- [x] Open PR against `main`: **#36** — https://github.com/azido-azide-azide/basalt/pull/36
+      (`MERGEABLE`, 40 files, +3146/-151).
 
 ---
 
