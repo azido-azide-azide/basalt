@@ -52,16 +52,12 @@ int main(int argc, char** argv) {
     req.max_context = 8192;
     req.sessions = 1;
     req.tp = 2;
-    std::unique_ptr<model::LoadedModel> loaded;
-    if (const model::Result r = a->load(req, loaded); !r.ok()) {
-        std::fprintf(stderr, "load: %s\n", r.message.c_str());
+    model::Started started;
+    if (const model::Result r = a->start(req, started); !r.ok() || started.sessions.empty()) {
+        std::fprintf(stderr, "start: %s\n", r.message.c_str());
         return 1;
     }
-    std::unique_ptr<model::ModelSession> sess;
-    if (const model::Result r = loaded->make_session(sess); !r.ok()) {
-        std::fprintf(stderr, "session: %s\n", r.message.c_str());
-        return 1;
-    }
+    model::ModelSession& sess = *started.sessions.front();
     // a short, ordinary prompt: the chunk path runs, then plain decode windows
     const std::vector<int32_t> prompt{20000, 5000, 1200, 44, 770, 304, 1883, 315, 2570, 66};
     model::PrefillRequest pre;
@@ -69,8 +65,8 @@ int main(int argc, char** argv) {
     pre.n_tokens = (int) prompt.size();
     pre.total_tokens = pre.n_tokens;
     pre.pos = 0;
-    if (!step_ok("prefill", sess->prefill_chunk(pre), "chunk")) return failures ? 1 : 0;
-    sess->end_prompt();
+    if (!step_ok("prefill", sess.prefill_chunk(pre), "chunk")) return failures ? 1 : 0;
+    sess.end_prompt();
     int32_t next = prompt.back();
     int64_t pos = (int64_t) prompt.size();
     std::printf("picks:");
@@ -80,7 +76,7 @@ int main(int argc, char** argv) {
         d.n_tokens = 1;
         d.pos = pos++;
         d.next_token = &next;
-        if (!step_ok("decode", sess->decode_window(d), "window")) break;
+        if (!step_ok("decode", sess.decode_window(d), "window")) break;
         std::printf(" %d", next);
         std::fflush(stdout);
     }

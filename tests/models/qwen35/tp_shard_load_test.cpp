@@ -183,7 +183,9 @@ void try_load(const model::ModelAdapter& a, const std::string& pack, bool draft)
     // the real load: both card models build and pair, and each card's free memory drops by (at least, and not
     // unreasonably more than) the bytes its slices take - the pair's scratch and arenas ride on top of the weights
     const long long free0 = card_free(0), free1 = card_free(1);
-    const model::Result r = a.load(req, loaded);
+    model::Started started;
+    const model::Result r = a.start(req, started);
+    loaded = std::move(started.model);
     check(r.ok(), "the --tp 2 load built and paired both card models" + (r.ok() ? std::string() : ": " + r.message));
     if (!r.ok()) return;
     const long long used0 = free0 - card_free(0), used1 = free1 - card_free(1);
@@ -226,8 +228,8 @@ int main(int argc, char** argv) {
     req.max_context = 8192;
     req.tp = 2;
     req.diag_split_at = 5;
-    std::unique_ptr<model::LoadedModel> loaded;
-    const model::Result r = a->load(req, loaded);
+    model::Started started;
+    const model::Result r = a->start(req, started);
     check(!r.ok() && r.message.find("do not mix") != std::string::npos, "--tp with --diag-split-at refuses: " + r.message);
     std::printf("%s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;
