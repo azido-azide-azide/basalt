@@ -886,7 +886,7 @@ private:
     dense::Weights peer_w1_;                          ///< rank 1's layer weights, kept for attach()
     dense::Options tp_o0_;                            ///< the run's options, kept for rank 1's model
     dense::Linear w0_head_{};                         ///< the head as loaded, for rank 1's type
-    const void* embd_dev_ = nullptr;                 ///< the embedding's device pointer, for rank 1
+    const uint16_t* embd_dev_ = nullptr;                 ///< the embedding's device pointer, for rank 1
     std::vector<int64_t> tp_free_;                ///< per session-slot: rank 0's headroom gate (see attach)
 };
 
