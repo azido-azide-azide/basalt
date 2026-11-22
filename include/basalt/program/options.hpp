@@ -61,6 +61,7 @@ struct CommonOptions {
     /// --diag-split-at N: diagnostic, a model split across two cards at layer N whatever the start would pick (0: off)
     int diag_rows = 0;
     int diag_split_at = 0;
+    int tp = 0;                       ///< --tp: tensor-parallel over this many cards (0 or 1: off)
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.
