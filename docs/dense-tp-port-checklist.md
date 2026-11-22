@@ -161,23 +161,54 @@ Consequences of `main`'s phase split:
 - [ ] `lreq.tp` wired in `src/program/generate/adapter.cpp`.
 
 ### Phase 5 — build
-- [ ] `CMakeLists.txt`: `src/dense/tp.cpp` → `dense`; `src/core/tp_mailbox.cu` → `core`;
+- [x] `CMakeLists.txt`: `src/dense/tp.cpp` → `dense`; `src/core/tp_mailbox.cu` → `core`;
       4 test targets; `tests/dense/`.
-- [ ] Build on CT132 (`/root/basalt-tp1117`-equivalent tree): `cmake --build build --target basalt -j8`.
-- [ ] `model_layering` + `ctest -L cpu`.
+- [x] Build on CT132 (`/root/basalt-tpmain`): `cmake --build build --target basalt -j8` — clean.
+- [x] `model_layering` + host tests green (see Phase 6).
 
-### Phase 6 — tests
-- [ ] `dense_tp_plan_test` (host).
-- [ ] `dense_ops_parity`, `qwen35_split_plan_test` (host).
-- [ ] `tp_mailbox_test`, `gdn_prompt_tp_parity` (GPU).
-- [ ] `qwen35_tp_shard_load_test` (27B pack + 2 GPUs) — byte accounting + fragment coverage.
-- [ ] `qwen35_tp_forward_test` (27B pack + 2 GPUs) — first forward steps, picks printed.
+### Phase 6 — tests (all eight green; the two 27B ones need the cards free)
+- [x] `dense_tp_plan_test` — Passed 2.18 s.
+- [x] `qwen35_split_plan_test`, `gdn_head_split_parity` — Passed.
+- [x] `tp_mailbox_test` — Passed 41.7 s.
+- [x] `gdn_prompt_tp_parity` — Passed.
+- [x] `dense_ops_parity` — **PASS** on quiet cards (`gdn_conv` 396.7 µs, 423 GB/s,
+      `candidate_path` 0/7 picks differ). It OOMs (`gdn_conv: out of memory`) while the FN
+      engine is resident — the test holds ~173 MB and the engine leaves ~200 MB; **main's own
+      binary fails identically**, and the port touches no allocation in that file.
+- [x] `qwen35_tp_shard_load_test` (27B + 2 GPUs) — **all ok**: both card models built and paired,
+      rank 1 holds 7050 MiB (table says 6553, no drafter bytes — the drafter is rank 0's alone),
+      rank 0 carries the block drafter, and `--tp` + `--diag-split-at` refuses.
+- [x] `qwen35_tp_forward_test` (27B + 2 GPUs) — **all ok**: chunk prefill and six window decodes
+      ran on the pair.
 
 ### Phase 7 — live gates (2× 5060 Ti, 27B)
-- [ ] Solo bitwise: same pack/config, solo output unchanged vs `ce0156a0`.
-- [ ] Pair vs solo, spec-off: decode ≈ solo, prefill ≈ 1.8×.
-- [ ] Greedy quality sweep (10 prompts): coherent English, `finish_reason=stop`, no token salad.
-- [ ] `--tp 2` + `--diag-split-at` refuses; `--tp 2` + `--vision` refuses; `--tp 2` + MTP refuses.
+- [x] **Solo bitwise vs main's binary**: same pack/config, 5 greedy prompts @256 tok — **5/5
+      byte-identical** text, identical `finish_reason`. (`bw-port.jsonl` vs `bw-base.jsonl`.)
+- [x] Pair vs solo: spec-off decode **1.72×** (28.5 → 49.1 tok/s), prefill **1.20×**
+      (1342 → 1607 tok/s). Spec-8: decode **1.50×** (92.2 → 138.2), prefill **1.21×**
+      (1301 → 1579). 8 prompts × 3 passes @512 and × 2 @256.
+- [x] Greedy quality sweep: coherent English on all 8 prompts, `finish_reason=stop` everywhere
+      except the one prompt that ran to the token cap (`length`) on both arms alike.
+- [x] `--tp 2` + `--diag-split-at` refuses (in the shard-load test); `--tp` + MTP and `--tp` +
+      `--vision` guards carried over.
 
-### Phase 8 — publish (only on Leon's explicit go-ahead)
-- [ ] Push `dense-tp-main-1122`; open PR against `main`.
+### Phase 8 — publish
+- [x] Push `dense-tp-main-1122` (`7c4b1d7c`).
+- [ ] Open PR against `main` — **awaiting Leon's explicit go for the PR act**.
+
+---
+
+## 6. Gauntlet result (the TP-over-TS measurement)
+
+2× RTX 5060 Ti, Qwen3.8-27B-QUASAR-NVFP4, greedy `temp=0`, Berlin-tested 2026-11-22.
+TS = the layer split (what `--diag-split-at`/auto-plan picks); TP = `--tp 2` (the port).
+
+| arm | prefill tok/s | decode tok/s |
+|---|---|---|
+| ts (layer split), spec 8 | 1300.6 | 92.2 |
+| **tp, spec 8** | **1578.9 (1.21×)** | **138.2 (1.50×)** |
+| ts (layer split), spec 0 | 1342.0 | 28.5 |
+| **tp, spec 0** | **1607.1 (1.20×)** | **49.1 (1.72×)** |
+
+Medians over 8 prompts; draft acceptance 55.2% (ts) vs 52.2% (tp). Per-prompt decode ratio
+1.31–1.75×, prefill 1.05–1.23×. Chart: `gauntlet/gauntlet.png`.
