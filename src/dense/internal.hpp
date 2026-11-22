@@ -1,6 +1,7 @@
 // src/dense/internal.hpp - the dense stack's model, session state and forward passes (see basalt/dense/model.hpp).
 #pragma once
 
+#include "basalt/core/tp_mailbox.hpp"
 #include "basalt/dense/model.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/model/batch_driver.hpp"
@@ -121,6 +122,21 @@ struct SplitHand {
     size_t first_tap = 0;          ///< the first of them among the drafter's target layers
 };
 
+/// The tensor pair: the mailbox the two cards' column-parallel products sum through, and the other card's model
+/// (half-wide weights on its own card, its own scratch).  A step's exchanges take the mailbox's slots in host
+/// launch order, and both cards' bodies launch the same sequence, so every slot's epochs advance in lockstep -
+/// inside captured graphs too.  Owned by the rank 0 model, pointed at by both.
+struct TpHand {
+    core::TpMailbox mb;
+    ModelPtr peer_model;        ///< owns it: the model running the layers half-wide on the other card
+    Model* peer = nullptr;      ///< peer_model.get()
+    int peer_dev = -1;          ///< its CUDA device
+    // per-rank exchange counters: the k-th exchange of card 0 pairs with the k-th of card 1 and they must pick
+    // the same slot, which a shared counter would break the moment the drivers interleave the cards' enqueues
+    size_t epi[2] = {0, 0};     ///< exchanges so far, per body (each body's step starts its own at 0; slots alternate by it)
+    ~TpHand();
+};
+
 class Model {
 public:
     Geometry g;
@@ -158,6 +174,11 @@ public:
     SplitHand* hand = nullptr;                   // the layer split's decode hand-off, on both cards' models (null: none)
     Model* split_model = nullptr;                // the split's second card's model, and its CUDA device
     int split_dev = -1;
+    // the tensor pair (null: no tensor parallel): both cards run every layer half-wide, and every column-parallel
+    // product's partial meets the other card's over the mailbox; the residual rows stay equal on both cards
+    std::unique_ptr<TpHand> tp_own;              // the pair's hand, owned by the rank 0 model (both point at it)
+    TpHand* tp = nullptr;                        // the pair's shared hand (both cards' models point at one)
+    int tp_rank = 0;                             // 0: the card whose head the sessions sample
     ~Model();
     bool ensure_chunk(std::string& err);
     /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).
@@ -230,6 +251,9 @@ bool init_state(Model& m, SessionState& st, std::string& err);
 void free_state(SessionState& st);
 /// The layer split's second card's state of the session `st` of model `m` (st.peer).
 bool split_session(Model& m, SessionState& st, std::string& err);
+/// The tensor pair's rank 1 state of the session `st` of the rank 0 model `m` (st.peer): the same cells and recurrent
+/// state, of the card's head slices, on the peer card.
+bool tp_session(Model& m, SessionState& st, std::string& err);
 /// Tokens [pos, pos + n) of the session `st` across the layer split's cards, the chunks pipelined (the second card reads a
 /// chunk's later layers while the main card reads the next one's first layers); `progress` and `stop` as prompt_split_read's.
 /// A session with an MTP drafter reads its prompt chunk by chunk (split_chunk): that drafter reads every chunk's last rows.
@@ -266,7 +290,8 @@ void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float*
 /// Layers [l0, l1) of the chunk in m.cs; with `taps`, the block drafter's features of its target layers in the range
 /// into cs.dacc (the first target layer's written, the later ones' added).  The last layer's rows are made in full when
 /// something reads them (`read_last`, a drafter), else only its cells.
-void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last = false);
+void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last = false,
+                    int scan_l1 = -1);
 /// The block drafter's feature projection j of the rows in cs.x into cs.dacc (j == 0 writes it, later ones add).
 void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j);
 /// After the last layer: the block drafter's context from cs.dacc, or the MTP history.

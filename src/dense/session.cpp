@@ -35,8 +35,9 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         err = "cannot create a CUDA stream";
         return false;
     }
-    // the drafter's state, the logits and the picks on the card that holds layer 0
-    const bool head = m.lb == 0, mtp = head && m.o.drafter == Drafter::Mtp, block = head && m.o.drafter == Drafter::Block;
+    // the drafter's state, the logits and the picks on the card that holds layer 0 (the tensor pair's rank 1 keeps none)
+    const bool head = m.lb == 0 && !m.tp_rank, mtp = head && m.o.drafter == Drafter::Mtp,
+                 block = head && m.o.drafter == Drafter::Block;
     size_t blockbytes = 0;
     if (block) {
         const BlockDrafter& bd = m.w.dflash;
@@ -189,6 +190,7 @@ public:
         block_ = m_.o.drafter == Drafter::Block;
         if (!init_state(m_, st_, err)) return false;
         if (m_.split && !split_session(m_, st_, err)) return false;
+        if (m_.tp && !tp_session(m_, st_, err)) return false;
         if (cudaHostAlloc((void**) &h_picks_, kWindow * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess) {
             err = "out of page-locked memory";
             return false;
@@ -332,6 +334,8 @@ public:
                                       cudaMemcpyDeviceToHost, st_.stream);
         cudaMemcpyAsync(h_picks_, st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream);
         if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+        if (m_.tp && m_.tp->mb.hang_reported())   // the round's work is done: a timeout now means the picks are wrong
+            return fail(m_.o.arch + ": dense tp: an exchange diverged during the window; the pair's results have split");
         if (r.row_tokens) std::copy(h_picks_, h_picks_ + T, r.row_tokens);
         if (r.next_token) *r.next_token = h_picks_[T - 1];
         return {};
@@ -348,8 +352,8 @@ protected:
     int64_t batch_context() const override { return m_.o.max_context; }
     model::BatchShared& batch_shared() override { return m_.batch; }
     cudaStream_t batch_stream() const override { return st_.stream; }
-    // a layer split's forward runs its two cards' graphs itself (forward_batch)
-    bool batch_captured() const override { return !m_.split; }
+    // a layer split's forward runs its two cards' graphs itself (forward_batch), and so does a tensor-parallel pair's
+    bool batch_captured() const override { return !m_.split && !m_.tp; }
 
     bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
         if (r.n_tokens < 1 || r.n_tokens > kWindow) {
@@ -393,7 +397,7 @@ protected:
             if (se.drafter_)
                 cudaMemcpyAsync(se.st_.win_tok, v.reqs[i].tokens, (size_t) v.reqs[i].n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice, v.stream);
         }
-        if (m_.split) return true;   // forward_batch stages both cards
+        if (m_.split || m_.tp) return true;   // forward_batch stages the pair's or the split's two cards
         std::vector<BatchSeg> segs;
         std::vector<int32_t> pos3;
         batch_pack(v, segs, pos3);
@@ -405,7 +409,7 @@ protected:
         std::vector<BatchSeg> segs;
         std::vector<int32_t> pos3;
         batch_pack(v, segs, pos3);
-        if (m_.split) return forward_batch(m_, segs.data(), v.n, v.w.tokens.data(), pos3.data(), err);
+        if (m_.split || m_.tp) return forward_batch(m_, segs.data(), v.n, v.w.tokens.data(), pos3.data(), err);
         batch_body(m_, segs.data(), v.n);
         return true;
     }
@@ -422,6 +426,16 @@ protected:
         draw(T, v.stream);
         cudaMemcpyAsync(h_picks_, st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, v.stream);
         return h_picks_ + (T - v.head[i]);   // the driver reads the window's last head[i] rows
+    }
+
+    // The batch's rows are drawn and its stream synced (the driver calls this after both): a mailbox timeout known by
+    // now means the picks it just read are not the same tokens on both cards. The solo window and the prompt chunks
+    // check their own syncs; the shared driver gives no hook after its sync but this one.
+    Result decode_kept(model::ModelSession* const* sessions, const int* kept, int n) override {
+        (void) sessions; (void) kept; (void) n;
+        if (m_.tp && m_.tp->mb.hang_reported())
+            return fail(m_.o.arch + ": dense tp: an exchange diverged during the batch; the pair's results have split");
+        return {};
     }
 
 public:
@@ -447,6 +461,8 @@ public:
             std::string err;
             if (!forward_chunk(m_, st_, r.tokens + at, nullptr, n, p, pos3.data(), err)) return fail(err);
             if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+            if (m_.tp && m_.tp->mb.hang_reported())   // the chunk's rounds are done: a timeout now means the cells are wrong
+                return fail(m_.o.arch + ": dense tp: an exchange diverged during the chunk; the pair's results have split");
             at += n;
             if (r.progress) r.progress(at);
             if (at < r.n_tokens && r.stop && r.stop()) break;
@@ -502,6 +518,8 @@ public:
             std::string err;
             if (!forward_chunk(m_, st_, nullptr, rows + (size_t) at * g_.n_embd, n, pos + at, pos3.data(), err)) return fail(err);
             if (cudaStreamSynchronize(st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
+            if (m_.tp && m_.tp->mb.hang_reported())   // the chunk's rounds are done: a timeout now means the cells are wrong
+                return fail(m_.o.arch + ": dense tp: an exchange diverged during the chunk; the pair's results have split");
             at += n;
         }
         if (grid) st_.rope_delta += std::max(nx, ny) - n_rows;
@@ -516,7 +534,7 @@ public:
     static constexpr size_t kHeadBytes = 4 * sizeof(int64_t);
     size_t block_ring_bytes() const { return (size_t) st_.dctx_cap * m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
     size_t running_bytes() const override {
-        return kHeadBytes + (size_t) (m_.n_gdn + (st_.peer ? m_.split_model->n_gdn : 0)) * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
+        return kHeadBytes + (size_t) (m_.n_gdn + (st_.peer ? peer_model().n_gdn : 0)) * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
                (block_ ? st_.dk.size() * 2 * block_ring_bytes() : 0);
     }
 
@@ -541,9 +559,10 @@ public:
         s.stream = st_.stream;
         s.peer_regions.clear();
         if (st_.peer) {   // the second card's layers' state
-            if (const size_t n = (size_t) m_.split_model->n_gdn * st_.gdn_floats * 4) s.peer_regions.push_back({st_.peer->gdn, n});
+            if (const size_t n = (size_t) peer_model().n_gdn * st_.peer->gdn_floats * 4)
+                s.peer_regions.push_back({st_.peer->gdn, n});
             s.peer_stream = st_.peer->stream;
-            s.peer_device = m_.split_dev;
+            s.peer_device = peer_device();
         }
         return {};
     }
@@ -573,6 +592,11 @@ public:
     // a layer's cells: fp16 K and V (format 1), or int8 codes with fp16 scales per 64 values (format 2); the MTP
     // drafter's own layer is fp16 and comes last
     size_t row_bytes(bool int8) const { return (size_t) g_.n_kv * g_.head_dim * (int8 ? 1 : 2); }
+    // The other card's model and device, whichever pair arrangement is running: a layer split's deep half
+    // or the tensor-parallel peer. Session bookkeeping that walks the peer state asks here instead of assuming
+    // the split, since a TP pair has peer state and no split model at all.
+    Model& peer_model() const { return m_.tp ? *m_.tp->peer : *m_.split_model; }
+    int peer_device() const { return m_.tp ? m_.tp->peer_dev : m_.split_dev; }
     // the conversation's attention layers: the main card's, then the second card's (a layer split); kv_state maps i to its
     // card's state and its index there
     size_t kv_layers() const { return st_.kc.size() + (st_.peer ? st_.peer->kc.size() : 0); }
@@ -603,7 +627,7 @@ public:
             const bool mtp = i == kv_layers();
             size_t j = i;
             const SessionState& ls = mtp ? st_ : kv_state(j);
-            const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
+            const core::OnDevice on(&ls == &st_ ? -1 : peer_device());
             const bool int8 = !mtp && m_.o.kv_int8;
             core::ConversationKv k;
             k.format = int8 ? 2 : 1;
@@ -644,7 +668,7 @@ public:
             const bool mtp = i == kv_layers();
             size_t j = i;
             const SessionState& ls = mtp ? st_ : kv_state(j);
-            const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
+            const core::OnDevice on(&ls == &st_ ? -1 : peer_device());
             const bool int8 = !mtp && m_.o.kv_int8;
             const core::ConversationKv& k = kv[i];
             if (k.format != (int8 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
@@ -730,8 +754,8 @@ private:
     void join_commit() {
         if (!commit_pending_) return;
         if (m_.n_gdn) cudaStreamWaitEvent(st_.stream, st_.join, 0);
-        if (st_.peer && m_.split_model->n_gdn) {
-            const core::OnDevice on(m_.split_dev);
+        if (st_.peer && peer_model().n_gdn) {
+            const core::OnDevice on(peer_device());
             cudaStreamWaitEvent(st_.peer->stream, st_.peer->join, 0);
         }
         commit_pending_ = false;
@@ -749,9 +773,9 @@ private:
                 cudaMemsetAsync(st_.gdn, 0, (size_t) m_.n_gdn * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
             if (SessionState* p = st_.peer.get()) {
-                const core::OnDevice on(m_.split_dev);
+                const core::OnDevice on(peer_device());
                 p->alt_ready = false;
-                if (cudaMemsetAsync(p->gdn, 0, (size_t) m_.split_model->n_gdn * p->gdn_floats * 4, p->stream) != cudaSuccess)
+                if (cudaMemsetAsync(p->gdn, 0, (size_t) peer_model().n_gdn * p->gdn_floats * 4, p->stream) != cudaSuccess)
                     return fail("clearing the recurrent state failed");
             }
             return {};
@@ -784,8 +808,8 @@ private:
             };
             commit(m_, st_);
             if (st_.peer) {
-                const core::OnDevice on(m_.split_dev);
-                commit(*m_.split_model, *st_.peer);
+                const core::OnDevice on(peer_device());
+                commit(peer_model(), *st_.peer);
             }
             if (!defer) join_commit();
         }

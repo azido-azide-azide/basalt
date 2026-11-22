@@ -1,0 +1,16 @@
+{"pass": 0, "i": 0, "spec": "spec0", "prompt": 64, "completion": 154, "prompt_tok_s": 830.1, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 0, "i": 1, "spec": "spec0", "prompt": 96, "completion": 256, "prompt_tok_s": 1878.7, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "length"}
+{"pass": 0, "i": 2, "spec": "spec0", "prompt": 66, "completion": 221, "prompt_tok_s": 1312.1, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 0, "i": 3, "spec": "spec0", "prompt": 69, "completion": 148, "prompt_tok_s": 1371.8, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 0, "i": 4, "spec": "spec0", "prompt": 85, "completion": 109, "prompt_tok_s": 1669.9, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 0, "i": 5, "spec": "spec0", "prompt": 67, "completion": 225, "prompt_tok_s": 1334.7, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 0, "i": 6, "spec": "spec0", "prompt": 66, "completion": 226, "prompt_tok_s": 1314.7, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 0, "i": 7, "spec": "spec0", "prompt": 68, "completion": 238, "prompt_tok_s": 1351.9, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 1, "i": 0, "spec": "spec0", "prompt": 64, "completion": 154, "prompt_tok_s": 1285.1, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 1, "i": 1, "spec": "spec0", "prompt": 96, "completion": 256, "prompt_tok_s": 1875.0, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "length"}
+{"pass": 1, "i": 2, "spec": "spec0", "prompt": 66, "completion": 221, "prompt_tok_s": 1312.1, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 1, "i": 3, "spec": "spec0", "prompt": 69, "completion": 148, "prompt_tok_s": 1369.0, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 1, "i": 4, "spec": "spec0", "prompt": 85, "completion": 109, "prompt_tok_s": 1666.7, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 1, "i": 5, "spec": "spec0", "prompt": 67, "completion": 225, "prompt_tok_s": 1332.0, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 1, "i": 6, "spec": "spec0", "prompt": 66, "completion": 226, "prompt_tok_s": 1312.1, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
+{"pass": 1, "i": 7, "spec": "spec0", "prompt": 68, "completion": 238, "prompt_tok_s": 1349.2, "decode_tok_s": 28.5, "draft_n": 0, "acc": 0, "finish": "stop"}
