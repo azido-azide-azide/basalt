@@ -159,9 +159,9 @@ public:
             o.draft = false;
             o.vision = false;
             o.mmproj = {};
-            dense::Weights w1 = peer_w1_;
-            w1.embd = model_->w.embd;   // page-locked and mapped: the same address is valid on both cards
-            w1.head = model_->w.head;   // rank 1 never reads it; its type keeps the product plans alike
+            dense::Weights w1 = std::move(peer_w1_);
+            w1.embd = embd_dev_;     // page-locked and mapped: the same address is valid on both cards
+            w1.head = w0_head_;      // rank 1 never reads it; its type keeps the product plans alike
             dense::ModelPtr peer;
             std::string err;
             {
@@ -439,6 +439,8 @@ private:
         if (tp) {   // the pair's rank 1 model is built in attach(), once its slices have landed
             peer_w1_ = std::move(peer_w);
             tp_o0_ = o;
+            w0_head_ = w.head;
+            embd_dev_ = w.embd;
             reads.append(plan_);
             return true;
         }
@@ -883,6 +885,8 @@ private:
     std::optional<dense::tp::RankPlan> tp_plan0_, tp_plan1_;   // the pair's two card plans
     dense::Weights peer_w1_;                          ///< rank 1's layer weights, kept for attach()
     dense::Options tp_o0_;                            ///< the run's options, kept for rank 1's model
+    dense::Linear w0_head_{};                         ///< the head as loaded, for rank 1's type
+    const void* embd_dev_ = nullptr;                 ///< the embedding's device pointer, for rank 1
     std::vector<int64_t> tp_free_;                ///< per session-slot: rank 0's headroom gate (see attach)
 };
 
