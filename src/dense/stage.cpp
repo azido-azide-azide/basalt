@@ -689,6 +689,45 @@ bool split_session(Model& m, SessionState& st, std::string& err) {
     return init_state(*m.split_model, *st.peer, err);
 }
 
+TpHand::~TpHand() {
+    const core::OnDevice on(peer_dev);
+    mb.close();
+    peer_model.reset();
+}
+
+bool attach_tp(Model& m, ModelPtr peer, int dev, int64_t chunk_tokens, std::string& err) {
+    int main_dev = 0;
+    cudaGetDevice(&main_dev);
+    auto h = std::make_unique<TpHand>();
+    h->peer_model = std::move(peer);
+    h->peer = h->peer_model.get();
+    h->peer_dev = dev;
+    // one mailbox for the pair: two slots (a body's exchanges alternate between them), each big enough for a whole
+    // prompt chunk's residual rows - the widest payload one exchange carries
+    const size_t slot_bytes = (size_t) chunk_tokens * (size_t) m.g.n_embd * 2;
+    if (!h->mb.open(main_dev, dev, 2, slot_bytes, err)) {
+        err = m.o.arch + ": tensor pair: " + err;
+        return false;
+    }
+    h->peer->tp = h.get();
+    h->peer->tp_rank = 1;
+    m.tp_own = std::move(h);
+    m.tp = m.tp_own.get();
+    m.tp_rank = 0;
+    kernels::wgemm::plan_device(main_dev);   // the pair plans products as rank 0's (both ran under its device so far)
+    basalt::log::info("basalt dense", "tensor pair: CUDA%d and CUDA%d run every layer half-wide; %lld MiB of exchange "
+                          "slots (%zu x %zu)", main_dev, dev, (long long) (2 * slot_bytes >> 20), (long long) chunk_tokens,
+                      (size_t) m.g.n_embd);
+    return true;
+}
+
+bool tp_session(Model& m, SessionState& st, std::string& err) {
+    st.peer.reset(new SessionState());
+    st.peer->dev = m.tp->peer_dev;
+    const core::OnDevice on(m.tp->peer_dev);
+    return init_state(*m.tp->peer, *st.peer, err);
+}
+
 bool split_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos, const int32_t* pos3,
                  std::string& err) {
     Stage& L = *m.split;
