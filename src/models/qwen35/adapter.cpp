@@ -286,7 +286,8 @@ private:
             }
         }
         // the prompt split's copy of the last layers: its card's block reserved now, its weights read in the start's pass
-        if (split_at_ == 0 && !req.peer_devices.empty()) plan_stage(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
+        // the prompt split's stage would read the card the tensor pair's rank 1 already holds: no second reader under TP
+        if (!tp && split_at_ == 0 && !req.peer_devices.empty()) plan_stage(gg, g, req.peer_devices.front(), o.max_context, o.kv_resident);
         dense::Weights w;
         const int H = g.n_embd;
         // the token embedding stays in page-locked host memory; the kernels read the rows they need
