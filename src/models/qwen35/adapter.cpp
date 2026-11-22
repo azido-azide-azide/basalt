@@ -154,7 +154,7 @@ public:
         if (std::string err; !dense::attach_drafter(*model_, err)) return {model::Status::Error, err};
         if (tp_plan0_) {   // the tensor pair: rank 1's model now that its slices have landed, then the mailbox
             const int tp = 2, dev1 = tp_dev1_;
-            dense::Options o = model_->o;
+            dense::Options o = tp_o0_;
             o.drafter = dense::Drafter::None;
             o.draft = false;
             o.vision = false;
@@ -267,7 +267,7 @@ private:
             tp_dev1_ = req.peer_devices.empty() ? 1 : req.peer_devices.front();
         }
         g_full_ = &g;
-        plan_ = tp ? &*tp_plan0_ : nullptr;
+        tp_plan_ = tp ? &*tp_plan0_ : nullptr;
         if (!tp && !req.peer_devices.empty() && !plan_cards(gg, g, o, bd_meta, req, err)) return false;
         plan_file_ = plan_.file(path);
         stage_file_ = stage_plan_.file(path);
@@ -332,15 +332,15 @@ private:
             bool ok = true;
             {
                 const core::OnDevice on(tp_dev1_);
-                const dense::tp::RankPlan* keep = plan_;
-                plan_ = &*tp_plan1_;
+                const dense::tp::RankPlan* keep = tp_plan_;
+                tp_plan_ = &*tp_plan1_;
                 for (int il = 0; ok && il < g.n_layers; ++il) {
                     dense::Layer P;
                     P.kind = g.kinds[(size_t) il];
                     ok = layer(gg, g, il, P, err);
                     if (ok) peer_w.layers[(size_t) il] = P;
                 }
-                plan_ = keep;
+                tp_plan_ = keep;
             }
             if (!ok) return false;
             peer_bytes_ = dev_bytes_ - before;
@@ -438,6 +438,7 @@ private:
         if (!model_) return false;
         if (tp) {   // the pair's rank 1 model is built in attach(), once its slices have landed
             peer_w1_ = std::move(peer_w);
+            tp_o0_ = o;
             reads.append(plan_);
             return true;
         }
@@ -787,8 +788,8 @@ private:
     const float* floats(const GgufFile& gg, const std::string& name, int64_t elems, std::string& err) {
         const TensorInfo* t = need(gg, name, kTypeF32, elems, err);
         if (!t) return nullptr;
-        if (plan_) {
-            if (auto sl = tp_slice_for(name, *plan_, *g_full_)) return (const float*) upload_slice(gg, *t, *sl, err);
+        if (tp_plan_) {
+            if (auto sl = tp_slice_for(name, *tp_plan_, *g_full_)) return (const float*) upload_slice(gg, *t, *sl, err);
         }
         return (const float*) upload(gg, *t, err);
     }
@@ -798,8 +799,8 @@ private:
         const TensorInfo* ta = need(gg, a, kTypeBf16, elems, err);
         const TensorInfo* tb = ta ? need(gg, b, kTypeBf16, elems, err) : nullptr;
         if (!tb) return nullptr;
-        if (plan_) {
-            if (auto sl = tp_slice_for(a, *plan_, *g_full_)) return bf16_pair_slice(gg, *ta, *tb, *sl, err);
+        if (tp_plan_) {
+            if (auto sl = tp_slice_for(a, *tp_plan_, *g_full_)) return bf16_pair_slice(gg, *ta, *tb, *sl, err);
         }
         void* d = take(tensor_payload_bytes(*ta) + tensor_payload_bytes(*tb), a, err);
         if (!d) return nullptr;
@@ -830,8 +831,8 @@ private:
         l.type = type;
         l.rows = rows;
         l.cols = cols;
-        if (plan_) {
-            if (auto sl = tp_slice_for(base + ".weight", *plan_, *g_full_)) {   // the card's slice, repacked
+        if (tp_plan_) {
+            if (auto sl = tp_slice_for(base + ".weight", *tp_plan_, *g_full_)) {   // the card's slice, repacked
                 l.w = upload_slice(gg, *t, *sl, err);
                 if (!l.w) return false;
                 int64_t keep = 0;
@@ -877,10 +878,11 @@ private:
     uint64_t peer_bytes_ = 0;            // the weights there
     core::PromptStage stage_;         // the prompt split's stage (device -1: none)
     const dense::Geometry* g_full_ = nullptr;      // the pack's geometry, for the tensor-parallel slice dimensions
-    const dense::tp::RankPlan* plan_ = nullptr;    // set while a tensor-parallel card's weights load
+    const dense::tp::RankPlan* tp_plan_ = nullptr;   // set while a tensor-parallel card's weights load
     int tp_dev1_ = 1;                             // the tensor pair's rank 1 device
     std::optional<dense::tp::RankPlan> tp_plan0_, tp_plan1_;   // the pair's two card plans
     dense::Weights peer_w1_;                          ///< rank 1's layer weights, kept for attach()
+    dense::Options tp_o0_;                            ///< the run's options, kept for rank 1's model
     std::vector<int64_t> tp_free_;                ///< per session-slot: rank 0's headroom gate (see attach)
 };
 
