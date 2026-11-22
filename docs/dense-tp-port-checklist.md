@@ -129,8 +129,8 @@ Consequences of `main`'s phase split:
 
 ### Phase 0 — branch
 - [x] Branch `dense-tp-main-1122` created from `origin/main` (`ce0156a0`); working tree clean.
-- [ ] Base confirmed with Leon (GitHub main `ce0156a0`, not the newer local `merge-1121` scratch
-      `d49261fe`, which differs in 14 files incl. `adapter.hpp`/`options.hpp`).
+      Confirmed against GitHub: `refs/heads/main` = `ce0156a0` (README: synced to upstream
+      `1c97f52`, past 0.5.6). The local `merge-1121` scratch (`d49261fe`) is *not* main.
 
 ### Phase 1 — new files & moves
 - [ ] `src/core/tp_mailbox.{hpp,cu}` + `tests/core/tp_mailbox_test.cpp` added.
