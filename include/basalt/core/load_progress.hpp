@@ -61,11 +61,20 @@ public:
         emit_locked(std::chrono::steady_clock::now());
     }
 
-    /// Announces the bytes the whole start places (before the first is placed).
+    /// Announces the bytes the whole start places (before the first is placed).  A start is one announcement: the
+    /// counters are its own, so a second start in the same process (a test's two loads, an in-process reload) begins
+    /// at 0 rather than climbing past the new total on the first byte.
     static void announce_total(uint64_t bytes) {
         std::lock_guard<std::mutex> lk(weights_mu());
         W& w = weights();
         w.total = bytes;
+        w.placed = 0;
+        w.done = 0;
+        w.last_done = ~0ull;
+        w.last = Clock::now();
+        w.miscounted = false;
+        w.into.clear();
+        w.shares.clear();
         w.announced = true;
         basalt::log::info("basalt load", "total %llu", (unsigned long long) w.total);
         print_weights_locked();

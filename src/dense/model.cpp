@@ -145,7 +145,7 @@ size_t chunk_bytes(const Geometry& g) {
     const size_t keep = 6 * T * H * 4 + H * 4 +
                         std::max(prefill::mmq::q8_bytes(T, (int64_t) widest), prefill::fp8::act_bytes(T, (int64_t) widest)) +
                         prefill::fp4_dense::act_bytes((int64_t) T, (int64_t) widest) + 2 * T * 4 + 5 * 256;
-    const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T) : 0;
+    const size_t gdn = g.gdn_layers() ? (2 * T * C + 3 * T * VD + 4 * T * HV) * 4 + kernels::gdn_work_bytes(T, g.gdn_k_heads, g.gdn_v_heads) : 0;
     const size_t attn = g.attn_layers() ? T * (2 * AQ + 2 * (size_t) g.n_kv * g.head_dim + 3 * AQ) * 4 +
                                               kernels::gqa_prompt_split_floats((int64_t) T, g.n_head, kAttnSplits) * 4
                                         : 0;
@@ -484,7 +484,7 @@ bool Model::ensure_chunk(std::string& err) {
         b.gate = pre_arena.take<float>(T * HV);
         b.beta = pre_arena.take<float>(T * HV);
         b.ab = pre_arena.take<float>(T * 2 * HV);
-        b.work = pre_arena.take_bytes(kernels::gdn_work_bytes(T));
+        b.work = pre_arena.take_bytes(kernels::gdn_work_bytes(T, g.gdn_k_heads, g.gdn_v_heads));
         pre_arena.rewind(phase);
     }
     if (gg.attn_layers()) {
