@@ -222,6 +222,11 @@ engine (`serve/engine/process.py` `unload()` -> `__init__`), so they were never 
 in-process second load was. Pinned by `tests/core/load_progress_two_starts_test.cpp`, which
 fails 3 ways on the unpatched header.
 
+Confirmed on the real load (2026-11-22, free pair): `qwen35_tp_shard_load_test` rc=0, `all ok`,
+**0** warning lines, and the second start's bar now opens at `weights 0 19725443200` (it read
+`17559555200 19725443200` before the fix) and ends at `19725443200 19725443200`. Note the test
+binary must be relinked after the header change - a stale one silently measures the old code.
+
 ---
 
 ## 7. Gauntlet result (the TP-over-TS measurement)
