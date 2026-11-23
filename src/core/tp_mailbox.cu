@@ -1,4 +1,5 @@
 // src/core/tp_mailbox.cu - the two-card warp-epoch exchange (see include/basalt/core/tp_mailbox.hpp).
+#include <cstdlib>
 #include "basalt/core/tp_mailbox.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/vmm.hpp"
