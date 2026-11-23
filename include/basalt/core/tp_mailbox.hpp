@@ -57,10 +57,6 @@ public:
               bool want_device = true);
     void close();
 
-    /// Diagnostic: the payload/flag addresses each rank's slot 0 sees (a device path's VAs must be the same
-    /// number on both cards; the pinned path's block is one mapped allocation).
-    void trace(const char* what) const;
-
     /// True when the payloads are device VMM memory (one peer-link traversal per crossing); false on the pinned path.
     bool device_payload() const { return dev_payload_; }
 
