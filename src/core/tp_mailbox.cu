@@ -247,6 +247,71 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_f32_kernel(
                    SumF32{partial, out16});
 }
 
+// Publish this card's BF16 rounding of its fp32 product and release the lane's epoch: the first half of the split
+// exchange.  Nothing waits here, so the caller's next kernels are queued behind this one on its stream but the
+// peer's payload is not needed yet.
+__global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_publish_kernel(
+    const float* mine, Vec* mine_payload, uint32_t* mine_flags, uint32_t* epochs, int vecs, int rank, bool wt) {
+    const int lane = static_cast<int>(threadIdx.x & 31u);
+    const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    if (warp * (32 * kG) >= vecs) return;
+    const int base = warp * (32 * kG) + lane;
+    Vec pub[kG] = {};
+#pragma unroll
+    for (int j = 0; j < kG; ++j) {
+        const int v = base + j * 32;
+        if (v < vecs) pub[j] = AddBf16{mine, nullptr}.load_mine(v);
+    }
+#pragma unroll
+    for (int j = 0; j < kG; ++j) {
+        const int v = base + j * 32;
+        if (v < vecs) {
+            if (wt) __stwt(&mine_payload[v], pub[j]);
+            else mine_payload[v] = pub[j];
+        }
+    }
+    __syncwarp();
+    if (lane == 0) {
+        const uint32_t target = epochs[warp] + 1u;
+        flag_release(&mine_flags[warp * kFlagStride], target);
+        epochs[warp] = target;
+    }
+}
+
+// Wait the peer's epoch of this lane's round, then combine the two published payloads into `base`: the second half
+// of the split exchange.  This card's own published values are re-read from its slot (the registers are gone), so
+// the bits are exactly the ones `begin` published.
+__global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_combine_kernel(
+    VecBf16* base, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
+    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank) {
+    const int lane = static_cast<int>(threadIdx.x & 31u);
+    const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    if (warp * (32 * kG) >= vecs) return;
+    const int base_i = warp * (32 * kG) + lane;
+    const uint32_t target = epochs[warp];   // the round this lane published
+    if (lane == 0) {
+        unsigned spins = 0;
+        while (static_cast<int32_t>(flag_acquire(&peer_flags[warp * kFlagStride]) - target) < 0) {
+            __nanosleep(kPollSleepNs);
+            if (++spins % 1024u == 0u && (spins > kSpinLimit || flag_acquire(hang) != 0u)) {
+                cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*hang).store(1u, cuda::memory_order_relaxed);
+                break;
+            }
+        }
+    }
+    __syncwarp();
+    if (flag_acquire(hang) != 0u) return;
+    Vec mine[kG] = {}, peer[kG] = {};
+#pragma unroll
+    for (int j = 0; j < kG; ++j) {
+        const int v = base_i + j * 32;
+        if (v < vecs) {
+            mine[j] = __ldcv(&mine_payload[v]);
+            peer[j] = __ldcv(&peer_payload[v]);
+        }
+    }
+    AddBf16{nullptr, base}.finish(base_i, mine, peer, vecs);
+}
 dim3 exchange_grid(size_t vecs) {
     const size_t warps = (vecs + static_cast<size_t>(32 * kG) - 1) / (32 * kG);
     const size_t blocks = (warps + kBlockThreads / 32 - 1) / (kBlockThreads / 32);
@@ -503,6 +568,53 @@ bool TpMailbox::exchange_add_bf16(int rank, size_t slot, const float* mine, uint
         s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the add exchange failed";
+        return false;
+    }
+    return true;
+}
+
+bool TpMailbox::exchange_add_bf16_begin(int rank, size_t slot, const float* mine, size_t n, void* stream,
+                                        std::string& err) {
+    if (n == 0 || n % 8 != 0) {
+        err = "tp mailbox: an add exchange's value count is not a multiple of eight";
+        return false;
+    }
+    const size_t vecs = n / 8;
+    if (slot >= n_slots_ || vecs * kVecBytes > slot_bytes_) {
+        err = "tp mailbox: an add exchange's payload is out of range";
+        return false;
+    }
+    if (last_n_.size() < n_slots_) last_n_.assign(n_slots_, 0);
+    if (!n_agree(last_n_.data(), slot, rank, n, 1, err)) return false;
+    const Slot& s = slot_views_[slot];
+    const OnDevice on(rank == 0 ? dev0_ : dev1_);
+    exchange_add_bf16_publish_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        mine, s.payload[rank], s.flags[rank], s.epochs[rank], static_cast<int>(vecs), rank, dev_payload_);
+    if (cudaGetLastError() != cudaSuccess) {
+        err = "tp mailbox: launching the add exchange's publish failed";
+        return false;
+    }
+    return true;
+}
+
+bool TpMailbox::exchange_add_bf16_finish(int rank, size_t slot, uint16_t* base, size_t n, void* stream,
+                                         std::string& err) {
+    if (n == 0 || n % 8 != 0) {
+        err = "tp mailbox: an add exchange's value count is not a multiple of eight";
+        return false;
+    }
+    const size_t vecs = n / 8;
+    if (slot >= n_slots_ || vecs * kVecBytes > slot_bytes_) {
+        err = "tp mailbox: an add exchange's payload is out of range";
+        return false;
+    }
+    const Slot& s = slot_views_[slot];
+    const OnDevice on(rank == 0 ? dev0_ : dev1_);
+    exchange_add_bf16_combine_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<VecBf16*>(base), s.payload[rank], s.flags[rank], s.payload[1 - rank],
+        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank);
+    if (cudaGetLastError() != cudaSuccess) {
+        err = "tp mailbox: launching the add exchange's combine failed";
         return false;
     }
     return true;

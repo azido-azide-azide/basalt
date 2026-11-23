@@ -74,6 +74,14 @@ public:
     bool exchange_add_bf16(int rank, size_t slot, const float* mine, uint16_t* base, size_t n,
                            void* stream, std::string& err);
 
+    /// The split form of `exchange_add_bf16`, for a caller that has work to run between the two halves: `begin`
+    /// publishes this card's BF16 rounding of `mine` and releases the lane epochs (no wait), `finish` waits the
+    /// peer's epoch, reads both published payloads and combines them into `base`.  The two calls of one round must
+    /// be paired on both cards, and every begun round must be finished before `base` is read.  `mine` is not read
+    /// by `finish` (the published copy in the slot is), so the caller may reuse that buffer in between.
+    bool exchange_add_bf16_begin(int rank, size_t slot, const float* mine, size_t n, void* stream, std::string& err);
+    bool exchange_add_bf16_finish(int rank, size_t slot, uint16_t* base, size_t n, void* stream, std::string& err);
+
     /// FP32 payload exchange: `partial` (device fp32, `n` values) is replaced in place by the sum; with
     /// `bf16_out` the sum is also stored there rounded once (the FP32 payloads' combine is commutative, so both
     /// cards keep equal bits).
