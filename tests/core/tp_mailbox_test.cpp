@@ -5,6 +5,7 @@
 // order (tp_mailbox.cu's n_agree: rank 1 writes the slot's geometry, rank 0's compares), and the graphs are
 // captured and launched rank 1 first as the pair's drivers do.  Needs two GPUs; exits 77 without them.
 #include "basalt/core/tp_mailbox.hpp"
+#include "basalt/core/vmm.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -28,6 +29,9 @@ void check(bool ok, const std::string& what) {
     std::fflush(stdout);
     if (!ok) ++failures;
 }
+
+// Which payload path a mailbox opened with: device VMM or the pinned block.
+const char* path_name(bool device) { return device ? "device" : "pinned"; }
 
 // The host model of the combines, in the same rounding order as the kernels.
 uint16_t rn_bf16(float f) {
@@ -57,12 +61,17 @@ int main() {
     }
 
     const size_t kBytes = 1 << 20;  // the largest slot payload the mailbox opens with
+    const size_t kSlots = 16;
     TpMailbox mb;
     std::string err;
-    if (!mb.open(0, 1, 16, kBytes, err)) {
+    if (!mb.open(0, 1, kSlots, kBytes, err)) {
         std::printf("FAIL: open: %s\n", err.c_str());
         return 1;
     }
+    std::printf("note: payload path = %s (slot %zu B)\n", path_name(mb.device_payload()), mb.slot_bytes());
+    std::printf("note: vmm supported=%d gran=%llu\n", (int) basalt::core::vmm::supported(),
+                (unsigned long long) basalt::core::vmm::granularity());
+    mb.trace("device-path open");
     cudaStream_t s0, s1;
     cudaSetDevice(0);
     cudaStreamCreate(&s0);
@@ -90,7 +99,7 @@ int main() {
         std::vector<uint16_t> a = h0, b = h1;
         bool ok = true;
         for (int round = 0; round < 4 && ok; ++round) {
-            slot = (slot + 1) % 16;
+            slot = (slot + 1) % kSlots;
             cudaSetDevice(1);
             if (!mb.exchange_bf16(1, slot, p1, nbf * 2, s1, err)) { ok = false; break; }
             cudaSetDevice(0);
@@ -113,7 +122,9 @@ int main() {
         cudaFree(p0);
         cudaSetDevice(1);
         cudaFree(p1);
-    }
+        mb.close();   // the shape's slots are 2 MiB per slot: give them back before the next shape opens its own
+        if (!mb.open(0, 1, 16, kBytes, err)) { std::printf("FAIL: reopen: %s\n", err.c_str()); return 1; }
+        }
 
     // the fused residual add: base = bf16(fp32(base) + fp32(bf16(mine0)) + fp32(bf16(mine1)))
     {
@@ -142,7 +153,7 @@ int main() {
         cudaMemcpy(b1, base.data(), nval * 2, cudaMemcpyHostToDevice);
         bool ok = true;
         for (int round = 0; round < 3; ++round) {
-            slot = (slot + 1) % 16;
+            slot = (slot + 1) % kSlots;
             cudaSetDevice(1);
             ok = ok && mb.exchange_add_bf16(1, slot, d1, b1, nval, s1, err);
             cudaSetDevice(0);
@@ -192,7 +203,7 @@ int main() {
         cudaMalloc(&d1, nval * 4);
         cudaMalloc(&o1, nval * 2);
         cudaMemcpy(d1, f1.data(), nval * 4, cudaMemcpyHostToDevice);
-        slot = (slot + 1) % 16;
+        slot = (slot + 1) % kSlots;
         bool ok = true;
         cudaSetDevice(1);
         ok = ok && mb.exchange_f32(1, slot, d1, o1, nval, s1, err);
@@ -277,8 +288,17 @@ int main() {
         cudaFree(p1);
     }
 
-    // latency and bandwidth: median over consecutive exchanges at the biggest useful payloads.
-    {
+    // latency and bandwidth: median over consecutive exchanges at the biggest useful payloads.  Both paths, so a
+    // device-payload mailbox can be priced against the pinned one it replaces.
+    for (int path = 0; path < 2; ++path) {
+        const bool device = path == 0;
+        TpMailbox* mbp = device ? &mb : nullptr;
+        TpMailbox pin;
+        if (!device) {
+            if (!pin.open(0, 1, 16, kBytes, err, false)) { check(false, "the pinned latency mailbox opens: " + err); break; }
+            mbp = &pin;
+        }
+        TpMailbox& m = *mbp;
         const std::vector<std::pair<size_t, double>> bounds = {{40960, 200.0}, {163840, 400.0}, {1048576, 3000.0}};
         for (auto [bytes, us_bound] : bounds) {
             const size_t nbf = bytes / 2;
@@ -291,25 +311,26 @@ int main() {
             cudaMemset(p1, 0x3f, bytes);
             std::vector<double> times;
             for (int k = 0; k < 24; ++k) {
-                slot = (slot + 1) % 16;
+                slot = (slot + 1) % kSlots;
                 cudaSetDevice(1);
-                mb.exchange_bf16(1, slot, p1, bytes, s1, err);
+                m.exchange_bf16(1, slot, p1, bytes, s1, err);
                 auto t0 = std::chrono::steady_clock::now();
                 cudaSetDevice(0);
-                mb.exchange_bf16(0, slot, p0, bytes, s0, err);
+                m.exchange_bf16(0, slot, p0, bytes, s0, err);
                 cudaStreamSynchronize(s0);
                 cudaStreamSynchronize(s1);
                 times.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
             }
             const double med = median(times);
-            std::printf("note: exchange of %zu B: median %.1f us (%.2f GB/s per card)\n", bytes, med,
-                        bytes / med / 1000.0);
-            check(med < us_bound, "exchange of " + std::to_string(bytes) + " B under the bound");
+            std::printf("note: %s exchange of %zu B: median %.1f us (%.2f GB/s per card)\n", path_name(device), bytes,
+                        med, bytes / med / 1000.0);
+            check(med < us_bound, std::string(path_name(device)) + ": exchange of " + std::to_string(bytes) + " B under the bound");
             cudaSetDevice(0);
             cudaFree(p0);
             cudaSetDevice(1);
             cudaFree(p1);
         }
+        if (!device) pin.close();
     }
 
     // geometry disagreement: rank 1 says one payload size, rank 0 another - rank 0's call must refuse before
@@ -372,6 +393,64 @@ int main() {
     cudaStreamDestroy(s0);
     cudaStreamDestroy(s1);
     mb.close();
+
+    // the pinned path, on the same shapes: both paths must give the same bits, and the fallback must still open
+    {
+        TpMailbox pin;
+        if (!pin.open(0, 1, 16, kBytes, err, false)) {
+            check(false, "the pinned mailbox opens: " + err);
+        } else {
+            check(!pin.device_payload(), "want_device=false gives the pinned path");
+            cudaStream_t q0, q1;   // fresh streams: the device path's open/close moved the current device around
+            cudaSetDevice(0);
+            cudaStreamCreate(&q0);
+            cudaSetDevice(1);
+            cudaStreamCreate(&q1);
+            const size_t nbf = 640 * 8;
+            std::vector<uint16_t> h0(nbf), h1(nbf);
+            for (size_t i = 0; i < nbf; ++i) {
+                h0[i] = rn_bf16((rng() / float(rng.max())) * 4.0f - 2.0f);
+                h1[i] = rn_bf16((rng() / float(rng.max())) * 4.0f - 2.0f);
+            }
+            std::vector<uint16_t> a = h0, b = h1;
+            uint16_t *p0, *p1;
+            cudaSetDevice(0);
+            cudaMalloc(&p0, nbf * 2);
+            cudaMemcpy(p0, h0.data(), nbf * 2, cudaMemcpyHostToDevice);
+            cudaSetDevice(1);
+            cudaMalloc(&p1, nbf * 2);
+            cudaMemcpy(p1, h1.data(), nbf * 2, cudaMemcpyHostToDevice);
+            bool ok = true;
+            for (int round = 0; round < 4 && ok; ++round) {
+                slot = (slot + 1) % kSlots;
+                cudaSetDevice(1);
+                ok = ok && pin.exchange_bf16(1, slot, p1, nbf * 2, q1, err);
+                cudaSetDevice(0);
+                ok = ok && pin.exchange_bf16(0, slot, p0, nbf * 2, q0, err);
+                cudaStreamSynchronize(q1);
+                cudaStreamSynchronize(q0);
+                for (size_t i = 0; i < nbf; ++i) {
+                    const uint16_t s = rn_bf16(to_f(a[i]) + to_f(b[i]));
+                    a[i] = b[i] = s;
+                }
+            }
+            std::vector<uint16_t> r0(nbf), r1(nbf);
+            cudaSetDevice(0);
+            cudaMemcpy(r0.data(), p0, nbf * 2, cudaMemcpyDeviceToHost);
+            cudaSetDevice(1);
+            cudaMemcpy(r1.data(), p1, nbf * 2, cudaMemcpyDeviceToHost);
+            ok = ok && r0 == a && r1 == b && r0 == r1;
+            check(ok, "pinned path: bf16 sum exchange of 10 KiB over 4 rounds");
+            cudaSetDevice(0);
+            cudaFree(p0);
+            cudaSetDevice(1);
+            cudaFree(p1);
+            cudaStreamDestroy(q0);
+            cudaStreamDestroy(q1);
+            pin.close();
+        }
+    }
+
     std::printf("%s: %d failures\n", failures ? "FAIL" : "ok", failures);
     return failures ? 1 : 0;
 }
