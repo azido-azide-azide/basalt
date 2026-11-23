@@ -228,6 +228,16 @@ bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle) {
     return false;
 }
 
+bool grant_access(uint8_t* va, uint64_t bytes, int dev) {
+    const Fns& v = fns();
+    if (!v.ok || va == nullptr || bytes == 0 || dev < 0) return false;
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = dev;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    return v.set_access(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes, &access, 1) == CUDA_SUCCESS;
+}
+
 void unmap_only(uint8_t* va, uint64_t bytes) {
     const Fns& v = fns();
     if (v.ok && va != nullptr && bytes > 0) v.unmap(reinterpret_cast<CUdeviceptr>(va), (size_t) bytes);

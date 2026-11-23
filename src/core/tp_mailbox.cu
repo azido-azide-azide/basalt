@@ -1,6 +1,8 @@
 // src/core/tp_mailbox.cu - the two-card warp-epoch exchange (see include/basalt/core/tp_mailbox.hpp).
 #include "basalt/core/tp_mailbox.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/vmm.hpp"
+#include "basalt/log.hpp"
 
 #include <cuda/atomic>
 #include <cuda_bf16.h>
@@ -46,11 +48,14 @@ __device__ __forceinline__ void flag_release(uint32_t* p, uint32_t v) {
 // of the same round, then read the peer's vectors on the non-coherent path (the peer writes them from its own
 // card while this kernel runs) and hand everything to `combine`. All vector loads sit in flight before the
 // stores. Returns false, warp-uniformly, once the wait gave up; the hang word is set for every warp then.
+// `wt` says the payload is device memory: its publish store is then `st.global.wt`, which writes through to
+// memory instead of letting the card retire the block while it is still in its own caches (a plain store from
+// the writer is exactly how this rig once produced a first-token garbage bug over the pinned path).
 template <class Combine>
 __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine)[kG], Vec (&peer)[kG],
                                         const int vecs, Vec* mine_payload, uint32_t* mine_flags,
                                         const Vec* peer_payload, const uint32_t* peer_flags,
-                                        uint32_t* epochs, uint32_t* hang, Combine combine) {
+                                        uint32_t* epochs, uint32_t* hang, bool wt, Combine combine) {
     const int base = warp * (32 * kG) + lane;
 #pragma unroll
     for (int j = 0; j < kG; ++j) {
@@ -60,12 +65,15 @@ __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine
 #pragma unroll
     for (int j = 0; j < kG; ++j) {
         const int v = base + j * 32;
-        if (v < vecs) mine_payload[v] = mine[j];
+        if (v < vecs) {
+            if (wt) __stwt(&mine_payload[v], mine[j]);
+            else mine_payload[v] = mine[j];
+        }
     }
     __syncwarp();
+    const uint32_t target = epochs[warp] + 1u;   // the round this lane publishes and waits, whatever the lane count
     int ok = 1;
     if (lane == 0) {
-        const uint32_t target = epochs[warp] + 1u;
         flag_release(&mine_flags[warp * kFlagStride], target);
         unsigned spins = 0;
         while (static_cast<int32_t>(flag_acquire(&peer_flags[warp * kFlagStride]) - target) < 0) {
@@ -90,6 +98,11 @@ __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine
         if (v < vecs) peer[j] = __ldcv(&peer_payload[v]);
     }
     combine.finish(base, mine, peer, vecs);
+    // A device payload needs no write-after-read barrier of its own: the slot discipline already gives it.  A rank
+    // starts a slot's round n + 2 only after its round n + 1 waited for the peer's flag n + 1, which the peer
+    // releases from the kernel that already read the round n payload of this slot's peer line - so the publish of
+    // round n + 2 is ordered after the peer's read of round n.  Pinned memory needs none either.  (Adding the
+    // wait here instead deadlocks: kernel k would wait for the peer's k + 1, which waits for this kernel's k + 1.)
     return true;
 }
 
@@ -97,14 +110,14 @@ __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine
 template <class Combine>
 __device__ __forceinline__ void exchange_stage(int rank, Vec* mine_payload, uint32_t* mine_flags,
                                                const Vec* peer_payload, const uint32_t* peer_flags,
-                                               uint32_t* epochs, uint32_t* hang, const int vecs,
+                                               uint32_t* epochs, uint32_t* hang, const int vecs, bool wt,
                                                Combine combine) {
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     if (warp * (32 * kG) >= vecs) return;
     Vec mine[kG] = {}, peer[kG] = {};
     tp_lane(rank, warp, lane, mine, peer, vecs, mine_payload, mine_flags, peer_payload, peer_flags,
-            epochs, hang, combine);
+            epochs, hang, wt, combine);
 }
 
 // Publish this card's BF16 partial as-is; combine widens both values, adds and rounds once back into the
@@ -214,22 +227,23 @@ bool n_agree(size_t* last, size_t slot, int rank, size_t n, size_t kind, std::st
 
 __global__ __launch_bounds__(kBlockThreads) void exchange_bf16_kernel(
     VecBf16* partial, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
-    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank) {
-    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs,
+    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank, bool wt) {
+    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs, wt,
                    SumBf16{partial});
 }
 
 __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_kernel(
     const float* mine, VecBf16* base, Vec* mine_payload, uint32_t* mine_flags,
-    const Vec* peer_payload, const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank) {
-    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs,
+    const Vec* peer_payload, const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank,
+    bool wt) {
+    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs, wt,
                    AddBf16{mine, base});
 }
 
 __global__ __launch_bounds__(kBlockThreads) void exchange_f32_kernel(
     Vec* partial, uint2* out16, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
-    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank) {
-    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs,
+    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank, bool wt) {
+    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs, wt,
                    SumF32{partial, out16});
 }
 
@@ -241,8 +255,8 @@ dim3 exchange_grid(size_t vecs) {
 
 }  // namespace
 
-// One slot: its release lines and payload region in the shared pinned block (the same mapped addresses for
-// both cards) and the per-lane epochs in each card's memory.
+// One slot: its release lines in the shared pinned block (the same mapped addresses for both cards) and its payload
+// region per rank - in the pinned block, or in that rank's device VMM range when `dev_payload_`.
 struct TpMailbox::Slot {
     uint32_t* flags[2] = {nullptr, nullptr};
     Vec* payload[2] = {nullptr, nullptr};
@@ -274,7 +288,8 @@ void TpMailbox::poison() {
     if (hang_ != nullptr) std::atomic_ref<uint32_t>{*hang_}.store(1u, std::memory_order_relaxed);
 }
 
-bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_bytes, std::string& err) {
+bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_bytes, std::string& err,
+                     bool want_device) {
     close();
     if (rank0_dev == rank1_dev || slots == 0 || max_bytes == 0) {
         err = "tp mailbox: needs two cards, at least one slot and a positive payload";
@@ -289,16 +304,77 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
     const size_t rank_span = line_bytes_ + slot_bytes_;
     const size_t slot_span = 2 * rank_span;
     const size_t total = slot_span * slots + 256;
+    // The device path's pinned block holds every (slot, rank) pair's release lines in their own region, each
+    // `line_bytes` (one 64-byte line per warp lane); the fallback keeps the original interleaved layout.
+    const size_t dev_line_total = line_bytes_ * 2 * slots;
+
+    // ---- the payload region: device VMM when the driver offers it, else the pinned block ----
+    // One reserved range per rank holding all its slots' payloads, backed by one allocation on that rank's card
+    // and mapped there.  The owner then GRANTS the peer read/write access to the same address (cuMemSetAccess),
+    // so rank r publishes at its own range's address and the peer reads that same address: one mapping, one
+    // traversal of the link per crossing, and no reliance on the driver's peer access.  (Mapping the handle a
+    // second time into the peer's context is refused - a VA belongs to the context that reserved it.)
+    dev_payload_ = false;
+    if (want_device && vmm::supported()) {
+        const uint64_t g = vmm::granularity();
+        if (g != 0) {
+            // the payload needs no alignment pad (slot_bytes_ is whole KiB); the BACKING must be a whole granule
+            const uint64_t want = (uint64_t) slot_bytes_ * slots;
+            const uint64_t span = (want + g - 1) / g * g;
+            bool ok = true;
+            for (int rank = 0; rank < 2 && ok; ++rank) {
+                const OnDevice on(rank == 0 ? rank0_dev : rank1_dev);
+                uint8_t* va = vmm::reserve(span);
+                if (va == nullptr) { ok = false; break; }
+                const unsigned long long h = vmm::create(span);
+                if (h == 0) { vmm::release_range(va, span); ok = false; break; }
+                if (!vmm::map_handle(va, span, h)) {
+                    vmm::release(h);
+                    vmm::release_range(va, span);
+                    ok = false;
+                    break;
+                }
+                // the peer card reaches the same bytes at the same address
+                if (!vmm::grant_access(va, span, rank == 0 ? rank1_dev : rank0_dev)) {
+                    vmm::unmap_only(va, span);
+                    vmm::release(h);
+                    vmm::release_range(va, span);
+                    ok = false;
+                    break;
+                }
+                payload_va_[rank] = va;
+                payload_handle_[rank] = h;
+            }
+            if (ok) {
+                payload_span_ = span;
+                dev_payload_ = true;
+            } else {
+                for (int rank = 0; rank < 2; ++rank) {
+                    const OnDevice on(rank == 0 ? rank0_dev : rank1_dev);
+                    if (payload_va_[rank] != nullptr) vmm::unmap_only(payload_va_[rank], span);
+                    if (payload_handle_[rank] != 0) vmm::release(payload_handle_[rank]);
+                    if (payload_va_[rank] != nullptr) vmm::release_range(payload_va_[rank], span);
+                    payload_va_[rank] = nullptr;
+                    payload_handle_[rank] = 0;
+                }
+                payload_span_ = 0;
+            }
+        }
+    }
+
     void* pinned = nullptr;
-    if (cudaHostAlloc(&pinned, total, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
-        (void)cudaGetLastError();
-        err = "tp mailbox: out of page-locked memory for " + std::to_string(total >> 20) + " MiB";
+    // on the device path the pinned block carries only the release lines and the hang word
+    const size_t pinned_total = dev_payload_ ? dev_line_total + 256 : total;
+    if (cudaHostAlloc(&pinned, pinned_total, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        const cudaError_t e = cudaGetLastError();
+        err = "tp mailbox: out of page-locked memory for " + std::to_string(pinned_total >> 20) + " MiB (" +
+              std::string(cudaGetErrorString(e)) + ")";
         return false;
     }
-    std::memset(pinned, 0, total);
+    std::memset(pinned, 0, pinned_total);
     block_ = static_cast<uint8_t*>(pinned);
-    hang_ = reinterpret_cast<uint32_t*>(block_ + slot_span * slots);
-    gate_ = reinterpret_cast<uint32_t*>(block_ + slot_span * slots + 64);
+    hang_ = reinterpret_cast<uint32_t*>(block_ + pinned_total - 128);
+    gate_ = reinterpret_cast<uint32_t*>(block_ + pinned_total - 64);
     gate_seq_ = 0;
     *gate_ = 0;
     slot_views_ = new Slot[slots];
@@ -306,13 +382,13 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
     dev0_ = rank0_dev;
     dev1_ = rank1_dev;
     for (size_t s = 0; s < slots; ++s) {
-        uint8_t* at = block_ + slot_span * s;
-        // Under unified addressing one mapped pointer names the bytes on both cards; rank r's
-        // published bytes live in the slot's r-th section.
+        // the release lines keep their per-slot, per-rank layout on the fallback path; on the device path each
+        // (slot, rank) pair's lines have a region of their own, and the payload lives in that rank's device range
         for (int rank = 0; rank < 2; ++rank) {
-            uint8_t* sec = at + rank * (line_bytes_ + slot_bytes_);
-            slot_views_[s].flags[rank] = reinterpret_cast<uint32_t*>(sec);
-            slot_views_[s].payload[rank] = reinterpret_cast<Vec*>(sec + line_bytes_);
+            const size_t lines_at = dev_payload_ ? (s * 2 + rank) * line_bytes_ : slot_span * s + rank * rank_span;
+            slot_views_[s].flags[rank] = reinterpret_cast<uint32_t*>(block_ + lines_at);
+            uint8_t* pay = dev_payload_ ? payload_va_[rank] + s * slot_bytes_ : block_ + lines_at + line_bytes_;
+            slot_views_[s].payload[rank] = reinterpret_cast<Vec*>(pay);
         }
     }
     for (int rank = 0; rank < 2; ++rank) {
@@ -331,6 +407,16 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
     return true;
 }
 
+void TpMailbox::trace(const char* what) const {
+    std::printf("trace %s: device=%d slot_bytes=%zu slots=%zu\n", what, (int) dev_payload_, slot_bytes_, n_slots_);
+    for (int r = 0; r < 2; ++r) {
+        std::printf("  rank %d: payload_va=%p handle=%llu payload[0]=%p flags[0]=%p\n", r, (void*) payload_va_[r],
+                    (unsigned long long) payload_handle_[r], (void*) slot_views_[0].payload[r],
+                    (void*) slot_views_[0].flags[r]);
+    }
+    std::printf("  block=%p hang=%p gate=%p\n", (void*) block_, (void*) hang_, (void*) gate_);
+}
+
 void TpMailbox::close() {
     if (slot_views_ != nullptr) {
         for (int rank = 0; rank < 2; ++rank) {
@@ -346,6 +432,27 @@ void TpMailbox::close() {
     if (block_ != nullptr) {
         cudaFreeHost(block_);
         block_ = nullptr;
+    }
+    if (dev_payload_) {
+        for (int rank = 0; rank < 2; ++rank) {
+            if (payload_va_[rank] != nullptr) {
+                for (int d = 0; d < 2; ++d) {
+                    const int dev = d == 0 ? dev0_ : dev1_;
+                    if (dev < 0) continue;
+                    const OnDevice on(dev);
+                    vmm::unmap_only(payload_va_[rank], payload_span_);
+                }
+            }
+            if (payload_handle_[rank] != 0) vmm::release(payload_handle_[rank]);
+            if (payload_va_[rank] != nullptr) {
+                const OnDevice on(rank == 0 ? dev0_ : dev1_);
+                vmm::release_range(payload_va_[rank], payload_span_);
+            }
+            payload_va_[rank] = nullptr;
+            payload_handle_[rank] = 0;
+        }
+        payload_span_ = 0;
+        dev_payload_ = false;
     }
     hang_ = nullptr;
     n_slots_ = 0;
@@ -368,7 +475,7 @@ bool TpMailbox::exchange_bf16(int rank, size_t slot, void* partial, size_t bytes
     exchange_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
                            static_cast<cudaStream_t>(stream)>>>(
         static_cast<VecBf16*>(partial), s.payload[rank], s.flags[rank], s.payload[1 - rank],
-        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank);
+        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the BF16 exchange failed";
         return false;
@@ -395,7 +502,7 @@ bool TpMailbox::exchange_add_bf16(int rank, size_t slot, const float* mine, uint
     exchange_add_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
                                static_cast<cudaStream_t>(stream)>>>(
         mine, reinterpret_cast<VecBf16*>(base), s.payload[rank], s.flags[rank], s.payload[1 - rank],
-        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank);
+        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the add exchange failed";
         return false;
@@ -422,7 +529,7 @@ bool TpMailbox::exchange_f32(int rank, size_t slot, float* partial, uint16_t* bf
     exchange_f32_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<Vec*>(partial), reinterpret_cast<uint2*>(bf16_out), s.payload[rank],
         s.flags[rank], s.payload[1 - rank], s.flags[1 - rank], s.epochs[rank], hang_,
-        static_cast<int>(vecs), rank);
+        static_cast<int>(vecs), rank, dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the F32 exchange failed";
         return false;

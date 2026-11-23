@@ -11,6 +11,14 @@
 // The payloads cross PCIe as card-to-host reads of pinned memory: a card never needs to name the other card's
 // memory, so this works whether or not the driver granted peer access.
 //
+// The payload region is device VMM memory when the driver offers it (`basalt/core/vmm.hpp`): one backing per rank,
+// mapped under both cards' address ranges, so each rank's publish and the peer's read are device-to-device over the
+// peer link - one traversal of it per crossing instead of the two a host bounce buffer makes.  The per-warp release
+// lines and the hang word stay in the page-locked block: a release is a `thread_scope_system` atomic the two cards
+// must both see, which device memory cannot give them.  A device payload publishes with `st.global.wt` and reads
+// with `__ldcv` (the same non-coherent pair `tp_lane` already uses for the pinned path), so the peer's write is not
+// left in this card's caches.
+//
 // Slot use: a rank starts a slot's round n + 2 only after its round n + 1 waited for the peer's flag n + 1, which
 // the peer releases from the kernel that already read the round n payload of this slot's peer line; consecutive
 // exchanges therefore alternate slots. Within a captured graph, distinct slots per exchange site plus the graphs'
@@ -41,11 +49,20 @@ public:
     TpMailbox& operator=(const TpMailbox&) = delete;
 
     /// Opens `slots` slots, each holding `max_bytes`, for the ordered card pair (`rank0_dev`, `rank1_dev`).
-    /// Page-locked memory is allocated for every slot and mapped into both cards' address spaces; per-warp
-    /// release lines live at the front of each slot and a shared hang word at the front of the block.
-    /// `max_bytes` is rounded up to a multiple of `kVecBytes * 32 * kVecsPerLane` (the whole-geometry unit).
-    bool open(int rank0_dev, int rank1_dev, size_t slots, size_t max_bytes, std::string& err);
+    /// Page-locked memory is allocated for the per-warp release lines and the hang word, and mapped into both cards'
+    /// address spaces; each rank's payload region is device VMM memory when the driver offers it (see the header),
+    /// else the same page-locked block.  `max_bytes` is rounded up to a multiple of `kVecBytes * 32 * kVecsPerLane`
+    /// (the whole-geometry unit).
+    bool open(int rank0_dev, int rank1_dev, size_t slots, size_t max_bytes, std::string& err,
+              bool want_device = true);
     void close();
+
+    /// Diagnostic: the payload/flag addresses each rank's slot 0 sees (a device path's VAs must be the same
+    /// number on both cards; the pinned path's block is one mapped allocation).
+    void trace(const char* what) const;
+
+    /// True when the payloads are device VMM memory (one peer-link traversal per crossing); false on the pinned path.
+    bool device_payload() const { return dev_payload_; }
 
     /// Bytes of one slot's payload region and the number of slots.
     size_t slot_bytes() const { return slot_bytes_; }
@@ -89,11 +106,17 @@ private:
     size_t slot_bytes_ = 0;      // the payload region of one slot
     size_t line_bytes_ = 0;      // the release lines of one slot (one 64-byte line per warp lane)
     size_t n_slots_ = 0;
-    uint8_t* block_ = nullptr;   // the whole pinned block (slots' lines, then slots' payloads, then the hang word)
+    uint8_t* block_ = nullptr;   // the pinned block (slots' lines, then the hang word)
     uint32_t* hang_ = nullptr;   // the hang word (host view)
     uint32_t* gate_ = nullptr;   // the step gate's release count (host view; the mapped pointer names it on cards too)
     uint32_t gate_seq_ = 0;      // the host's issued step tokens
     Slot* slot_views_ = nullptr; // per slot: payload/flag pointers per rank and the per-rank device epochs
+    // the device VMM payload: one reserved range per rank, its backing handle, and the range's real extent (the
+    // driver's granularity rounds the reservation up, so the mapping is of the rounded length, not `slot_bytes_`)
+    uint8_t* payload_va_[2] = {nullptr, nullptr};
+    unsigned long long payload_handle_[2] = {0, 0};
+    uint64_t payload_span_ = 0;  // the reserved/mapped length of one rank's payload region
+    bool dev_payload_ = false;
     // the value count and exchange kind the pair's rank 1 last carried per slot (kind * kKindUnit + count), for
     // the enqueue-time agreement check that the two cards' exchanges say the same geometry (a mismatch wedges
     // the round forever); close() clears it, so a reopen starts the check off

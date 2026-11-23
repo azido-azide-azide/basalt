@@ -34,6 +34,10 @@ bool unmap(uint8_t* va, uint64_t bytes, unsigned long long handle);
 unsigned long long create(uint64_t bytes);
 /// Maps the first `bytes` of `handle` at `va`, readable and writable by the current device.
 bool map_handle(uint8_t* va, uint64_t bytes, unsigned long long handle);
+/// Grants `dev` read/write access to `[va, va + bytes)`, which the current device already maps: one backing two
+/// cards reach at the same address, without a second mapping (a VA is only mappable in the context that
+/// reserved it).  Use for a peer card's payload window.
+bool grant_access(uint8_t* va, uint64_t bytes, int dev);
 /// Unmaps `[va, va + bytes)` without releasing any handle (the mapping's reference goes with it).
 void unmap_only(uint8_t* va, uint64_t bytes);
 void release(unsigned long long handle);
