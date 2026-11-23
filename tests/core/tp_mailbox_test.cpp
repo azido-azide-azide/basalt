@@ -69,9 +69,6 @@ int main() {
         return 1;
     }
     std::printf("note: payload path = %s (slot %zu B)\n", path_name(mb.device_payload()), mb.slot_bytes());
-    std::printf("note: vmm supported=%d gran=%llu\n", (int) basalt::core::vmm::supported(),
-                (unsigned long long) basalt::core::vmm::granularity());
-    mb.trace("device-path open");
     cudaStream_t s0, s1;
     cudaSetDevice(0);
     cudaStreamCreate(&s0);

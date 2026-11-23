@@ -322,6 +322,20 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
             const uint64_t want = (uint64_t) slot_bytes_ * slots;
             const uint64_t span = (want + g - 1) / g * g;
             bool ok = true;
+            // A failure at rank r must leave NOTHING behind: the ranges already made are torn down before the
+            // fallback, or a later close() would unmap a VA that was never mapped (the engine's 80 MiB/rank
+            // allocation does not fit a card that already holds its weights, so this path is real).
+            auto tear_down = [&]() {
+                for (int r = 0; r < 2; ++r) {
+                    const OnDevice on(r == 0 ? rank0_dev : rank1_dev);
+                    if (payload_va_[r] == nullptr) continue;
+                    vmm::unmap_only(payload_va_[r], payload_span_);
+                    if (payload_handle_[r] != 0) vmm::release(payload_handle_[r]);
+                    vmm::release_range(payload_va_[r], payload_span_);
+                    payload_va_[r] = nullptr;
+                    payload_handle_[r] = 0;
+                }
+            };
             for (int rank = 0; rank < 2 && ok; ++rank) {
                 const OnDevice on(rank == 0 ? rank0_dev : rank1_dev);
                 uint8_t* va = vmm::reserve(span);
@@ -344,19 +358,12 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
                 }
                 payload_va_[rank] = va;
                 payload_handle_[rank] = h;
+                payload_span_ = span;
             }
             if (ok) {
-                payload_span_ = span;
                 dev_payload_ = true;
             } else {
-                for (int rank = 0; rank < 2; ++rank) {
-                    const OnDevice on(rank == 0 ? rank0_dev : rank1_dev);
-                    if (payload_va_[rank] != nullptr) vmm::unmap_only(payload_va_[rank], span);
-                    if (payload_handle_[rank] != 0) vmm::release(payload_handle_[rank]);
-                    if (payload_va_[rank] != nullptr) vmm::release_range(payload_va_[rank], span);
-                    payload_va_[rank] = nullptr;
-                    payload_handle_[rank] = 0;
-                }
+                tear_down();
                 payload_span_ = 0;
             }
         }
@@ -407,15 +414,6 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
     return true;
 }
 
-void TpMailbox::trace(const char* what) const {
-    std::printf("trace %s: device=%d slot_bytes=%zu slots=%zu\n", what, (int) dev_payload_, slot_bytes_, n_slots_);
-    for (int r = 0; r < 2; ++r) {
-        std::printf("  rank %d: payload_va=%p handle=%llu payload[0]=%p flags[0]=%p\n", r, (void*) payload_va_[r],
-                    (unsigned long long) payload_handle_[r], (void*) slot_views_[0].payload[r],
-                    (void*) slot_views_[0].flags[r]);
-    }
-    std::printf("  block=%p hang=%p gate=%p\n", (void*) block_, (void*) hang_, (void*) gate_);
-}
 
 void TpMailbox::close() {
     if (slot_views_ != nullptr) {

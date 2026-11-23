@@ -972,13 +972,14 @@ bool attach_tp(Model& m, ModelPtr peer, int dev, int64_t chunk_tokens, std::stri
     }
     h->peer->tp = h.get();
     h->peer->tp_rank = 1;
+    const bool device_payload = h->mb.device_payload();   // before the move: h is null afterwards
     m.tp_own = std::move(h);
     m.tp = m.tp_own.get();
     m.tp_rank = 0;
     kernels::wgemm::plan_device(main_dev);   // the pair plans products as rank 0's (both ran under its device so far)
     basalt::log::info("basalt dense", "tensor pair: CUDA%d and CUDA%d run every layer half-wide; %lld MiB of exchange "
                           "slots (%zu x %zu), %s payload", main_dev, dev, (long long) (2 * slot_bytes >> 20),
-                      (long long) chunk_tokens, (size_t) m.g.n_embd, h->mb.device_payload() ? "device" : "pinned");
+                      (long long) chunk_tokens, (size_t) m.g.n_embd, device_payload ? "device" : "pinned");
     return true;
 }
 
