@@ -389,10 +389,17 @@ void tp_chunk_finish(Model& m, size_t slot, uint16_t* base, int64_t n, cudaStrea
 // every product keeps the tile boundaries of a whole-chunk call (the same bits) while one half's exchange moves
 // beside the other half's compute.  0: the chunk runs as one call.
 //
-// OPT-IN (BASALT_TP_OVERLAP=1): the schedule is written and the mailbox's split form is bit-exact under test, but
-// the end-to-end path still faults in the window-decode launch, so it is off until that is understood.  Measured
-// prize if it is fixed: skipping the pair's exchanges outright takes the 27B pack's 16k prefill from 3,828 to
-// 7,455 tok/s, so the mailbox is roughly half the pair's prefill time.
+// OPT-IN (BASALT_TP_OVERLAP=1) and currently a REGRESSION on this model.  Measured at pp8192 (8,353 tokens,
+// 27B pack, block drafter), rep 1, engine tok/s:
+//   overlap off, real exchange  3,910   (2,136 ms)
+//   overlap off, no exchange    7,921   (1,055 ms)  -> the exchange is ~51% of prefill
+//   overlap on,  real exchange  1,679   (4,984 ms)  -> worse than not overlapping
+//   overlap on,  no exchange    7,719   (1,082 ms)  -> halving the rows costs only ~2.5%
+// Splitting every exchange into two rounds costs ~3.6x more than the bytes it hides: 512 rounds add 3,902 ms
+// where 256 whole rounds add 1,081 ms (~9.5 GB/s per card, near the Gen4 x8 practical ceiling).  The whole-chunk
+// exchange is already bandwidth-efficient; it needs concurrency with the compute, not halving.  Kept behind the
+// flag because the ordering work (split exchange + read epochs + per-card streams) is the prerequisite for any
+// finer-grained overlap.
 int prefill_overlap_split(int T) {
     static const bool on = std::getenv("BASALT_TP_OVERLAP") != nullptr;
     if (!on) return 0;
@@ -1301,8 +1308,12 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
             (block && std::find(m.w.dflash.target_layers.begin(), m.w.dflash.target_layers.end(), m.g.n_layers - 1) !=
                           m.w.dflash.target_layers.end());
         const cudaStream_t s = st.stream;
+        const BlockDrafter* taps = block ? &m.w.dflash : nullptr;
         const int split = prefill_overlap_split(T);
-        if (split > 0 && !block) {
+        size_t next_target = 0;
+        if (taps)
+            while (next_target < taps->target_layers.size() && taps->target_layers[next_target] < 0) ++next_target;
+        if (split > 0) {
             // The overlap: each layer's mixer and FFN run as two row halves, so one half's exchange moves beside
             // the other half's compute instead of stalling the card behind 2.4 GiB of BF16 traffic.  Rank 1 begins
             // every round first, so the two cards' rounds still pair; the finishes are queued in the same order as
@@ -1324,19 +1335,21 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
                     const Layer& lm = m.w.layers[(size_t) il];
                     {
                         const core::OnDevice on(m.tp->peer_dev);
-                        chunk_layer_mixer(*m.tp->peer, *st.peer, lp, il, firsts[h], counts[h], pos, unread, s,
-                                          !unread, &slot_mixer[h]);
+                        chunk_layer_mixer(*m.tp->peer, *st.peer, lp, il, firsts[h], counts[h], pos, unread,
+                                          st.peer->stream, !unread, &slot_mixer[h]);
                     }
                     chunk_layer_mixer(m, st, lm, il, firsts[h], counts[h], pos, unread, s, !unread, &slot_mixer[h]);
                 }
                 if (!unread) {
                     for (int h = 0; h < 2; ++h) {
                         const int64_t n = (int64_t) counts[h] * m.g.n_embd;
-                        const core::OnDevice on(m.tp->peer_dev);
-                        tp_chunk_finish(*m.tp->peer, slot_mixer[h],
-                                        const_cast<uint16_t*>(residual(m.tp->peer->cs)) +
-                                            (size_t) firsts[h] * m.g.n_embd,
-                                        n, s);
+                        {
+                            const core::OnDevice on(m.tp->peer_dev);
+                            tp_chunk_finish(*m.tp->peer, slot_mixer[h],
+                                            const_cast<uint16_t*>(residual(m.tp->peer->cs)) +
+                                                (size_t) firsts[h] * m.g.n_embd,
+                                            n, st.peer->stream);
+                        }
                         tp_chunk_finish(m, slot_mixer[h],
                                         const_cast<uint16_t*>(residual(m.cs)) + (size_t) firsts[h] * m.g.n_embd, n, s);
                     }
@@ -1348,19 +1361,28 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
                     const Layer& lm = m.w.layers[(size_t) il];
                     {
                         const core::OnDevice on(m.tp->peer_dev);
-                        chunk_ffn(*m.tp->peer, lp, counts[h], s, firsts[h], true, &slot_ffn[h]);
+                        chunk_ffn(*m.tp->peer, lp, counts[h], st.peer->stream, firsts[h], true, &slot_ffn[h]);
                     }
                     chunk_ffn(m, lm, counts[h], s, firsts[h], true, &slot_ffn[h]);
                 }
                 for (int h = 0; h < 2; ++h) {
                     const int64_t n = (int64_t) counts[h] * m.g.n_embd;
-                    const core::OnDevice on(m.tp->peer_dev);
-                    tp_chunk_finish(*m.tp->peer, slot_ffn[h],
-                                    const_cast<uint16_t*>(residual(m.tp->peer->cs)) +
-                                        (size_t) firsts[h] * m.g.n_embd,
-                                    n, s);
+                    {
+                        const core::OnDevice on(m.tp->peer_dev);
+                        tp_chunk_finish(*m.tp->peer, slot_ffn[h],
+                                        const_cast<uint16_t*>(residual(m.tp->peer->cs)) +
+                                            (size_t) firsts[h] * m.g.n_embd,
+                                        n, st.peer->stream);
+                    }
                     tp_chunk_finish(m, slot_ffn[h],
                                     const_cast<uint16_t*>(residual(m.cs)) + (size_t) firsts[h] * m.g.n_embd, n, s);
+                }
+                // the block drafter's features come off the completed residual, so they wait both halves' FFN
+                // rounds (rank 0 alone carries the taps)
+                if (block && taps && next_target < taps->target_layers.size() &&
+                    taps->target_layers[next_target] == il) {
+                    const core::OnDevice on(m.tp_rank == 0 ? 0 : 1);
+                    chunk_tap(m, st, T, *taps, next_target++);
                 }
             }
         } else {
