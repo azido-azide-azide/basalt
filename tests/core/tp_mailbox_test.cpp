@@ -391,6 +391,89 @@ int main() {
     cudaStreamDestroy(s1);
     mb.close();
 
+    // the split form (begin publishes, finish combines) must give the same bits as the one-call exchange,
+    // including with work queued between the two halves
+    {
+        const size_t nval = 640 * 8;
+        std::vector<float> m0(nval), m1(nval);
+        std::vector<uint16_t> base(nval);
+        for (size_t i = 0; i < nval; ++i) {
+            m0[i] = (rng() / float(rng.max())) * 4.0f - 2.0f;
+            m1[i] = (rng() / float(rng.max())) * 4.0f - 2.0f;
+            base[i] = rn_bf16((rng() / float(rng.max())) * 8.0f - 4.0f);
+        }
+        std::vector<uint16_t> want(nval);
+        for (size_t i = 0; i < nval; ++i)
+            want[i] = rn_bf16(to_f(base[i]) + to_f(rn_bf16(m0[i])) + to_f(rn_bf16(m1[i])));
+        float *d0, *d1, *scratch0, *scratch1;
+        uint16_t *b0, *b1;
+        cudaSetDevice(0);
+        cudaMalloc(&d0, nval * 4);
+        cudaMalloc(&b0, nval * 2);
+        cudaMalloc(&scratch0, 1 << 20);
+        cudaMemcpy(d0, m0.data(), nval * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(b0, base.data(), nval * 2, cudaMemcpyHostToDevice);
+        cudaSetDevice(1);
+        cudaMalloc(&d1, nval * 4);
+        cudaMalloc(&b1, nval * 2);
+        cudaMalloc(&scratch1, 1 << 20);
+        cudaMemcpy(d1, m1.data(), nval * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(b1, base.data(), nval * 2, cudaMemcpyHostToDevice);
+        bool ok = true;
+        TpMailbox sp;
+        if (!sp.open(0, 1, kSlots, kBytes, err)) { check(false, "the split mailbox opens: " + err); }
+        cudaStream_t t0, t1;
+        cudaSetDevice(0); cudaStreamCreate(&t0);
+        cudaSetDevice(1); cudaStreamCreate(&t1);
+        for (int round = 0; round < 4 && ok; ++round) {
+            slot = (slot + 1) % kSlots;
+            cudaSetDevice(1);
+            ok = ok && sp.exchange_add_bf16_begin(1, slot, d1, nval, t1, err);
+            cudaSetDevice(0);
+            ok = ok && sp.exchange_add_bf16_begin(0, slot, d0, nval, t0, err);
+            // work between the halves: a real kernel on each card, so the combine cannot rely on the publish
+            // kernel still holding the GPU
+            for (int k = 0; k < 8; ++k) {
+                cudaSetDevice(0);
+                ok = ok && cudaMemsetAsync(scratch0, k, 1 << 20, t0) == cudaSuccess;
+                cudaSetDevice(1);
+                ok = ok && cudaMemsetAsync(scratch1, k, 1 << 20, t1) == cudaSuccess;
+            }
+            cudaSetDevice(1);
+            ok = ok && sp.exchange_add_bf16_finish(1, slot, b1, nval, t1, err);
+            cudaSetDevice(0);
+            ok = ok && sp.exchange_add_bf16_finish(0, slot, b0, nval, t0, err);
+            cudaStreamSynchronize(t1);
+            cudaStreamSynchronize(t0);
+            for (size_t i = 0; i < nval; ++i)
+                want[i] = base[i] = rn_bf16(to_f(base[i]) + to_f(rn_bf16(m0[i])) + to_f(rn_bf16(m1[i])));
+        }
+        std::vector<uint16_t> r(nval);
+        cudaSetDevice(0);
+        cudaMemcpy(r.data(), b0, nval * 2, cudaMemcpyDeviceToHost);
+        ok = ok && r == want;
+        cudaSetDevice(1);
+        cudaMemcpy(r.data(), b1, nval * 2, cudaMemcpyDeviceToHost);
+        ok = ok && r == want;
+        if (!ok) {
+            size_t bad = 0;
+            for (size_t i = 0; i < nval; ++i) if (r[i] != want[i]) ++bad;
+            std::printf("  split: %zu of %zu values wrong (r==want %d)\n", bad, nval, (int) (r == want));
+        }
+        check(ok, "split exchange over 4 rounds with work between, equal bits on both cards");
+        cudaSetDevice(0);
+        cudaFree(d0);
+        cudaFree(b0);
+        cudaFree(scratch0);
+        cudaSetDevice(1);
+        cudaFree(d1);
+        cudaFree(b1);
+        cudaFree(scratch1);
+        cudaStreamDestroy(t0);
+        cudaStreamDestroy(t1);
+        sp.close();
+    }
+
     // the pinned path, on the same shapes: both paths must give the same bits, and the fallback must still open
     {
         TpMailbox pin;
