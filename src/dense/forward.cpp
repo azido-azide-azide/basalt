@@ -354,26 +354,43 @@ prefill::fp8::Segment f8_seg(const Linear& l, void* dst) { return {(const uint8_
 uint16_t* residual(ChunkScratch& b) { return reinterpret_cast<uint16_t*>(b.x); }
 uint16_t* bf(float* p) { return reinterpret_cast<uint16_t*>(p); }
 
-// x += W . a: the column-parallel product added to the chunk's BF16 residual rows - on a tensor-parallel pair, the
+// x += W . a: the column-parallel product added to a row range's BF16 residual rows - on a tensor-parallel pair, the
 // card's FP32 partial instead, and the two cards' partials and the residual meet over the mailbox (one rounding).
-void tp_chunk_add(Model& m, float* part, int64_t n, int T, cudaStream_t s) {
-    (void) T;
+// `base` is the range's first residual row; `n` is the range's value count (rows x rows-per-row).
+void tp_chunk_add(Model& m, float* part, uint16_t* base, int64_t n, cudaStream_t s) {
     std::string e;
-    if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, residual(m.cs), (size_t) n, s, e)) {
+    if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, base, (size_t) n, s, e)) {
         basalt::log::error("dense tp", "%s", e.c_str());
         m.tp->mb.poison();   // the chunk's rounds no longer pair: the caller's sync refuses the read
     }
 }
 
+// The split form: publish this card's partial and leave the exchange open, so the caller can queue the other row
+// range's work before finishing it.  `finish` carries the same `base`/`n`.
+void tp_chunk_begin(Model& m, float* part, int64_t n, cudaStream_t s) {
+    std::string e;
+    if (!m.tp->mb.exchange_add_bf16_begin(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, (size_t) n, s, e)) {
+        basalt::log::error("dense tp", "%s", e.c_str());
+        m.tp->mb.poison();
+    }
+}
+void tp_chunk_finish(Model& m, uint16_t* base, int64_t n, cudaStream_t s) {
+    std::string e;
+    if (!m.tp->mb.exchange_add_bf16_finish(m.tp_rank, (m.tp->epi[m.tp_rank] - 1) & 1, base, (size_t) n, s, e)) {
+        basalt::log::error("dense tp", "%s", e.c_str());
+        m.tp->mb.poison();
+    }
+}
+
 // x += W . a for a chunk's output projection on other matrix types (FP32 a): NVFP4 planes add into the BF16 residual in
 // their epilogue (in fp32, rounded once), others through tmp
-void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int T, cudaStream_t s) {
+void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int T, uint16_t* base, cudaStream_t s) {
     ChunkScratch& b = m.cs;
     chunk_act(m, a, l.type, cols, T, s);
     if (l.type == kTypeNvfp4Planes) {
         if (m.tp) {
             prefill::fp4_dense::product(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, b.tmp, l.rows, false, s);
-            tp_chunk_add(m, b.tmp, (int64_t) T * l.rows, T, s);
+            tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
             return;
         }
         prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, residual(b), l.rows, s);
@@ -382,32 +399,33 @@ void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int
     gemm(m, l, b.tmp, T, s);
     if (m.tp) {
         if (post_scale(l)) kernels::scale_values(b.tmp, post_scale(l), (int64_t) T * l.rows, s);
-        tp_chunk_add(m, b.tmp, (int64_t) T * l.rows, T, s);
+        tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
         return;
     }
-    kernels::add_scaled(residual(b), b.tmp, post_scale(l), (int64_t) T * l.rows, s);
+    kernels::add_scaled(base, b.tmp, post_scale(l), (int64_t) T * l.rows, s);
 }
 // x += W . a for an F8 output projection whose input rows its producer already rounded into b.xq
-void chunk_residual_f8(Model& m, const Linear& l, int T, cudaStream_t s) {
+void chunk_residual_f8(Model& m, const Linear& l, int T, uint16_t* base, cudaStream_t s) {
     if (m.tp) {
         prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, m.cs.tmp, l.rows,
                            prefill::fp8::Epilogue::Store, s);
-        tp_chunk_add(m, m.cs.tmp, (int64_t) T * l.rows, T, s);
+        tp_chunk_add(m, m.cs.tmp, base, (int64_t) T * l.rows, s);
         return;
     }
-    prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, residual(m.cs), l.rows,
+    prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, base, l.rows,
                        prefill::fp8::Epilogue::AddBf16, s);
 }
 // x += W . a for an NVFP4 planes output projection of BF16 rows a whose producer gave each token's largest |value| (rowmax)
-void chunk_residual_fp4(Model& m, const Linear& l, const uint16_t* a, const float* rowmax, int64_t cols, int T, cudaStream_t s) {
+void chunk_residual_fp4(Model& m, const Linear& l, const uint16_t* a, const float* rowmax, int64_t cols, int T,
+                        uint16_t* base, cudaStream_t s) {
     ChunkScratch& b = m.cs;
     prefill::fp4_dense::quantize_amax(a, rowmax, T, cols, cols, b.a4, b.gs, s);
     if (m.tp) {
         prefill::fp4_dense::product(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, b.tmp, l.rows, false, s);
-        tp_chunk_add(m, b.tmp, (int64_t) T * l.rows, T, s);
+        tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
         return;
     }
-    prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, residual(b), l.rows, s);
+    prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, base, l.rows, s);
 }
 
 // K/V streaming, a prompt chunk: an attention layer reads its far cells from the model's VRAM stage instead of host
@@ -461,10 +479,13 @@ kernels::KvInt8 prompt_cells(Model& m, const kernels::KvInt8& q8, int64_t cells,
 // and v products and the same cache write, without the queries, the attention and the output projection.  `far`: a
 // streamed cache's far cells (the chunk's rows are written there and read from the stage; stage_prefetch has run).
 void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
-                kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far_kv = {}) {
+                kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far_kv = {}, int first = 0) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim;
+    uint16_t* const xb = residual(b) + (size_t) first * H;   // this row range's residual rows
+    const int32_t* const pv = b.pos + (size_t) first * 3;    // and its rope positions
+    const int64_t p0 = pos + first;                          // its first cell
     const bool f8 = all_f8({&L.q, &L.k, &L.v, &L.o}), nvfp4 = all_nvfp4({&L.q, &L.k, &L.v, &L.o});
     if (f8 || nvfp4) {
         // the norm in the quantizer, the q, k and v products BF16 out (F8: one product), the gate's rows straight to E4M3 for
@@ -472,8 +493,8 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         const auto product = [&](const Linear& l, float* dst) {
             prefill::fp4_dense::product_bf16(l.w, l.scale, l.rows, H, b.a4, b.gs, T, bf(dst), l.rows, s);
         };
-        if (f8) prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
-        else prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
+        if (f8) prefill::fp8::rms_norm_quantize(xb, L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
+        else prefill::fp4_dense::rms_norm_quantize(xb, L.attn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
         if (cells_only) {
             if (f8) {
                 const prefill::fp8::Segment seg[2] = {f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
@@ -482,8 +503,8 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
                 product(L.k, b.k);
                 product(L.v, b.v);
             }
-            kernels::attn_qk_prepare_bf16(nullptr, bf(b.k), bf(b.v), nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr,
-                                          pos, s, q8, kc, vc, far_kv);
+            kernels::attn_qk_prepare_bf16(nullptr, bf(b.k), bf(b.v), nullptr, L.k_norm, g.eps, g.rope, pv, T, 0, g.n_kv,
+                                          nullptr, p0, s, q8, kc, vc, far_kv);
             return;
         }
         if (f8) {
@@ -494,34 +515,34 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
             product(L.k, b.k);
             product(L.v, b.v);
         }
-        kernels::attn_qk_prepare_bf16(bf(b.qfull), bf(b.k), bf(b.v), L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv,
-                                      bf(b.qo), pos, s, q8, kc, vc, far_kv);
-        const kernels::KvFar read = stage_far(m, far_kv, pos, T, s);
+        kernels::attn_qk_prepare_bf16(bf(b.qfull), bf(b.k), bf(b.v), L.q_norm, L.k_norm, g.eps, g.rope, pv, T, g.n_head,
+                                      g.n_kv, bf(b.qo), p0, s, q8, kc, vc, far_kv);
+        const kernels::KvFar read = stage_far(m, far_kv, p0, T, s);
         const size_t split = kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits);
         uint8_t* e4 = (uint8_t*) b.xq;
         float* e4s = prefill::fp8::act_scales(b.xq, T, AQ);
         if (q8.k) {   // BF16 queries and output rows
-            const kernels::KvInt8 r8 = prompt_cells(m, q8, pos + T, s);
-            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, pos, T, bf(b.ao), s, r8, b.attn_split, split, read);
+            const kernels::KvInt8 r8 = prompt_cells(m, q8, p0 + T, s);
+            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, p0, T, bf(b.ao), s, r8, b.attn_split, split, read);
             if (f8) kernels::attn_gate_e4m3(bf(b.ao), bf(b.qfull), T, g.n_head, e4, e4s, s);
             else kernels::attn_gate_bf16(bf(b.ao), bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
         } else {      // an fp16 cache's prompt kernel reads FP32 queries (the gate's BF16 rows reuse their buffer)
             kernels::to_f32(bf(b.qo), b.ag, (int64_t) T * AQ, s);
-            kernels::gqa_prompt_attn(b.ag, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split, split, read);
+            kernels::gqa_prompt_attn(b.ag, kc, vc, g.n_head, g.n_kv, p0, T, b.ao, s, q8, b.attn_split, split, read);
             if (f8) kernels::attn_gate_e4m3(b.ao, bf(b.qfull), T, g.n_head, e4, e4s, s);
             else kernels::attn_gate_bf16(b.ao, bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
         }
-        if (f8) chunk_residual_f8(m, L.o, T, s);
-        else chunk_residual_fp4(m, L.o, bf(b.ag), b.hmax, AQ, T, s);
+        if (f8) chunk_residual_f8(m, L.o, T, xb, s);
+        else chunk_residual_fp4(m, L.o, bf(b.ag), b.hmax, AQ, T, xb, s);
         return;
     }
-    kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
+    kernels::rms_norm_rows(xb, L.attn_norm, b.xn, T, H, g.eps, s);
     if (cells_only) {
         chunk_act(m, b.xn, L.k.type, H, T, s);
         gemm(m, L.k, b.k, T, s);
         gemm(m, L.v, b.v, T, s);
-        kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr, kc, vc, pos, s,
-                                 256, true, 0, nullptr, q8, far_kv);
+        kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, pv, T, 0, g.n_kv, nullptr, kc, vc, p0,
+                                 s, 256, true, 0, nullptr, q8, far_kv);
         return;
     }
     chunk_act(m, b.xn, L.q.type, H, T, s);
@@ -529,18 +550,19 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     if (L.k.type != L.q.type) chunk_act(m, b.xn, L.k.type, H, T, s);
     gemm(m, L.k, b.k, T, s);
     gemm(m, L.v, b.v, T, s);
-    kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
-                             pos, s, 256, true, 0, nullptr, q8, far_kv);
-    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, prompt_cells(m, q8, pos + T, s), b.attn_split,
-                             kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far_kv, pos, T, s));
+    kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, pv, T, g.n_head, g.n_kv, b.qo, kc, vc,
+                             p0, s, 256, true, 0, nullptr, q8, far_kv);
+    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, p0, T, b.ao, s, prompt_cells(m, q8, p0 + T, s), b.attn_split,
+                             kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far_kv, p0, T, s));
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
-    chunk_residual(m, L.o, b.ag, AQ, T, s);
+    chunk_residual(m, L.o, b.ag, AQ, T, xb, s);
 }
 
-void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s) {
+void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s, int first = 0) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, VD = g.value_width(), HV = g.gdn_v_heads;
+    uint16_t* const xb = residual(b) + (size_t) first * H;   // this row range's residual rows
     float* state = st.gdn + (size_t) gi * st.gdn_floats;
     float* hist = state + (size_t) g.gdn_state * HV * g.gdn_state;
     const bool f8 = all_f8({&L.qkv, &L.z, &L.out}), nvfp4 = all_nvfp4({&L.qkv, &L.z, &L.out});
@@ -549,11 +571,11 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
         // the conv and the recurrence on BF16 rows, the closing norm straight to E4M3 for an F8 out, else to BF16 rows with
         // each row's amax, read once by out's FP4 quantizer
         if (f8) {
-            prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, bf(b.xn), s);
+            prefill::fp8::rms_norm_quantize(xb, L.attn_norm, g.eps, T, H, b.xq, bf(b.xn), s);
             const prefill::fp8::Segment seg[2] = {f8_seg(L.qkv, b.qkv), f8_seg(L.z, b.z)};
             prefill::fp8::gemm_segmented(seg, 2, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
         } else {
-            prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, bf(b.xn), s);
+            prefill::fp4_dense::rms_norm_quantize(xb, L.attn_norm, g.eps, T, H, b.a4, b.gs, bf(b.xn), s);
             prefill::fp4_dense::product_bf16(L.qkv.w, L.qkv.scale, L.qkv.rows, H, b.a4, b.gs, T, bf(b.qkv), L.qkv.rows, s);
             prefill::fp4_dense::product_bf16(L.z.w, L.z.scale, L.z.rows, H, b.a4, b.gs, T, bf(b.z), L.z.rows, s);
         }
@@ -562,16 +584,16 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
         if (f8) {
             kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
                                          (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD), nullptr, nullptr, g.gdn_k_heads, HV);
-            chunk_residual_f8(m, L.out, T, s);
+            chunk_residual_f8(m, L.out, T, xb, s);
             return;
         }
         kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
                                      nullptr, nullptr, bf(b.yn), b.hmax, g.gdn_k_heads, HV);
-        chunk_residual_fp4(m, L.out, bf(b.yn), b.hmax, VD, T, s);
+        chunk_residual_fp4(m, L.out, bf(b.yn), b.hmax, VD, T, xb, s);
         return;
     }
     {
-        kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
+        kernels::rms_norm_rows(xb, L.attn_norm, b.xn, T, H, g.eps, s);
         chunk_act(m, b.xn, L.qkv.type, H, T, s);
         gemm(m, L.qkv, b.qkv, T, s);
         if (L.z.type != L.qkv.type) chunk_act(m, b.xn, L.z.type, H, T, s);
@@ -581,31 +603,32 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
     kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s, g.gdn_k_heads, HV);
     kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn,
                              nullptr, nullptr, g.gdn_k_heads, HV);
-    chunk_residual(m, L.out, b.yn, VD, T, s);
+    chunk_residual(m, L.out, b.yn, VD, T, xb, s);
 }
 
 
-void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
+void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s, int first = 0) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
+    uint16_t* const xb = residual(b) + (size_t) first * H;   // this row range's residual rows
     if (L.gate.type == kTypeNvfp4Planes && L.up.type == kTypeNvfp4Planes && L.down.type == kTypeNvfp4Planes) {
         // NVFP4 planes: the norm in the quantizer, W4A4 on the TMA products, gate and up as one SwiGLU product, the residual
         // added by down's; H is BF16 (in b.h's buffer), read once by its quantizer
         uint16_t* h16 = reinterpret_cast<uint16_t*>(b.h);
-        prefill::fp4_dense::rms_norm_quantize(residual(b), L.ffn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
+        prefill::fp4_dense::rms_norm_quantize(xb, L.ffn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
         prefill::fp4_dense::swiglu(L.gate.w, L.up.w, L.gate.scale, L.up.scale, L.gate.rows, H, b.a4, b.gs, T, h16, g.n_ff, s,
                                    b.hmax);
         prefill::fp4_dense::quantize_amax(h16, b.hmax, T, g.n_ff, g.n_ff, b.a4, b.gs, s);
         if (m.tp) {
             prefill::fp4_dense::product(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, b.tmp, H, false, s);
-            tp_chunk_add(m, b.tmp, (int64_t) T * H, T, s);
+            tp_chunk_add(m, b.tmp, xb, (int64_t) T * H, s);
             return;
         }
-        prefill::fp4_dense::product_add_bf16(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, residual(b), H, s);
+        prefill::fp4_dense::product_add_bf16(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, xb, H, s);
         return;
     }
-    kernels::rms_norm_rows(residual(b), L.ffn_norm, b.xn, T, H, g.eps, s);
+    kernels::rms_norm_rows(xb, L.ffn_norm, b.xn, T, H, g.eps, s);
     chunk_act(m, b.xn, L.gate.type, H, T, s);
     gemm(m, L.gate, b.g, T, s);
     if (L.up.type != L.gate.type) chunk_act(m, b.xn, L.up.type, H, T, s);
@@ -615,10 +638,10 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     gemm(m, L.down, b.tmp, T, s);
     if (m.tp) {
         if (L.down.scale) kernels::scale_values(b.tmp, L.down.scale, (int64_t) T * H, s);
-        tp_chunk_add(m, b.tmp, (int64_t) T * H, T, s);
+        tp_chunk_add(m, b.tmp, xb, (int64_t) T * H, s);
         return;
     }
-    kernels::add_scaled(residual(b), b.tmp, L.down.scale, (int64_t) T * H, s);
+    kernels::add_scaled(xb, b.tmp, L.down.scale, (int64_t) T * H, s);
 }
 
 // The block drafter's rope: plain positions over the whole head.
