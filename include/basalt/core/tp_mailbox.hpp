@@ -41,7 +41,7 @@ public:
     // The payload unit: 16 bytes, one PCIe transaction per access.
     static constexpr size_t kVecBytes = 16;
     // Payload vectors one warp lane publishes and reads (one KiB of payload per lane).
-    static constexpr int kVecsPerLane = 2;
+    static constexpr int kVecsPerLane = 4;
 
     TpMailbox() = default;
     ~TpMailbox();
