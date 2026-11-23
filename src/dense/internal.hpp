@@ -293,7 +293,7 @@ void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float*
 /// into cs.dacc (the first target layer's written, the later ones' added).  The last layer's rows are made in full when
 /// something reads them (`read_last`, a drafter), else only its cells.
 void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last = false,
-                    int scan_l1 = -1);
+                    int scan_l1 = -1, int first = 0);
 /// The block drafter's feature projection j of the rows in cs.x into cs.dacc (j == 0 writes it, later ones add).
 void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j);
 /// After the last layer: the block drafter's context from cs.dacc, or the MTP history.
