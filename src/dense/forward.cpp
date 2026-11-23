@@ -367,30 +367,43 @@ void tp_chunk_add(Model& m, float* part, uint16_t* base, int64_t n, cudaStream_t
 
 // The split form: publish this card's partial and leave the exchange open, so the caller can queue the other row
 // range's work before finishing it.  `finish` carries the same `base`/`n`.
-void tp_chunk_begin(Model& m, float* part, int64_t n, cudaStream_t s) {
+size_t tp_chunk_begin(Model& m, float* part, int64_t n, cudaStream_t s) {
+    const size_t slot = m.tp->epi[m.tp_rank]++ & 1;
     std::string e;
-    if (!m.tp->mb.exchange_add_bf16_begin(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, (size_t) n, s, e)) {
+    if (!m.tp->mb.exchange_add_bf16_begin(m.tp_rank, slot, part, (size_t) n, s, e)) {
         basalt::log::error("dense tp", "%s", e.c_str());
-        m.tp->mb.poison();
+        m.tp->mb.poison();   // the chunk's rounds no longer pair: the caller's sync refuses the read
     }
+    return slot;
 }
-void tp_chunk_finish(Model& m, uint16_t* base, int64_t n, cudaStream_t s) {
+void tp_chunk_finish(Model& m, size_t slot, uint16_t* base, int64_t n, cudaStream_t s) {
     std::string e;
-    if (!m.tp->mb.exchange_add_bf16_finish(m.tp_rank, (m.tp->epi[m.tp_rank] - 1) & 1, base, (size_t) n, s, e)) {
+    if (!m.tp->mb.exchange_add_bf16_finish(m.tp_rank, slot, base, (size_t) n, s, e)) {
         basalt::log::error("dense tp", "%s", e.c_str());
         m.tp->mb.poison();
     }
 }
 
+// The prefill-overlap split of a chunk: the first row of the two halves, 128-aligned, each at least 384 rows, so
+// every product keeps the tile boundaries of a whole-chunk call (the same bits) while one half's exchange moves
+// beside the other half's compute.  0: the chunk runs as one call.
+int prefill_overlap_split(int T) {
+    constexpr int kAlign = 128, kMinHalf = 384;
+    const int split = T / 2 / kAlign * kAlign;
+    return split >= kMinHalf && T - split >= kMinHalf ? split : 0;
+}
+
 // x += W . a for a chunk's output projection on other matrix types (FP32 a): NVFP4 planes add into the BF16 residual in
 // their epilogue (in fp32, rounded once), others through tmp
-void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int T, uint16_t* base, cudaStream_t s) {
+void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int T, uint16_t* base, cudaStream_t s,
+                    bool defer = false, size_t* slot = nullptr) {
     ChunkScratch& b = m.cs;
     chunk_act(m, a, l.type, cols, T, s);
     if (l.type == kTypeNvfp4Planes) {
         if (m.tp) {
             prefill::fp4_dense::product(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, b.tmp, l.rows, false, s);
-            tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
+            if (defer) { if (slot) *slot = tp_chunk_begin(m, b.tmp, (int64_t) T * l.rows, s); }
+            else tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
             return;
         }
         prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, residual(b), l.rows, s);
@@ -405,11 +418,13 @@ void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int
     kernels::add_scaled(base, b.tmp, post_scale(l), (int64_t) T * l.rows, s);
 }
 // x += W . a for an F8 output projection whose input rows its producer already rounded into b.xq
-void chunk_residual_f8(Model& m, const Linear& l, int T, uint16_t* base, cudaStream_t s) {
+void chunk_residual_f8(Model& m, const Linear& l, int T, uint16_t* base, cudaStream_t s, bool defer = false,
+                       size_t* slot = nullptr) {
     if (m.tp) {
         prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, m.cs.tmp, l.rows,
                            prefill::fp8::Epilogue::Store, s);
-        tp_chunk_add(m, m.cs.tmp, base, (int64_t) T * l.rows, s);
+        if (defer) { if (slot) *slot = tp_chunk_begin(m, m.cs.tmp, (int64_t) T * l.rows, s); }
+        else tp_chunk_add(m, m.cs.tmp, base, (int64_t) T * l.rows, s);
         return;
     }
     prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, base, l.rows,
@@ -417,12 +432,13 @@ void chunk_residual_f8(Model& m, const Linear& l, int T, uint16_t* base, cudaStr
 }
 // x += W . a for an NVFP4 planes output projection of BF16 rows a whose producer gave each token's largest |value| (rowmax)
 void chunk_residual_fp4(Model& m, const Linear& l, const uint16_t* a, const float* rowmax, int64_t cols, int T,
-                        uint16_t* base, cudaStream_t s) {
+                        uint16_t* base, cudaStream_t s, bool defer = false, size_t* slot = nullptr) {
     ChunkScratch& b = m.cs;
     prefill::fp4_dense::quantize_amax(a, rowmax, T, cols, cols, b.a4, b.gs, s);
     if (m.tp) {
         prefill::fp4_dense::product(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, b.tmp, l.rows, false, s);
-        tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
+        if (defer) { if (slot) *slot = tp_chunk_begin(m, b.tmp, (int64_t) T * l.rows, s); }
+        else tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
         return;
     }
     prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, base, l.rows, s);
@@ -479,7 +495,8 @@ kernels::KvInt8 prompt_cells(Model& m, const kernels::KvInt8& q8, int64_t cells,
 // and v products and the same cache write, without the queries, the attention and the output projection.  `far`: a
 // streamed cache's far cells (the chunk's rows are written there and read from the stage; stage_prefetch has run).
 void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
-                kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far_kv = {}, int first = 0) {
+                kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far_kv = {}, int first = 0,
+                bool defer = false, size_t* slot = nullptr) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim;
@@ -532,8 +549,8 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
             if (f8) kernels::attn_gate_e4m3(b.ao, bf(b.qfull), T, g.n_head, e4, e4s, s);
             else kernels::attn_gate_bf16(b.ao, bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
         }
-        if (f8) chunk_residual_f8(m, L.o, T, xb, s);
-        else chunk_residual_fp4(m, L.o, bf(b.ag), b.hmax, AQ, T, xb, s);
+        if (f8) chunk_residual_f8(m, L.o, T, xb, s, defer, slot);
+        else chunk_residual_fp4(m, L.o, bf(b.ag), b.hmax, AQ, T, xb, s, defer, slot);
         return;
     }
     kernels::rms_norm_rows(xb, L.attn_norm, b.xn, T, H, g.eps, s);
@@ -555,10 +572,11 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, p0, T, b.ao, s, prompt_cells(m, q8, p0 + T, s), b.attn_split,
                              kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far_kv, p0, T, s));
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
-    chunk_residual(m, L.o, b.ag, AQ, T, xb, s);
+    chunk_residual(m, L.o, b.ag, AQ, T, xb, s, defer, slot);
 }
 
-void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s, int first = 0) {
+void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s, int first = 0,
+               bool defer = false, size_t* slot = nullptr) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, VD = g.value_width(), HV = g.gdn_v_heads;
@@ -584,12 +602,12 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
         if (f8) {
             kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
                                          (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD), nullptr, nullptr, g.gdn_k_heads, HV);
-            chunk_residual_f8(m, L.out, T, xb, s);
+            chunk_residual_f8(m, L.out, T, xb, s, defer, slot);
             return;
         }
         kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
                                      nullptr, nullptr, bf(b.yn), b.hmax, g.gdn_k_heads, HV);
-        chunk_residual_fp4(m, L.out, bf(b.yn), b.hmax, VD, T, xb, s);
+        chunk_residual_fp4(m, L.out, bf(b.yn), b.hmax, VD, T, xb, s, defer, slot);
         return;
     }
     {
@@ -603,11 +621,12 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
     kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s, g.gdn_k_heads, HV);
     kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn,
                              nullptr, nullptr, g.gdn_k_heads, HV);
-    chunk_residual(m, L.out, b.yn, VD, T, xb, s);
+    chunk_residual(m, L.out, b.yn, VD, T, xb, s, defer, slot);
 }
 
 
-void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s, int first = 0) {
+void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s, int first = 0, bool defer = false,
+               size_t* slot = nullptr) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
@@ -622,7 +641,8 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s, int first = 0) {
         prefill::fp4_dense::quantize_amax(h16, b.hmax, T, g.n_ff, g.n_ff, b.a4, b.gs, s);
         if (m.tp) {
             prefill::fp4_dense::product(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, b.tmp, H, false, s);
-            tp_chunk_add(m, b.tmp, xb, (int64_t) T * H, s);
+            if (defer) { if (slot) *slot = tp_chunk_begin(m, b.tmp, (int64_t) T * H, s); }
+            else tp_chunk_add(m, b.tmp, xb, (int64_t) T * H, s);
             return;
         }
         prefill::fp4_dense::product_add_bf16(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, xb, H, s);
@@ -638,7 +658,8 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s, int first = 0) {
     gemm(m, L.down, b.tmp, T, s);
     if (m.tp) {
         if (L.down.scale) kernels::scale_values(b.tmp, L.down.scale, (int64_t) T * H, s);
-        tp_chunk_add(m, b.tmp, xb, (int64_t) T * H, s);
+        if (defer) { if (slot) *slot = tp_chunk_begin(m, b.tmp, (int64_t) T * H, s); }
+        else tp_chunk_add(m, b.tmp, xb, (int64_t) T * H, s);
         return;
     }
     kernels::add_scaled(xb, b.tmp, L.down.scale, (int64_t) T * H, s);
@@ -1120,7 +1141,7 @@ void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float*
 }
 
 void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last,
-                    int scan_l1) {
+                    int scan_l1, int first) {
     const Geometry& g = m.g;
     const Weights& w = m.w;
     const cudaStream_t s = st.stream;
@@ -1150,17 +1171,43 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
         const Layer& L = w.layers[(size_t) il];
         const bool unread = il == g.n_layers - 1 && !last_read;
         if (L.kind == Mixer::Gdn) {
-            chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
+            chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s, first);
         } else {
             const int ai = m.attn_index[(size_t) il];
-            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread, st.far_kv[(size_t) ai]);
+            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread,
+                       st.far_kv[(size_t) ai], first);
             if (!unread) prefetch_from(il + 1);
         }
         if (unread) break;
-        chunk_ffn(m, L, T, s);
+        chunk_ffn(m, L, T, s, first);
         if (taps && next_target < taps->target_layers.size() && taps->target_layers[next_target] == il)
             chunk_tap(m, st, T, *taps, next_target++);
     }
+}
+
+// One layer's mixer (GDN or attention) over a row range, ending with its exchange begun.  `unread`: nothing reads
+// the layer's rows, so only the K and V cells are made (no o-projection, no exchange).
+void chunk_layer_mixer(Model& m, SessionState& st, const Layer& L, int il, int first, int T, int64_t pos, bool unread,
+                       cudaStream_t s, bool defer = false, size_t* slot = nullptr) {
+    if (L.kind == Mixer::Gdn) {
+        chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s, first, defer, slot);
+        return;
+    }
+    const int ai = m.attn_index[(size_t) il];
+    chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread,
+               st.far_kv[(size_t) ai], first, defer, slot);
+}
+
+// The next attention layer's far cells, staged once per layer (independent of the row range a body is split into).
+void stage_prefetch_layer(Model& m, SessionState& st, int64_t pos, int il0, int scan_end, bool last_read) {
+    const Geometry& g = m.g;
+    const Weights& w = m.w;
+    if (m.stage.at >= pos) return;
+    for (int j = il0; j < scan_end; ++j)
+        if (w.layers[j].kind == Mixer::Attention) {
+            if (j < g.n_layers - 1 || last_read) stage_prefetch(m, st.far_kv[m.attn_index[j]], pos, st.stream);
+            return;
+        }
 }
 
 void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j) {
@@ -1246,12 +1293,77 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
             st.mtp_kc != nullptr ||
             (block && std::find(m.w.dflash.target_layers.begin(), m.w.dflash.target_layers.end(), m.g.n_layers - 1) !=
                           m.w.dflash.target_layers.end());
-        for (int il = 0; il < m.g.n_layers; ++il) {
-            {
-                const core::OnDevice on(m.tp->peer_dev);
-                chunk_layers(*m.tp->peer, *st.peer, T, pos, il, il + 1, nullptr, read_last, m.g.n_layers);
+        const cudaStream_t s = st.stream;
+        const int split = prefill_overlap_split(T);
+        if (split > 0 && !block) {
+            // The overlap: each layer's mixer and FFN run as two row halves, so one half's exchange moves beside
+            // the other half's compute instead of stalling the card behind 2.4 GiB of BF16 traffic.  Rank 1 begins
+            // every round first, so the two cards' rounds still pair; the finishes are queued in the same order as
+            // their begins, so a slot is reused only after the peer's read of the previous round has been waited.
+            const int firsts[2] = {0, split};
+            const int counts[2] = {split, T - split};
+            for (int il = 0; il < m.g.n_layers; ++il) {
+                const bool unread = (il == m.g.n_layers - 1) && !read_last;
+                // stage the next attention layer's far cells once per layer: the staging depends only on the chunk,
+                // not on the row range
+                if (il + 1 < m.g.n_layers) {
+                    const core::OnDevice on(m.tp->peer_dev);
+                    stage_prefetch_layer(*m.tp->peer, *st.peer, pos, il + 1, m.g.n_layers, read_last);
+                }
+                stage_prefetch_layer(m, st, pos, il + 1, m.g.n_layers, read_last);
+                size_t slot_mixer[2] = {0, 0};
+                for (int h = 0; h < 2; ++h) {
+                    const Layer& lp = m.tp->peer->w.layers[(size_t) il];
+                    const Layer& lm = m.w.layers[(size_t) il];
+                    {
+                        const core::OnDevice on(m.tp->peer_dev);
+                        chunk_layer_mixer(*m.tp->peer, *st.peer, lp, il, firsts[h], counts[h], pos, unread, s,
+                                          !unread, &slot_mixer[h]);
+                    }
+                    chunk_layer_mixer(m, st, lm, il, firsts[h], counts[h], pos, unread, s, !unread, &slot_mixer[h]);
+                }
+                if (!unread) {
+                    for (int h = 0; h < 2; ++h) {
+                        const int64_t n = (int64_t) counts[h] * m.g.n_embd;
+                        const core::OnDevice on(m.tp->peer_dev);
+                        tp_chunk_finish(*m.tp->peer, slot_mixer[h],
+                                        const_cast<uint16_t*>(residual(m.tp->peer->cs)) +
+                                            (size_t) firsts[h] * m.g.n_embd,
+                                        n, s);
+                        tp_chunk_finish(m, slot_mixer[h],
+                                        const_cast<uint16_t*>(residual(m.cs)) + (size_t) firsts[h] * m.g.n_embd, n, s);
+                    }
+                }
+                if (unread) break;
+                size_t slot_ffn[2] = {0, 0};
+                for (int h = 0; h < 2; ++h) {
+                    const Layer& lp = m.tp->peer->w.layers[(size_t) il];
+                    const Layer& lm = m.w.layers[(size_t) il];
+                    {
+                        const core::OnDevice on(m.tp->peer_dev);
+                        chunk_ffn(*m.tp->peer, lp, counts[h], s, firsts[h], true, &slot_ffn[h]);
+                    }
+                    chunk_ffn(m, lm, counts[h], s, firsts[h], true, &slot_ffn[h]);
+                }
+                for (int h = 0; h < 2; ++h) {
+                    const int64_t n = (int64_t) counts[h] * m.g.n_embd;
+                    const core::OnDevice on(m.tp->peer_dev);
+                    tp_chunk_finish(*m.tp->peer, slot_ffn[h],
+                                    const_cast<uint16_t*>(residual(m.tp->peer->cs)) +
+                                        (size_t) firsts[h] * m.g.n_embd,
+                                    n, s);
+                    tp_chunk_finish(m, slot_ffn[h],
+                                    const_cast<uint16_t*>(residual(m.cs)) + (size_t) firsts[h] * m.g.n_embd, n, s);
+                }
             }
-            chunk_layers(m, st, T, pos, il, il + 1, block ? &m.w.dflash : nullptr, read_last, m.g.n_layers);
+        } else {
+            for (int il = 0; il < m.g.n_layers; ++il) {
+                {
+                    const core::OnDevice on(m.tp->peer_dev);
+                    chunk_layers(*m.tp->peer, *st.peer, T, pos, il, il + 1, nullptr, read_last, m.g.n_layers);
+                }
+                chunk_layers(m, st, T, pos, il, il + 1, block ? &m.w.dflash : nullptr, read_last, m.g.n_layers);
+            }
         }
         if (m.tp->epi[0] != m.tp->epi[1]) {
             err = "dense tp: chunk T=" + std::to_string(T) + " pos=" + std::to_string((long long) pos) + ": cards queued " +

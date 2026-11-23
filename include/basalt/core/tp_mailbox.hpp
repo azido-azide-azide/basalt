@@ -113,6 +113,7 @@ private:
     uint8_t* block_ = nullptr;   // the pinned block (slots' lines, then the hang word)
     uint32_t* hang_ = nullptr;   // the hang word (host view)
     uint32_t* gate_ = nullptr;   // the step gate's release count (host view; the mapped pointer names it on cards too)
+    uint32_t* reads_ = nullptr;  // the read-done epochs, in mapped host memory so both cards see them
     uint32_t gate_seq_ = 0;      // the host's issued step tokens
     Slot* slot_views_ = nullptr; // per slot: payload/flag pointers per rank and the per-rank device epochs
     // the device VMM payload: one reserved range per rank, its backing handle, and the range's real extent (the

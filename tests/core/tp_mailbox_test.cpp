@@ -456,6 +456,7 @@ int main() {
         cudaMemcpy(r.data(), b1, nval * 2, cudaMemcpyDeviceToHost);
         ok = ok && r == want;
         if (!ok) {
+            std::printf("  split err: %s\n", err.c_str());
             size_t bad = 0;
             for (size_t i = 0; i < nval; ++i) if (r[i] != want[i]) ++bad;
             std::printf("  split: %zu of %zu values wrong (r==want %d)\n", bad, nval, (int) (r == want));

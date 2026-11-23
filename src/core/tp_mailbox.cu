@@ -55,7 +55,7 @@ template <class Combine>
 __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine)[kG], Vec (&peer)[kG],
                                         const int vecs, Vec* mine_payload, uint32_t* mine_flags,
                                         const Vec* peer_payload, const uint32_t* peer_flags,
-                                        uint32_t* epochs, uint32_t* hang, bool wt, Combine combine) {
+                                        uint32_t* epochs, uint32_t* reads, uint32_t* hang, bool wt, Combine combine) {
     const int base = warp * (32 * kG) + lane;
 #pragma unroll
     for (int j = 0; j < kG; ++j) {
@@ -89,6 +89,7 @@ __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine
             }
         }
         epochs[warp] = target;  // the epoch advances whatever happens: rounds stay aligned with the peer's
+        flag_release(&reads[warp], target);   // and this lane has finished reading this round
     }
     __syncwarp();
     if (__shfl_sync(0xffffffffu, ok, 0) == 0) return false;
@@ -98,11 +99,10 @@ __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine
         if (v < vecs) peer[j] = __ldcv(&peer_payload[v]);
     }
     combine.finish(base, mine, peer, vecs);
-    // A device payload needs no write-after-read barrier of its own: the slot discipline already gives it.  A rank
-    // starts a slot's round n + 2 only after its round n + 1 waited for the peer's flag n + 1, which the peer
-    // releases from the kernel that already read the round n payload of this slot's peer line - so the publish of
-    // round n + 2 is ordered after the peer's read of round n.  Pinned memory needs none either.  (Adding the
-    // wait here instead deadlocks: kernel k would wait for the peer's k + 1, which waits for this kernel's k + 1.)
+    // The split form can queue a slot's next round before the earlier finish(), so the publish side waits the
+    // peer's read epoch explicitly (see exchange_add_bf16_publish_kernel).  The one-call form keeps its own
+    // ordering: this card's round n + 2 begins only after its round n + 1 waited the peer's flag n + 1, which the
+    // peer released after reading round n.
     return true;
 }
 
@@ -110,14 +110,14 @@ __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine
 template <class Combine>
 __device__ __forceinline__ void exchange_stage(int rank, Vec* mine_payload, uint32_t* mine_flags,
                                                const Vec* peer_payload, const uint32_t* peer_flags,
-                                               uint32_t* epochs, uint32_t* hang, const int vecs, bool wt,
+                                               uint32_t* epochs, uint32_t* reads, uint32_t* hang, const int vecs, bool wt,
                                                Combine combine) {
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     if (warp * (32 * kG) >= vecs) return;
     Vec mine[kG] = {}, peer[kG] = {};
     tp_lane(rank, warp, lane, mine, peer, vecs, mine_payload, mine_flags, peer_payload, peer_flags,
-            epochs, hang, wt, combine);
+            epochs, reads, hang, wt, combine);
 }
 
 // Publish this card's BF16 partial as-is; combine widens both values, adds and rounds once back into the
@@ -227,23 +227,23 @@ bool n_agree(size_t* last, size_t slot, int rank, size_t n, size_t kind, std::st
 
 __global__ __launch_bounds__(kBlockThreads) void exchange_bf16_kernel(
     VecBf16* partial, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
-    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank, bool wt) {
-    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs, wt,
+    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* reads, uint32_t* hang, int vecs, int rank, bool wt) {
+    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, reads, hang, vecs, wt,
                    SumBf16{partial});
 }
 
 __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_kernel(
     const float* mine, VecBf16* base, Vec* mine_payload, uint32_t* mine_flags,
-    const Vec* peer_payload, const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank,
-    bool wt) {
-    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs, wt,
+    const Vec* peer_payload, const uint32_t* peer_flags, uint32_t* epochs, uint32_t* reads, uint32_t* hang, int vecs,
+    int rank, bool wt) {
+    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, reads, hang, vecs, wt,
                    AddBf16{mine, base});
 }
 
 __global__ __launch_bounds__(kBlockThreads) void exchange_f32_kernel(
     Vec* partial, uint2* out16, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
-    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank, bool wt) {
-    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, hang, vecs, wt,
+    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* reads, uint32_t* hang, int vecs, int rank, bool wt) {
+    exchange_stage(rank, mine_payload, mine_flags, peer_payload, peer_flags, epochs, reads, hang, vecs, wt,
                    SumF32{partial, out16});
 }
 
@@ -251,7 +251,8 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_f32_kernel(
 // exchange.  Nothing waits here, so the caller's next kernels are queued behind this one on its stream but the
 // peer's payload is not needed yet.
 __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_publish_kernel(
-    const float* mine, Vec* mine_payload, uint32_t* mine_flags, uint32_t* epochs, int vecs, int rank, bool wt) {
+    const float* mine, Vec* mine_payload, uint32_t* mine_flags, const uint32_t* peer_reads, uint32_t* epochs,
+    uint32_t* hang, int vecs, int rank, bool wt) {
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     if (warp * (32 * kG) >= vecs) return;
@@ -273,6 +274,17 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_publish_kerne
     __syncwarp();
     if (lane == 0) {
         const uint32_t target = epochs[warp] + 1u;
+        // The slot alternates, so this round reuses the payload two rounds back: wait until the peer has read that
+        // round, or this card would overwrite values it has not consumed yet.  In a lockstep pair this is already
+        // true; it is what lets begin() be queued ahead of the earlier finish().
+        unsigned spins = 0;
+        while (static_cast<int32_t>(flag_acquire(&peer_reads[warp]) - (target - 1u)) < 0) {
+            __nanosleep(kPollSleepNs);
+            if (++spins % 1024u == 0u && (spins > kSpinLimit || flag_acquire(hang) != 0u)) {
+                cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*hang).store(1u, cuda::memory_order_relaxed);
+                break;
+            }
+        }
         flag_release(&mine_flags[warp * kFlagStride], target);
         epochs[warp] = target;
     }
@@ -283,7 +295,7 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_publish_kerne
 // the bits are exactly the ones `begin` published.
 __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_combine_kernel(
     VecBf16* base, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
-    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* hang, int vecs, int rank) {
+    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* reads, uint32_t* hang, int vecs, int rank) {
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     if (warp * (32 * kG) >= vecs) return;
@@ -311,6 +323,8 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_combine_kerne
         }
     }
     AddBf16{nullptr, base}.finish(base_i, mine, peer, vecs);
+    __syncwarp();
+    if (lane == 0) flag_release(&reads[warp], target);   // this lane's payload is consumed
 }
 dim3 exchange_grid(size_t vecs) {
     const size_t warps = (vecs + static_cast<size_t>(32 * kG) - 1) / (32 * kG);
@@ -326,6 +340,7 @@ struct TpMailbox::Slot {
     uint32_t* flags[2] = {nullptr, nullptr};
     Vec* payload[2] = {nullptr, nullptr};
     uint32_t* epochs[2] = {nullptr, nullptr};
+    uint32_t* reads[2] = {nullptr, nullptr};   // the round whose payload this card has finished reading
 };
 
 TpMailbox::~TpMailbox() { close(); }
@@ -453,12 +468,27 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
     n_slots_ = slots;
     dev0_ = rank0_dev;
     dev1_ = rank1_dev;
+    // The read-done epochs live in mapped host memory, like the release lines: the split form makes a card wait
+    // for the PEER's read epoch, so they cannot sit in one card's device memory the way the publish epochs do.
+    {
+        const OnDevice on(rank0_dev);
+        if (cudaHostAlloc(reinterpret_cast<void**>(&reads_), slots * 2 * lanes * sizeof(uint32_t),
+                          cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            reads_ == nullptr) {
+            (void)cudaGetLastError();
+            err = "tp mailbox: out of page-locked memory for the read epochs";
+            close();
+            return false;
+        }
+        std::memset(reads_, 0, slots * 2 * lanes * sizeof(uint32_t));
+    }
     for (size_t s = 0; s < slots; ++s) {
         // the release lines keep their per-slot, per-rank layout on the fallback path; on the device path each
         // (slot, rank) pair's lines have a region of their own, and the payload lives in that rank's device range
         for (int rank = 0; rank < 2; ++rank) {
             const size_t lines_at = dev_payload_ ? (s * 2 + rank) * line_bytes_ : slot_span * s + rank * rank_span;
             slot_views_[s].flags[rank] = reinterpret_cast<uint32_t*>(block_ + lines_at);
+            slot_views_[s].reads[rank] = reads_ + (s * 2 + rank) * lanes;
             uint8_t* pay = dev_payload_ ? payload_va_[rank] + s * slot_bytes_ : block_ + lines_at + line_bytes_;
             slot_views_[s].payload[rank] = reinterpret_cast<Vec*>(pay);
         }
@@ -486,8 +516,9 @@ void TpMailbox::close() {
             const int dev = rank == 0 ? dev0_ : dev1_;
             if (dev < 0) continue;
             const OnDevice on(dev);
-            for (size_t s = 0; s < n_slots_; ++s)
+            for (size_t s = 0; s < n_slots_; ++s) {
                 if (slot_views_[s].epochs[rank] != nullptr) cudaFree(slot_views_[s].epochs[rank]);
+            }
         }
         delete[] slot_views_;
         slot_views_ = nullptr;
@@ -495,6 +526,10 @@ void TpMailbox::close() {
     if (block_ != nullptr) {
         cudaFreeHost(block_);
         block_ = nullptr;
+    }
+    if (reads_ != nullptr) {
+        cudaFreeHost(reads_);
+        reads_ = nullptr;
     }
     if (dev_payload_) {
         for (int rank = 0; rank < 2; ++rank) {
@@ -538,7 +573,7 @@ bool TpMailbox::exchange_bf16(int rank, size_t slot, void* partial, size_t bytes
     exchange_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
                            static_cast<cudaStream_t>(stream)>>>(
         static_cast<VecBf16*>(partial), s.payload[rank], s.flags[rank], s.payload[1 - rank],
-        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
+        s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the BF16 exchange failed";
         return false;
@@ -565,7 +600,7 @@ bool TpMailbox::exchange_add_bf16(int rank, size_t slot, const float* mine, uint
     exchange_add_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
                                static_cast<cudaStream_t>(stream)>>>(
         mine, reinterpret_cast<VecBf16*>(base), s.payload[rank], s.flags[rank], s.payload[1 - rank],
-        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
+        s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the add exchange failed";
         return false;
@@ -589,7 +624,8 @@ bool TpMailbox::exchange_add_bf16_begin(int rank, size_t slot, const float* mine
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_add_bf16_publish_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-        mine, s.payload[rank], s.flags[rank], s.epochs[rank], static_cast<int>(vecs), rank, dev_payload_);
+        mine, s.payload[rank], s.flags[rank], s.reads[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank,
+        dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the add exchange's publish failed";
         return false;
@@ -612,7 +648,7 @@ bool TpMailbox::exchange_add_bf16_finish(int rank, size_t slot, uint16_t* base, 
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_add_bf16_combine_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<VecBf16*>(base), s.payload[rank], s.flags[rank], s.payload[1 - rank],
-        s.flags[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank);
+        s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_, static_cast<int>(vecs), rank);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the add exchange's combine failed";
         return false;
@@ -638,7 +674,7 @@ bool TpMailbox::exchange_f32(int rank, size_t slot, float* partial, uint16_t* bf
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_f32_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<Vec*>(partial), reinterpret_cast<uint2*>(bf16_out), s.payload[rank],
-        s.flags[rank], s.payload[1 - rank], s.flags[1 - rank], s.epochs[rank], hang_,
+        s.flags[rank], s.payload[1 - rank], s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_,
         static_cast<int>(vecs), rank, dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the F32 exchange failed";
