@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <initializer_list>
 #include <cstddef>
 #include <vector>
@@ -387,7 +388,14 @@ void tp_chunk_finish(Model& m, size_t slot, uint16_t* base, int64_t n, cudaStrea
 // The prefill-overlap split of a chunk: the first row of the two halves, 128-aligned, each at least 384 rows, so
 // every product keeps the tile boundaries of a whole-chunk call (the same bits) while one half's exchange moves
 // beside the other half's compute.  0: the chunk runs as one call.
+//
+// OPT-IN (BASALT_TP_OVERLAP=1): the schedule is written and the mailbox's split form is bit-exact under test, but
+// the end-to-end path still faults in the window-decode launch, so it is off until that is understood.  Measured
+// prize if it is fixed: skipping the pair's exchanges outright takes the 27B pack's 16k prefill from 3,828 to
+// 7,455 tok/s, so the mailbox is roughly half the pair's prefill time.
 int prefill_overlap_split(int T) {
+    static const bool on = std::getenv("BASALT_TP_OVERLAP") != nullptr;
+    if (!on) return 0;
     constexpr int kAlign = 128, kMinHalf = 384;
     const int split = T / 2 / kAlign * kAlign;
     return split >= kMinHalf && T - split >= kMinHalf ? split : 0;
