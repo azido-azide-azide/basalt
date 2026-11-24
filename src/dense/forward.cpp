@@ -1314,14 +1314,58 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
         if (taps)
             while (next_target < taps->target_layers.size() && taps->target_layers[next_target] < 0) ++next_target;
         if (split > 0) {
-            // The overlap: each layer's mixer and FFN run as two row halves, so one half's exchange moves beside
-            // the other half's compute instead of stalling the card behind 2.4 GiB of BF16 traffic.  Rank 1 begins
-            // every round first, so the two cards' rounds still pair; the finishes are queued in the same order as
-            // their begins, so a slot is reused only after the peer's read of the previous round has been waited.
+            // The overlap, with real lanes: each layer's mixer and FFN run as two row halves, and each card's
+            // mailbox combines (wait, pull, residual add) run on that card's SIDE stream - the finished half's
+            // pull moves beside the main stream's compute. The exchange kernels' grids are SM-capped
+            // (BASALT_TP_GRID_BPSM): a capped pull coexists with compute on the machine; at the full grid the
+            // exchange owns every SM and the schedule serialises (the 11-23 measurement, 2.3x worse).
+            // Events gate the lanes in pairs - every record is followed by its waits at the same enqueue
+            // point, so the objects reuse across layers: 0-3 publish done (main -> side), 4-7 combine done
+            // (side -> main). A combine's gate is waited where those rows are next read: the half's FFN
+            // after its mixer combine, the next layer's mixer halves after this layer's FFN combines, the
+            // drafter's taps after both. Rank 1's op of every pair is enqueued first, as everywhere else.
+            // BASALT_TP_NO_SIDE=1 keeps the schedule but pulls on the main streams: no hiding, only doubled
+            // rounds (the 11-23 regression, kept as the switch matrix's old arm).
+            const bool lanes = std::getenv("BASALT_TP_NO_SIDE") == nullptr;
             const int firsts[2] = {0, split};
             const int counts[2] = {split, T - split};
+            const int64_t nh[2] = {(int64_t) counts[0] * m.g.n_embd, (int64_t) counts[1] * m.g.n_embd};
+            const cudaStream_t ps = st.peer->stream;
+            const cudaStream_t pside = lanes ? st.peer->side : ps;
+            const cudaStream_t sside = lanes ? st.side : s;
+            uint16_t* res0 = const_cast<uint16_t*>(residual(m.cs));
+            uint16_t* pres0 = const_cast<uint16_t*>(residual(m.tp->peer->cs));
+            const int64_t H = m.g.n_embd;
+            bool ev_ok = true;
+            const auto fork = [&](int gi) {   // this card's publish is done: its side lane may pull
+                {
+                    const core::OnDevice on(m.tp->peer_dev);
+                    ev_ok = ev_ok && cudaEventRecord(st.peer->tp_e[gi], ps) == cudaSuccess &&
+                            cudaStreamWaitEvent(pside, st.peer->tp_e[gi], 0) == cudaSuccess;
+                }
+                ev_ok = ev_ok && cudaEventRecord(st.tp_e[gi], s) == cudaSuccess &&
+                        cudaStreamWaitEvent(sside, st.tp_e[gi], 0) == cudaSuccess;
+            };
+            const auto fin = [&](size_t slot, int h, int gi) {   // the pull on the lanes; record its gate
+                {
+                    const core::OnDevice on(m.tp->peer_dev);
+                    tp_chunk_finish(*m.tp->peer, slot, pres0 + (size_t) firsts[h] * H, nh[h], pside);
+                    ev_ok = ev_ok && cudaEventRecord(st.peer->tp_e[gi], pside) == cudaSuccess;
+                }
+                tp_chunk_finish(m, slot, res0 + (size_t) firsts[h] * H, nh[h], sside);
+                ev_ok = ev_ok && cudaEventRecord(st.tp_e[gi], sside) == cudaSuccess;
+            };
+            const auto gate = [&](int gi) {   // the main streams wait a recorded combine before reading rows
+                {
+                    const core::OnDevice on(m.tp->peer_dev);
+                    ev_ok = ev_ok && cudaStreamWaitEvent(ps, st.peer->tp_e[gi], 0) == cudaSuccess;
+                }
+                ev_ok = ev_ok && cudaStreamWaitEvent(s, st.tp_e[gi], 0) == cudaSuccess;
+            };
+            bool exchanged_last = false;
             for (int il = 0; il < m.g.n_layers; ++il) {
                 const bool unread = (il == m.g.n_layers - 1) && !read_last;
+                if (il > 0 && exchanged_last) gate(6);   // this half's mixer reads rows the last FFN's combine A completes
                 // stage the next attention layer's far cells once per layer: the staging depends only on the chunk,
                 // not on the row range
                 if (il + 1 < m.g.n_layers) {
@@ -1330,60 +1374,63 @@ bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const floa
                 }
                 stage_prefetch_layer(m, st, pos, il + 1, m.g.n_layers, read_last);
                 size_t slot_mixer[2] = {0, 0};
-                for (int h = 0; h < 2; ++h) {
-                    const Layer& lp = m.tp->peer->w.layers[(size_t) il];
-                    const Layer& lm = m.w.layers[(size_t) il];
-                    {
-                        const core::OnDevice on(m.tp->peer_dev);
-                        chunk_layer_mixer(*m.tp->peer, *st.peer, lp, il, firsts[h], counts[h], pos, unread,
-                                          st.peer->stream, !unread, &slot_mixer[h]);
-                    }
-                    chunk_layer_mixer(m, st, lm, il, firsts[h], counts[h], pos, unread, s, !unread, &slot_mixer[h]);
+                {
+                    const core::OnDevice on(m.tp->peer_dev);
+                    chunk_layer_mixer(*m.tp->peer, *st.peer, m.tp->peer->w.layers[(size_t) il], il, firsts[0],
+                                      counts[0], pos, unread, ps, !unread, &slot_mixer[0]);
                 }
+                chunk_layer_mixer(m, st, m.w.layers[(size_t) il], il, firsts[0], counts[0], pos, unread, s,
+                                  !unread, &slot_mixer[0]);
+                if (!unread) fork(0);
+                if (exchanged_last) gate(7);   // half B's mixer: the last FFN's combine B (enqueued after A's begin: pipelined)
+                {
+                    const core::OnDevice on(m.tp->peer_dev);
+                    chunk_layer_mixer(*m.tp->peer, *st.peer, m.tp->peer->w.layers[(size_t) il], il, firsts[1],
+                                      counts[1], pos, unread, ps, !unread, &slot_mixer[1]);
+                }
+                chunk_layer_mixer(m, st, m.w.layers[(size_t) il], il, firsts[1], counts[1], pos, unread, s, !unread,
+                                  &slot_mixer[1]);
                 if (!unread) {
-                    for (int h = 0; h < 2; ++h) {
-                        const int64_t n = (int64_t) counts[h] * m.g.n_embd;
-                        {
-                            const core::OnDevice on(m.tp->peer_dev);
-                            tp_chunk_finish(*m.tp->peer, slot_mixer[h],
-                                            const_cast<uint16_t*>(residual(m.tp->peer->cs)) +
-                                                (size_t) firsts[h] * m.g.n_embd,
-                                            n, st.peer->stream);
-                        }
-                        tp_chunk_finish(m, slot_mixer[h],
-                                        const_cast<uint16_t*>(residual(m.cs)) + (size_t) firsts[h] * m.g.n_embd, n, s);
-                    }
+                    fork(1);
+                    fin(slot_mixer[0], 0, 4);
+                    fin(slot_mixer[1], 1, 5);
                 }
-                if (unread) break;
+                if (unread) { exchanged_last = false; break; }
+                gate(4);   // FFN A reads half A's residual rows
                 size_t slot_ffn[2] = {0, 0};
-                for (int h = 0; h < 2; ++h) {
-                    const Layer& lp = m.tp->peer->w.layers[(size_t) il];
-                    const Layer& lm = m.w.layers[(size_t) il];
-                    {
-                        const core::OnDevice on(m.tp->peer_dev);
-                        chunk_ffn(*m.tp->peer, lp, counts[h], st.peer->stream, firsts[h], true, &slot_ffn[h]);
-                    }
-                    chunk_ffn(m, lm, counts[h], s, firsts[h], true, &slot_ffn[h]);
+                {
+                    const core::OnDevice on(m.tp->peer_dev);
+                    chunk_ffn(*m.tp->peer, m.tp->peer->w.layers[(size_t) il], counts[0], ps, firsts[0], true,
+                              &slot_ffn[0]);
                 }
-                for (int h = 0; h < 2; ++h) {
-                    const int64_t n = (int64_t) counts[h] * m.g.n_embd;
-                    {
-                        const core::OnDevice on(m.tp->peer_dev);
-                        tp_chunk_finish(*m.tp->peer, slot_ffn[h],
-                                        const_cast<uint16_t*>(residual(m.tp->peer->cs)) +
-                                            (size_t) firsts[h] * m.g.n_embd,
-                                        n, st.peer->stream);
-                    }
-                    tp_chunk_finish(m, slot_ffn[h],
-                                    const_cast<uint16_t*>(residual(m.cs)) + (size_t) firsts[h] * m.g.n_embd, n, s);
+                chunk_ffn(m, m.w.layers[(size_t) il], counts[0], s, firsts[0], true, &slot_ffn[0]);
+                fork(2);
+                gate(5);   // FFN B reads half B's residual rows
+                {
+                    const core::OnDevice on(m.tp->peer_dev);
+                    chunk_ffn(*m.tp->peer, m.tp->peer->w.layers[(size_t) il], counts[1], ps, firsts[1], true,
+                              &slot_ffn[1]);
                 }
+                chunk_ffn(m, m.w.layers[(size_t) il], counts[1], s, firsts[1], true, &slot_ffn[1]);
+                fork(3);
+                fin(slot_ffn[0], 0, 6);
+                fin(slot_ffn[1], 1, 7);
+                exchanged_last = true;
                 // the block drafter's features come off the completed residual, so they wait both halves' FFN
                 // rounds (rank 0 alone carries the taps)
                 if (block && taps && next_target < taps->target_layers.size() &&
                     taps->target_layers[next_target] == il) {
+                    gate(6);
+                    gate(7);
                     const core::OnDevice on(m.tp_rank == 0 ? 0 : 1);
                     chunk_tap(m, st, T, *taps, next_target++);
                 }
+            }
+            if (exchanged_last) { gate(6); gate(7); }   // chunk_finish reads the residual
+            if (!ev_ok) {
+                err = "dense tp: the pull lanes' events failed";
+                m.tp->mb.poison();
+                return false;
             }
         } else {
             for (int il = 0; il < m.g.n_layers; ++il) {
