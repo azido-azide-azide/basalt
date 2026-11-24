@@ -49,7 +49,9 @@ int main() {
     void *a1 = nullptr;
     ck("malloc", cudaMalloc(&a1, bytes));
     ck("memset", cudaMemset(a1, 1, bytes));
+    ck("setDevice0", cudaSetDevice(0));
     ck("memset", cudaMemset(a0, 2, bytes));
+    ck("setDevice1", cudaSetDevice(1));
 
     // 1a. record a device-1 context's event, wait it on a device-0 stream.
     ck("setDevice1", cudaSetDevice(1));
