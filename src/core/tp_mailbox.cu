@@ -59,6 +59,12 @@ __device__ __forceinline__ void flag_release(uint32_t* p, uint32_t v) {
         .store(v, cuda::memory_order_release);
 }
 
+// This card's re-read of its OWN published slot bytes. The peer's writes are never involved here, so only the
+// card's own store->load order matters: the VMM payload wants `__ldcv` (bypass any L1 line, hit L2 where the
+// card's own `__stwt` left the data); the pinned payload must NOT be a volatile read - a PCIe read can pass
+// this card's own posted writes to host memory, while its L2 always holds the freshest copy of what it wrote.
+__device__ __forceinline__ Vec self_slot_read(const Vec* p, bool wt) { return wt ? __ldcv(p) : *p; }
+
 // One lane of the protocol, pre-11-24: publish this card's vectors, release the lane's epoch, wait for the
 // peer's epoch of the same round, read the peer's vectors, combine. exchange_stage() now serves several lanes
 // per warp with the same per-lane steps split across its two phases; kept as the protocol's shape.
@@ -185,7 +191,7 @@ __device__ __forceinline__ void exchange_stage(int rank, Vec* mine_payload, uint
             const int v = base + j * 32;
             if (v < vecs) {
                 peer[j] = __ldcv(&peer_payload[v]);
-                mine[j] = __ldcv(&mine_payload[v]);
+                mine[j] = self_slot_read(&mine_payload[v], wt);
             }
         }
         combine.finish(base, mine, peer, vecs);
@@ -372,7 +378,7 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_publish_kerne
 // the bits are exactly the ones `begin` published.
 __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_combine_kernel(
     VecBf16* base, Vec* mine_payload, uint32_t* mine_flags, const Vec* peer_payload,
-    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* reads, uint32_t* hang, int vecs, int rank) {
+    const uint32_t* peer_flags, uint32_t* epochs, uint32_t* reads, uint32_t* hang, int vecs, int rank, bool wt) {
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     const int nwarp = static_cast<int>((gridDim.x * blockDim.x) >> 5);
@@ -398,7 +404,7 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_combine_kerne
     for (int j = 0; j < kG; ++j) {
         const int v = base_i + j * 32;
         if (v < vecs) {
-            mine[j] = __ldcv(&mine_payload[v]);
+            mine[j] = self_slot_read(&mine_payload[v], wt);
             peer[j] = __ldcv(&peer_payload[v]);
         }
     }
@@ -746,7 +752,7 @@ bool TpMailbox::exchange_add_bf16_finish(int rank, size_t slot, uint16_t* base, 
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
     exchange_add_bf16_combine_kernel<<<exchange_grid(vecs, rank), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<VecBf16*>(base), s.payload[rank], s.flags[rank], s.payload[1 - rank],
-        s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_, static_cast<int>(vecs), rank);
+        s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
         err = "tp mailbox: launching the add exchange's combine failed";
         return false;

@@ -516,10 +516,12 @@ int main() {
             cudaStreamCreate(&q1);
             cudaStreamCreate(&sd1);
             cudaEvent_t pub[2], fin[2];
-            cudaSetDevice(0);
-            for (int i = 0; i < 2; ++i) {
-                ok = ok && cudaEventCreateWithFlags(&pub[i], cudaEventDisableTiming) == cudaSuccess &&
-                     cudaEventCreateWithFlags(&fin[i], cudaEventDisableTiming) == cudaSuccess;
+            // an event lives in one card's context: create (and record) rank r's on device r, as the engine's
+            // init_state does under OnDevice - a cross-context event here would fail exactly like the pair law says
+            for (int r = 0; r < 2; ++r) {
+                cudaSetDevice(r);
+                ok = ok && cudaEventCreateWithFlags(&pub[r], cudaEventDisableTiming) == cudaSuccess &&
+                     cudaEventCreateWithFlags(&fin[r], cudaEventDisableTiming) == cudaSuccess;
             }
             for (int round = 0; round < 4 && ok; ++round) {
                 slot = (slot + 1) % kSlots;
@@ -555,6 +557,13 @@ int main() {
             cudaSetDevice(1);
             cudaMemcpy(r.data(), b1, nval * 2, cudaMemcpyDeviceToHost);
             ok = ok && r == want;
+            if (!ok) {
+                std::printf("  lane err: %s\n", err.c_str());
+                size_t bad = 0;
+                for (size_t i = 0; i < nval; ++i)
+                    if (r[i] != want[i]) ++bad;
+                std::printf("  lane: %zu of %zu values wrong\n", bad, nval);
+            }
             check(ok, "split exchange across side streams at a capped grid, equal bits on both cards");
             for (int i = 0; i < 2; ++i) {
                 cudaEventDestroy(pub[i]);
