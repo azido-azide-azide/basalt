@@ -28,6 +28,20 @@ constexpr int kBlockThreads = 64;
 // Vectors per lane (the geometry every exchange of this mailbox uses).
 constexpr int kG = TpMailbox::kVecsPerLane;
 
+// The grid cap: exchange blocks per SM (0: uncapped, the pre-11-24 geometry where a whole-chunk exchange is
+// ~10,000 blocks). Read once (the first open), so every launch of the process - captures included - agrees.
+int g_grid_bpsm = -1;
+int g_sm_count[2] = {0, 0};
+
+int grid_bpsm() {
+    if (g_grid_bpsm < 0) {
+        const char* e = std::getenv("BASALT_TP_GRID_BPSM");
+        g_grid_bpsm = (e != nullptr && *e != '\0') ? std::atoi(e) : 4;
+        if (g_grid_bpsm < 0) g_grid_bpsm = 0;
+    }
+    return g_grid_bpsm;
+}
+
 using Vec = uint4;  // 16 bytes
 
 union VecBf16 {
@@ -45,15 +59,14 @@ __device__ __forceinline__ void flag_release(uint32_t* p, uint32_t v) {
         .store(v, cuda::memory_order_release);
 }
 
-// One lane of the protocol: publish this card's vectors, release the lane's epoch, wait for the peer's epoch
-// of the same round, then read the peer's vectors on the non-coherent path (the peer writes them from its own
-// card while this kernel runs) and hand everything to `combine`. All vector loads sit in flight before the
-// stores. Returns false, warp-uniformly, once the wait gave up; the hang word is set for every warp then.
+// One lane of the protocol, pre-11-24: publish this card's vectors, release the lane's epoch, wait for the
+// peer's epoch of the same round, read the peer's vectors, combine. exchange_stage() now serves several lanes
+// per warp with the same per-lane steps split across its two phases; kept as the protocol's shape.
 // `wt` says the payload is device memory: its publish store is then `st.global.wt`, which writes through to
 // memory instead of letting the card retire the block while it is still in its own caches (a plain store from
 // the writer is exactly how this rig once produced a first-token garbage bug over the pinned path).
 template <class Combine>
-__device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine)[kG], Vec (&peer)[kG],
+[[maybe_unused]] __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine)[kG], Vec (&peer)[kG],
                                         const int vecs, Vec* mine_payload, uint32_t* mine_flags,
                                         const Vec* peer_payload, const uint32_t* peer_flags,
                                         uint32_t* epochs, uint32_t* reads, uint32_t* hang, bool wt, Combine combine) {
@@ -107,7 +120,15 @@ __device__ __forceinline__ bool tp_lane(int rank, int warp, int lane, Vec (&mine
     return true;
 }
 
-// The whole kernel body: one lane per warp of the grid, the grid's last warps idle past the payload.
+// The whole kernel body. One-call form, bounded grid: a warp of a capped grid serves several logical lanes
+// (stride of the grid's warp count) in TWO phases - it publishes and releases every lane it owns first, then
+// waits, reads and combines them one by one, re-reading its own published vectors from the slot (the same bits
+// the register held: publish writes them verbatim). The cap exists because the whole-chunk geometry is ~10,000
+// blocks of 64 threads: blocks past the resident wave can neither publish (the peer's pull of the previous
+// wave's data stalls behind them) nor run beside the compute they are meant to overlap with - and every one of
+// them adds its own poll of a host-pinned flag line. Measured at full grid, the spinners alone saturate the
+// host link (see dense-tp-port: `BASALT_TP_GRID_BPSM`). Deadlock-free by construction: both cards' warps walk
+// their lanes in the same order and every wait targets a flag the peer's publish phase releases unconditionally.
 template <class Combine>
 __device__ __forceinline__ void exchange_stage(int rank, Vec* mine_payload, uint32_t* mine_flags,
                                                const Vec* peer_payload, const uint32_t* peer_flags,
@@ -115,10 +136,60 @@ __device__ __forceinline__ void exchange_stage(int rank, Vec* mine_payload, uint
                                                Combine combine) {
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
-    if (warp * (32 * kG) >= vecs) return;
-    Vec mine[kG] = {}, peer[kG] = {};
-    tp_lane(rank, warp, lane, mine, peer, vecs, mine_payload, mine_flags, peer_payload, peer_flags,
-            epochs, reads, hang, wt, combine);
+    const int nwarp = static_cast<int>((gridDim.x * blockDim.x) >> 5);
+    const int unit = 32 * kG;
+    const int ngroups = (vecs + unit - 1) / unit;
+    for (int g = warp; g < ngroups; g += nwarp) {
+        const int base = g * unit + lane;
+#pragma unroll
+        for (int j = 0; j < kG; ++j) {
+            const int v = base + j * 32;
+            if (v < vecs) {
+                const Vec x = combine.load_mine(v);
+                if (wt) __stwt(&mine_payload[v], x);
+                else mine_payload[v] = x;
+            }
+        }
+        __syncwarp();
+        if (lane == 0) {
+            const uint32_t target = epochs[g] + 1u;
+            flag_release(&mine_flags[g * kFlagStride], target);
+            epochs[g] = target;   // advance whatever happens after: rounds stay aligned with the peer's
+        }
+    }
+    for (int g = warp; g < ngroups; g += nwarp) {
+        const int base = g * unit + lane;
+        int ok = 1;
+        if (lane == 0) {
+            const uint32_t target = epochs[g];   // the round phase 1 published (this lane wrote it: own-store own-load)
+            unsigned spins = 0;
+            while (static_cast<int32_t>(flag_acquire(&peer_flags[g * kFlagStride]) - target) < 0) {
+                __nanosleep(kPollSleepNs);
+                if (g == 0 && warp == 0 && (spins == 2000000u || spins == 10000000u))
+                    printf("mb: rank %d lane 0 waits epoch %u, peer flag %u, spins %u\n", rank, target,
+                           flag_acquire(&peer_flags[g * kFlagStride]), spins);
+                if (++spins % 1024u == 0u && (spins > kSpinLimit || flag_acquire(hang) != 0u)) {
+                    cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*hang)
+                        .store(1u, cuda::memory_order_relaxed);
+                    ok = 0;
+                    break;
+                }
+            }
+            flag_release(&reads[g], target);   // as in tp_lane: this lane's round is spent reading (its own re-read below is slot-stable)
+        }
+        __syncwarp();
+        if (__shfl_sync(0xffffffffu, ok, 0) == 0) return;
+        Vec mine[kG] = {}, peer[kG] = {};
+#pragma unroll
+        for (int j = 0; j < kG; ++j) {
+            const int v = base + j * 32;
+            if (v < vecs) {
+                peer[j] = __ldcv(&peer_payload[v]);
+                mine[j] = __ldcv(&mine_payload[v]);
+            }
+        }
+        combine.finish(base, mine, peer, vecs);
+    }
 }
 
 // Publish this card's BF16 partial as-is; combine widens both values, adds and rounds once back into the
@@ -256,8 +327,11 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_publish_kerne
     uint32_t* hang, int vecs, int rank, bool wt) {
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
-    if (warp * (32 * kG) >= vecs) return;
-    const int base = warp * (32 * kG) + lane;
+    const int nwarp = static_cast<int>((gridDim.x * blockDim.x) >> 5);
+    const int unit = 32 * kG;
+    const int ngroups = (vecs + unit - 1) / unit;
+    for (int g = warp; g < ngroups; g += nwarp) {
+    const int base = g * unit + lane;
     Vec pub[kG] = {};
 #pragma unroll
     for (int j = 0; j < kG; ++j) {
@@ -274,20 +348,22 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_publish_kerne
     }
     __syncwarp();
     if (lane == 0) {
-        const uint32_t target = epochs[warp] + 1u;
+        const uint32_t target = epochs[g] + 1u;
         // The slot alternates, so this round reuses the payload two rounds back: wait until the peer has read that
         // round, or this card would overwrite values it has not consumed yet.  In a lockstep pair this is already
         // true; it is what lets begin() be queued ahead of the earlier finish().
         unsigned spins = 0;
-        while (static_cast<int32_t>(flag_acquire(&peer_reads[warp]) - (target - 1u)) < 0) {
+        while (static_cast<int32_t>(flag_acquire(&peer_reads[g]) - (target - 1u)) < 0) {
             __nanosleep(kPollSleepNs);
             if (++spins % 1024u == 0u && (spins > kSpinLimit || flag_acquire(hang) != 0u)) {
                 cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*hang).store(1u, cuda::memory_order_relaxed);
                 break;
             }
         }
-        flag_release(&mine_flags[warp * kFlagStride], target);
-        epochs[warp] = target;
+        flag_release(&mine_flags[g * kFlagStride], target);
+        epochs[g] = target;
+    }
+    __syncwarp();
     }
 }
 
@@ -299,12 +375,15 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_combine_kerne
     const uint32_t* peer_flags, uint32_t* epochs, uint32_t* reads, uint32_t* hang, int vecs, int rank) {
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
-    if (warp * (32 * kG) >= vecs) return;
-    const int base_i = warp * (32 * kG) + lane;
-    const uint32_t target = epochs[warp];   // the round this lane published
+    const int nwarp = static_cast<int>((gridDim.x * blockDim.x) >> 5);
+    const int unit = 32 * kG;
+    const int ngroups = (vecs + unit - 1) / unit;
+    for (int g = warp; g < ngroups; g += nwarp) {
+    const int base_i = g * unit + lane;
+    const uint32_t target = epochs[g];   // the round this lane published
     if (lane == 0) {
         unsigned spins = 0;
-        while (static_cast<int32_t>(flag_acquire(&peer_flags[warp * kFlagStride]) - target) < 0) {
+        while (static_cast<int32_t>(flag_acquire(&peer_flags[g * kFlagStride]) - target) < 0) {
             __nanosleep(kPollSleepNs);
             if (++spins % 1024u == 0u && (spins > kSpinLimit || flag_acquire(hang) != 0u)) {
                 cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*hang).store(1u, cuda::memory_order_relaxed);
@@ -325,11 +404,20 @@ __global__ __launch_bounds__(kBlockThreads) void exchange_add_bf16_combine_kerne
     }
     AddBf16{nullptr, base}.finish(base_i, mine, peer, vecs);
     __syncwarp();
-    if (lane == 0) flag_release(&reads[warp], target);   // this lane's payload is consumed
+    if (lane == 0) flag_release(&reads[g], target);   // this lane's payload is consumed
+    }
 }
-dim3 exchange_grid(size_t vecs) {
+dim3 exchange_grid(size_t vecs, int rank) {
     const size_t warps = (vecs + static_cast<size_t>(32 * kG) - 1) / (32 * kG);
-    const size_t blocks = (warps + kBlockThreads / 32 - 1) / (kBlockThreads / 32);
+    size_t blocks = (warps + kBlockThreads / 32 - 1) / (kBlockThreads / 32);
+    // the SM cap (BASALT_TP_GRID_BPSM, 0: uncapped - the pre-11-24 geometry): the exchange kernel's blocks must
+    // not occupy the whole machine - beside compute (the overlap's premise) and not all at once polling host
+    // flags. The kernels' lane loops grid-stride, so a capped grid moves the same bytes in the same order.
+    const int bpsm = grid_bpsm();
+    if (bpsm > 0) {
+        const size_t cap = static_cast<size_t>(g_sm_count[rank < 2 ? rank : 0]) * static_cast<size_t>(bpsm);
+        if (cap > 0 && blocks > cap) blocks = cap;
+    }
     return dim3(static_cast<unsigned>(blocks));
 }
 
@@ -469,6 +557,15 @@ bool TpMailbox::open(int rank0_dev, int rank1_dev, size_t slots, size_t max_byte
     n_slots_ = slots;
     dev0_ = rank0_dev;
     dev1_ = rank1_dev;
+    // the grid cap's per-rank SM counts (queried once; a failed query leaves 0, which the cap check treats as
+    // uncapped for that rank)
+    for (int rank = 0; rank < 2; ++rank) {
+        const OnDevice on(rank == 0 ? rank0_dev : rank1_dev);
+        int sm = 0;
+        if (cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, rank == 0 ? rank0_dev : rank1_dev) ==
+            cudaSuccess)
+            g_sm_count[rank] = sm;
+    }
     // The read-done epochs live in mapped host memory, like the release lines: the split form makes a card wait
     // for the PEER's read epoch, so they cannot sit in one card's device memory the way the publish epochs do.
     {
@@ -571,7 +668,7 @@ bool TpMailbox::exchange_bf16(int rank, size_t slot, void* partial, size_t bytes
     if (!n_agree(last_n_.data(), slot, rank, bytes / kVecBytes * 8, 0, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
-    exchange_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
+    exchange_bf16_kernel<<<exchange_grid(vecs, rank), kBlockThreads, 0,
                            static_cast<cudaStream_t>(stream)>>>(
         static_cast<VecBf16*>(partial), s.payload[rank], s.flags[rank], s.payload[1 - rank],
         s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
@@ -598,7 +695,7 @@ bool TpMailbox::exchange_add_bf16(int rank, size_t slot, const float* mine, uint
     if (!n_agree(last_n_.data(), slot, rank, n, 1, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
-    exchange_add_bf16_kernel<<<exchange_grid(vecs), kBlockThreads, 0,
+    exchange_add_bf16_kernel<<<exchange_grid(vecs, rank), kBlockThreads, 0,
                                static_cast<cudaStream_t>(stream)>>>(
         mine, reinterpret_cast<VecBf16*>(base), s.payload[rank], s.flags[rank], s.payload[1 - rank],
         s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_, static_cast<int>(vecs), rank, dev_payload_);
@@ -624,7 +721,7 @@ bool TpMailbox::exchange_add_bf16_begin(int rank, size_t slot, const float* mine
     if (!n_agree(last_n_.data(), slot, rank, n, 1, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
-    exchange_add_bf16_publish_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    exchange_add_bf16_publish_kernel<<<exchange_grid(vecs, rank), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         mine, s.payload[rank], s.flags[rank], s.reads[1 - rank], s.epochs[rank], hang_, static_cast<int>(vecs), rank,
         dev_payload_);
     if (cudaGetLastError() != cudaSuccess) {
@@ -647,7 +744,7 @@ bool TpMailbox::exchange_add_bf16_finish(int rank, size_t slot, uint16_t* base, 
     }
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
-    exchange_add_bf16_combine_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    exchange_add_bf16_combine_kernel<<<exchange_grid(vecs, rank), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<VecBf16*>(base), s.payload[rank], s.flags[rank], s.payload[1 - rank],
         s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_, static_cast<int>(vecs), rank);
     if (cudaGetLastError() != cudaSuccess) {
@@ -673,7 +770,7 @@ bool TpMailbox::exchange_f32(int rank, size_t slot, float* partial, uint16_t* bf
     if (!n_agree(last_n_.data(), slot, rank, n, 2, err)) return false;
     const Slot& s = slot_views_[slot];
     const OnDevice on(rank == 0 ? dev0_ : dev1_);
-    exchange_f32_kernel<<<exchange_grid(vecs), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+    exchange_f32_kernel<<<exchange_grid(vecs, rank), kBlockThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<Vec*>(partial), reinterpret_cast<uint2*>(bf16_out), s.payload[rank],
         s.flags[rank], s.payload[1 - rank], s.flags[1 - rank], s.epochs[rank], s.reads[rank], hang_,
         static_cast<int>(vecs), rank, dev_payload_);

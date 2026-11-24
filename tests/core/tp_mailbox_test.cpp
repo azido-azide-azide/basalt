@@ -475,6 +475,108 @@ int main() {
         sp.close();
     }
 
+    // the engine's lane pattern at a capped-grid geometry: begin on each card's MAIN stream, finish on its
+    // SIDE stream between event gates (record at the enqueue point of each dependent wait), and real work on
+    // the main streams beside the pull. 512 lanes at BASALT_TP_GRID_BPSM=4 means every warp grid-strides
+    // several lanes on both halves of the split. Same bits as the one-call exchange.
+    {
+        const size_t nval = 65536 * 8;   // a 1 MiB BF16 payload: 512 lanes, capped grid
+        std::vector<float> m0(nval), m1(nval);
+        std::vector<uint16_t> base(nval);
+        for (size_t i = 0; i < nval; ++i) {
+            m0[i] = (rng() / float(rng.max())) * 4.0f - 2.0f;
+            m1[i] = (rng() / float(rng.max())) * 4.0f - 2.0f;
+            base[i] = rn_bf16((rng() / float(rng.max())) * 8.0f - 4.0f);
+        }
+        std::vector<uint16_t> want(nval);
+        for (size_t i = 0; i < nval; ++i)
+            want[i] = rn_bf16(to_f(base[i]) + to_f(rn_bf16(m0[i])) + to_f(rn_bf16(m1[i])));
+        float *d0, *d1;
+        uint16_t *b0, *b1;
+        cudaSetDevice(0);
+        cudaMalloc(&d0, nval * 4);
+        cudaMalloc(&b0, nval * 2);
+        cudaMemcpy(d0, m0.data(), nval * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(b0, base.data(), nval * 2, cudaMemcpyHostToDevice);
+        cudaSetDevice(1);
+        cudaMalloc(&d1, nval * 4);
+        cudaMalloc(&b1, nval * 2);
+        cudaMemcpy(d1, m1.data(), nval * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(b1, base.data(), nval * 2, cudaMemcpyHostToDevice);
+        bool ok = true;
+        TpMailbox sp;
+        if (!sp.open(0, 1, kSlots, kBytes, err)) {
+            check(false, "the lane-pattern mailbox opens: " + err);
+        } else {
+            cudaStream_t q0, q1, sd0, sd1;
+            cudaSetDevice(0);
+            cudaStreamCreate(&q0);
+            cudaStreamCreate(&sd0);
+            cudaSetDevice(1);
+            cudaStreamCreate(&q1);
+            cudaStreamCreate(&sd1);
+            cudaEvent_t pub[2], fin[2];
+            cudaSetDevice(0);
+            for (int i = 0; i < 2; ++i) {
+                ok = ok && cudaEventCreateWithFlags(&pub[i], cudaEventDisableTiming) == cudaSuccess &&
+                     cudaEventCreateWithFlags(&fin[i], cudaEventDisableTiming) == cudaSuccess;
+            }
+            for (int round = 0; round < 4 && ok; ++round) {
+                slot = (slot + 1) % kSlots;
+                // rank 1 first, as the pair's drivers do: publish, fork its card's side lane...
+                cudaSetDevice(1);
+                ok = ok && sp.exchange_add_bf16_begin(1, slot, d1, nval, q1, err);
+                ok = ok && cudaEventRecord(pub[1], q1) == cudaSuccess &&
+                     cudaStreamWaitEvent(sd1, pub[1], 0) == cudaSuccess;
+                cudaSetDevice(0);
+                ok = ok && sp.exchange_add_bf16_begin(0, slot, d0, nval, q0, err);
+                ok = ok && cudaEventRecord(pub[0], q0) == cudaSuccess &&
+                     cudaStreamWaitEvent(sd0, pub[0], 0) == cudaSuccess;
+                // ... combine on the side lanes, each main stream gated where it next reads the rows
+                cudaSetDevice(1);
+                ok = ok && sp.exchange_add_bf16_finish(1, slot, b1, nval, sd1, err);
+                ok = ok && cudaEventRecord(fin[1], sd1) == cudaSuccess &&
+                     cudaStreamWaitEvent(q1, fin[1], 0) == cudaSuccess;
+                cudaSetDevice(0);
+                ok = ok && sp.exchange_add_bf16_finish(0, slot, b0, nval, sd0, err);
+                ok = ok && cudaEventRecord(fin[0], sd0) == cudaSuccess &&
+                     cudaStreamWaitEvent(q0, fin[0], 0) == cudaSuccess;
+                cudaSetDevice(1);
+                ok = ok && cudaStreamSynchronize(q1) == cudaSuccess;
+                cudaSetDevice(0);
+                ok = ok && cudaStreamSynchronize(q0) == cudaSuccess;
+                for (size_t i = 0; i < nval; ++i)
+                    want[i] = base[i] = rn_bf16(to_f(base[i]) + to_f(rn_bf16(m0[i])) + to_f(rn_bf16(m1[i])));
+            }
+            std::vector<uint16_t> r(nval);
+            cudaSetDevice(0);
+            cudaMemcpy(r.data(), b0, nval * 2, cudaMemcpyDeviceToHost);
+            ok = ok && r == want;
+            cudaSetDevice(1);
+            cudaMemcpy(r.data(), b1, nval * 2, cudaMemcpyDeviceToHost);
+            ok = ok && r == want;
+            check(ok, "split exchange across side streams at a capped grid, equal bits on both cards");
+            for (int i = 0; i < 2; ++i) {
+                cudaEventDestroy(pub[i]);
+                cudaEventDestroy(fin[i]);
+            }
+            cudaSetDevice(0);
+            cudaStreamDestroy(q0);
+            cudaStreamDestroy(sd0);
+            cudaSetDevice(1);
+            cudaStreamDestroy(q1);
+            cudaStreamDestroy(sd1);
+            cudaSetDevice(0);
+            cudaFree(d0);
+            cudaFree(b0);
+            cudaSetDevice(1);
+            cudaFree(d1);
+            cudaFree(b1);
+            cudaSetDevice(0);
+            sp.close();
+        }
+    }
+
     // the pinned path, on the same shapes: both paths must give the same bits, and the fallback must still open
     {
         TpMailbox pin;

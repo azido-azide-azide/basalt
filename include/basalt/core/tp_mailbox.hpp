@@ -8,6 +8,11 @@
 // epochs advance in lockstep over both cards, so replays need no resets and a flag left at the previous round
 // never satisfies the wait.
 //
+// The kernel's grid is SM-capped (`BASALT_TP_GRID_BPSM`, blocks per SM, 0: uncapped): a whole-chunk geometry
+// would otherwise launch ~10,000 blocks and own the machine. Capped, each warp grid-strides several logical
+// lanes; the one-call form publishes all of them first (phase 1) and waits/reads/combines after (phase 2),
+// re-reading its own published vectors from the slot - the same bits, a smaller, schedulable kernel.
+//
 // The payloads cross PCIe as card-to-host reads of pinned memory: a card never needs to name the other card's
 // memory, so this works whether or not the driver granted peer access.
 //
