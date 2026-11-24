@@ -8,8 +8,21 @@
 // epochs advance in lockstep over both cards, so replays need no resets and a flag left at the previous round
 // never satisfies the wait.
 //
+// The kernel's grid is SM-capped (`BASALT_TP_GRID_BPSM`, blocks per SM, 0: uncapped): a whole-chunk geometry
+// would otherwise launch ~10,000 blocks and own the machine. Capped, each warp grid-strides several logical
+// lanes; the one-call form publishes all of them first (phase 1) and waits/reads/combines after (phase 2),
+// re-reading its own published vectors from the slot - the same bits, a smaller, schedulable kernel.
+//
 // The payloads cross PCIe as card-to-host reads of pinned memory: a card never needs to name the other card's
 // memory, so this works whether or not the driver granted peer access.
+//
+// The payload region is device VMM memory when the driver offers it (`basalt/core/vmm.hpp`): one backing per rank,
+// mapped under both cards' address ranges, so each rank's publish and the peer's read are device-to-device over the
+// peer link - one traversal of it per crossing instead of the two a host bounce buffer makes.  The per-warp release
+// lines and the hang word stay in the page-locked block: a release is a `thread_scope_system` atomic the two cards
+// must both see, which device memory cannot give them.  A device payload publishes with `st.global.wt` and reads
+// with `__ldcv` (the same non-coherent pair `tp_lane` already uses for the pinned path), so the peer's write is not
+// left in this card's caches.
 //
 // Slot use: a rank starts a slot's round n + 2 only after its round n + 1 waited for the peer's flag n + 1, which
 // the peer releases from the kernel that already read the round n payload of this slot's peer line; consecutive
@@ -33,7 +46,7 @@ public:
     // The payload unit: 16 bytes, one PCIe transaction per access.
     static constexpr size_t kVecBytes = 16;
     // Payload vectors one warp lane publishes and reads (one KiB of payload per lane).
-    static constexpr int kVecsPerLane = 2;
+    static constexpr int kVecsPerLane = 4;
 
     TpMailbox() = default;
     ~TpMailbox();
@@ -41,11 +54,16 @@ public:
     TpMailbox& operator=(const TpMailbox&) = delete;
 
     /// Opens `slots` slots, each holding `max_bytes`, for the ordered card pair (`rank0_dev`, `rank1_dev`).
-    /// Page-locked memory is allocated for every slot and mapped into both cards' address spaces; per-warp
-    /// release lines live at the front of each slot and a shared hang word at the front of the block.
-    /// `max_bytes` is rounded up to a multiple of `kVecBytes * 32 * kVecsPerLane` (the whole-geometry unit).
-    bool open(int rank0_dev, int rank1_dev, size_t slots, size_t max_bytes, std::string& err);
+    /// Page-locked memory is allocated for the per-warp release lines and the hang word, and mapped into both cards'
+    /// address spaces; each rank's payload region is device VMM memory when the driver offers it (see the header),
+    /// else the same page-locked block.  `max_bytes` is rounded up to a multiple of `kVecBytes * 32 * kVecsPerLane`
+    /// (the whole-geometry unit).
+    bool open(int rank0_dev, int rank1_dev, size_t slots, size_t max_bytes, std::string& err,
+              bool want_device = true);
     void close();
+
+    /// True when the payloads are device VMM memory (one peer-link traversal per crossing); false on the pinned path.
+    bool device_payload() const { return dev_payload_; }
 
     /// Bytes of one slot's payload region and the number of slots.
     size_t slot_bytes() const { return slot_bytes_; }
@@ -60,6 +78,14 @@ public:
     /// bf16(fp32(base) + fp32(mine rounded) + fp32(peer's rounded value)), each value rounded once.
     bool exchange_add_bf16(int rank, size_t slot, const float* mine, uint16_t* base, size_t n,
                            void* stream, std::string& err);
+
+    /// The split form of `exchange_add_bf16`, for a caller that has work to run between the two halves: `begin`
+    /// publishes this card's BF16 rounding of `mine` and releases the lane epochs (no wait), `finish` waits the
+    /// peer's epoch, reads both published payloads and combines them into `base`.  The two calls of one round must
+    /// be paired on both cards, and every begun round must be finished before `base` is read.  `mine` is not read
+    /// by `finish` (the published copy in the slot is), so the caller may reuse that buffer in between.
+    bool exchange_add_bf16_begin(int rank, size_t slot, const float* mine, size_t n, void* stream, std::string& err);
+    bool exchange_add_bf16_finish(int rank, size_t slot, uint16_t* base, size_t n, void* stream, std::string& err);
 
     /// FP32 payload exchange: `partial` (device fp32, `n` values) is replaced in place by the sum; with
     /// `bf16_out` the sum is also stored there rounded once (the FP32 payloads' combine is commutative, so both
@@ -89,11 +115,18 @@ private:
     size_t slot_bytes_ = 0;      // the payload region of one slot
     size_t line_bytes_ = 0;      // the release lines of one slot (one 64-byte line per warp lane)
     size_t n_slots_ = 0;
-    uint8_t* block_ = nullptr;   // the whole pinned block (slots' lines, then slots' payloads, then the hang word)
+    uint8_t* block_ = nullptr;   // the pinned block (slots' lines, then the hang word)
     uint32_t* hang_ = nullptr;   // the hang word (host view)
     uint32_t* gate_ = nullptr;   // the step gate's release count (host view; the mapped pointer names it on cards too)
+    uint32_t* reads_ = nullptr;  // the read-done epochs, in mapped host memory so both cards see them
     uint32_t gate_seq_ = 0;      // the host's issued step tokens
     Slot* slot_views_ = nullptr; // per slot: payload/flag pointers per rank and the per-rank device epochs
+    // the device VMM payload: one reserved range per rank, its backing handle, and the range's real extent (the
+    // driver's granularity rounds the reservation up, so the mapping is of the rounded length, not `slot_bytes_`)
+    uint8_t* payload_va_[2] = {nullptr, nullptr};
+    unsigned long long payload_handle_[2] = {0, 0};
+    uint64_t payload_span_ = 0;  // the reserved/mapped length of one rank's payload region
+    bool dev_payload_ = false;
     // the value count and exchange kind the pair's rank 1 last carried per slot (kind * kKindUnit + count), for
     // the enqueue-time agreement check that the two cards' exchanges say the same geometry (a mismatch wedges
     // the round forever); close() clears it, so a reopen starts the check off
