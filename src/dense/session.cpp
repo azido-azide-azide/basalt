@@ -35,6 +35,11 @@ bool init_state(Model& m, SessionState& st, std::string& err) {
         err = "cannot create a CUDA stream";
         return false;
     }
+    for (cudaEvent_t& e : st.tp_e)
+        if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+            err = "cannot create a CUDA event";
+            return false;
+        }
     // the drafter's state, the logits and the picks on the card that holds layer 0 (the tensor pair's rank 1 keeps none)
     const bool head = m.lb == 0 && !m.tp_rank, mtp = head && m.o.drafter == Drafter::Mtp,
                  block = head && m.o.drafter == Drafter::Block;
@@ -172,6 +177,8 @@ void free_state(SessionState& st) {
     if (st.side) cudaStreamDestroy(st.side);
     if (st.fork) cudaEventDestroy(st.fork);
     if (st.join) cudaEventDestroy(st.join);
+    for (cudaEvent_t& e : st.tp_e)
+        if (e) { cudaEventDestroy(e); e = nullptr; }
     if (st.far_host) cudaFreeHost(st.far_host);
 }
 

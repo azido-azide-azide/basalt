@@ -245,6 +245,10 @@ struct SessionState {
     // and the device a second card's state lives on
     std::unique_ptr<SessionState, PeerStateDeleter> peer;
     int dev = -1;
+    // the tensor pair's prefill pull lanes: `side` (peer: st.peer->side) carries the mailbox combines while
+    // `stream` computes; these gate main->side (0-3: a publish is done) and side->main (4-7: a combine is
+    // done). Each record is paired by its wait at the same enqueue point, so the objects serve every layer.
+    cudaEvent_t tp_e[8] = {};
 };
 
 /// One session's device state on the card of model `m` (its layers' cells and recurrent state; on the card that holds layer
