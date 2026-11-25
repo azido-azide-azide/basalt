@@ -54,8 +54,6 @@ void usage() {
                  "  --gpu-share A,B,..   the cards' relative shares, one positive number per card in the order of --gpu\n"
                  "                       (like 3,1); not with one card\n"
                  "  --gpu-plan           print the GPU choice as one JSON line and exit (no model needed)\n"
-                 "  --tp N               tensor-parallel across N cards (2) named by --gpu: every card holds every\n"
-                 "                       layer, sliced by heads (a layer cut is --gpu-mode split)\n"
                  "  --mtp-window N       the drafter attends to the last N cells (default 32768; 0 = every cell)\n"
                  "  --stop-eos           stop when the model emits an end-of-turn token\n"
                  "  --eos-ids LIST       the end-of-turn token ids for --stop-eos (default the pack's); implies it\n"

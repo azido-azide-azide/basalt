@@ -1,7 +1,7 @@
 #include "cpu_warm.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
-#include "basalt/core/gdn_head_split.hpp"
+#include "basalt/models/qwen4exp/decode/gdn_head_split.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/core/progress.hpp"
