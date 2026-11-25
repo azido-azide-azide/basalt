@@ -23,12 +23,6 @@ Upstream, plus the changes one deployment runs on top of it:
 - **Chat slot affinity** (`serve/handler.py`, `serve/engine/process.py`): a multi-turn chat that names no
   session identifies itself by its first user message, so a client that resends the whole history keeps one
   slot even when a turn's re-rendered prompt matches none of the held K/V.
-- **Dense tensor parallel** (`--tp N`: `src/dense/tp.cpp`, `src/core/tp_mailbox.cu`,
-  `include/basalt/dense/tp.hpp`): a dense model (the 27B) runs as a pair of cards holding half of every
-  layer's rows each, the two cards' products summed over a peer-memory mailbox of two-slot warp-epoch
-  exchanges, with lockstep and divergence checks around every window, batch and prompt chunk. Against the
-  layer split in the gauntlet here: 1.50× the decode with 8 drafts, 1.72× greedy, 1.21× the prefill
-  (records: `docs/gauntlet/`).
 
 Nothing else is changed.
 

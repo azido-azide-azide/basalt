@@ -13,12 +13,10 @@
 #include "basalt/prefill/fp8_gemm.hpp"
 
 #include "basalt/core/on_device.hpp"
-#include "basalt/log.hpp"
 #include "basalt/kernels/elementwise.hpp"
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
 #include <initializer_list>
 #include <cstddef>
 #include <vector>
@@ -150,24 +148,6 @@ void prod_group(Model& m, const float* x, const void* xq, int type, std::initial
 }
 // x [T][rows] += scale W y into the BF16 residual (the add in fp32, rounded once; in the window gemm's epilogue)
 void prod_add(Model& m, const Linear& l, const void* yq, uint16_t* x, int T, cudaStream_t s) {
-    if (m.tp) {   // the card's partial (weight scale applied) stays in the product's FP32 scratch; the exchange
-                  // adds the two cards' partials and the residual, each value rounded once (the exchange's combine)
-        float* part = x == m.ws.x ? m.ws.tmp : m.cs.tmp;
-        if (on_wg(l.type)) {
-            wg::Call c = wcall(l);   // Store, not the fused AddBf16: the add is the exchange's
-            c.m[0] = wmat(l, part);
-            wg::gemm(c, yq, T, m.ws.w8, s);
-        } else {
-            mmq_run(m, l, yq, part, T, s);
-            if (l.scale) kernels::scale_values(part, l.scale, (int64_t) T * l.rows, s);
-        }
-        std::string e;
-        if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, x, (size_t) T * l.rows, s, e)) {
-            basalt::log::error("dense tp", "%s", e.c_str());
-            m.tp->mb.poison();   // the rounds no longer pair: the driver refuses the launch, the sync refuses the picks
-        }
-        return;
-    }
     if (on_wg(l.type)) {
         wg::Call c = wcall(l, wg::Epilogue::AddBf16);
         c.m[0] = wmat(l, nullptr);
@@ -355,108 +335,28 @@ prefill::fp8::Segment f8_seg(const Linear& l, void* dst) { return {(const uint8_
 uint16_t* residual(ChunkScratch& b) { return reinterpret_cast<uint16_t*>(b.x); }
 uint16_t* bf(float* p) { return reinterpret_cast<uint16_t*>(p); }
 
-// x += W . a: the column-parallel product added to a row range's BF16 residual rows - on a tensor-parallel pair, the
-// card's FP32 partial instead, and the two cards' partials and the residual meet over the mailbox (one rounding).
-// `base` is the range's first residual row; `n` is the range's value count (rows x rows-per-row).
-void tp_chunk_add(Model& m, float* part, uint16_t* base, int64_t n, cudaStream_t s) {
-    std::string e;
-    if (!m.tp->mb.exchange_add_bf16(m.tp_rank, m.tp->epi[m.tp_rank]++ & 1, part, base, (size_t) n, s, e)) {
-        basalt::log::error("dense tp", "%s", e.c_str());
-        m.tp->mb.poison();   // the chunk's rounds no longer pair: the caller's sync refuses the read
-    }
-}
-
-// The split form: publish this card's partial and leave the exchange open, so the caller can queue the other row
-// range's work before finishing it.  `finish` carries the same `base`/`n`.
-size_t tp_chunk_begin(Model& m, float* part, int64_t n, cudaStream_t s) {
-    const size_t slot = m.tp->epi[m.tp_rank]++ & 1;
-    std::string e;
-    if (!m.tp->mb.exchange_add_bf16_begin(m.tp_rank, slot, part, (size_t) n, s, e)) {
-        basalt::log::error("dense tp", "%s", e.c_str());
-        m.tp->mb.poison();   // the chunk's rounds no longer pair: the caller's sync refuses the read
-    }
-    return slot;
-}
-void tp_chunk_finish(Model& m, size_t slot, uint16_t* base, int64_t n, cudaStream_t s) {
-    std::string e;
-    if (!m.tp->mb.exchange_add_bf16_finish(m.tp_rank, slot, base, (size_t) n, s, e)) {
-        basalt::log::error("dense tp", "%s", e.c_str());
-        m.tp->mb.poison();
-    }
-}
-
-// The prefill-overlap split of a chunk: the first row of the two halves, 128-aligned, each at least 384 rows, so
-// every product keeps the tile boundaries of a whole-chunk call (the same bits) while one half's exchange moves
-// beside the other half's compute.  0: the chunk runs as one call.
-//
-// OPT-IN (BASALT_TP_OVERLAP=1) and currently a REGRESSION on this model.  Measured at pp8192 (8,353 tokens,
-// 27B pack, block drafter), rep 1, engine tok/s:
-//   overlap off, real exchange  3,910   (2,136 ms)
-//   overlap off, no exchange    7,921   (1,055 ms)  -> the exchange is ~51% of prefill
-//   overlap on,  real exchange  1,679   (4,984 ms)  -> worse than not overlapping
-//   overlap on,  no exchange    7,719   (1,082 ms)  -> halving the rows costs only ~2.5%
-// Splitting every exchange into two rounds costs ~3.6x more than the bytes it hides: 512 rounds add 3,902 ms
-// where 256 whole rounds add 1,081 ms (~9.5 GB/s per card, near the Gen4 x8 practical ceiling).  The whole-chunk
-// exchange is already bandwidth-efficient; it needs concurrency with the compute, not halving.  Kept behind the
-// flag because the ordering work (split exchange + read epochs + per-card streams) is the prerequisite for any
-// finer-grained overlap.
-int prefill_overlap_split(int T) {
-    static const bool on = std::getenv("BASALT_TP_OVERLAP") != nullptr;
-    if (!on) return 0;
-    constexpr int kAlign = 128, kMinHalf = 384;
-    const int split = T / 2 / kAlign * kAlign;
-    return split >= kMinHalf && T - split >= kMinHalf ? split : 0;
-}
-
 // x += W . a for a chunk's output projection on other matrix types (FP32 a): NVFP4 planes add into the BF16 residual in
 // their epilogue (in fp32, rounded once), others through tmp
-void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int T, uint16_t* base, cudaStream_t s,
-                    bool defer = false, size_t* slot = nullptr) {
+void chunk_residual(Model& m, const Linear& l, const float* a, int64_t cols, int T, cudaStream_t s) {
     ChunkScratch& b = m.cs;
     chunk_act(m, a, l.type, cols, T, s);
     if (l.type == kTypeNvfp4Planes) {
-        if (m.tp) {
-            prefill::fp4_dense::product(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, b.tmp, l.rows, false, s);
-            if (defer) { if (slot) *slot = tp_chunk_begin(m, b.tmp, (int64_t) T * l.rows, s); }
-            else tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
-            return;
-        }
         prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, residual(b), l.rows, s);
         return;
     }
     gemm(m, l, b.tmp, T, s);
-    if (m.tp) {
-        if (post_scale(l)) kernels::scale_values(b.tmp, post_scale(l), (int64_t) T * l.rows, s);
-        tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
-        return;
-    }
-    kernels::add_scaled(base, b.tmp, post_scale(l), (int64_t) T * l.rows, s);
+    kernels::add_scaled(residual(b), b.tmp, post_scale(l), (int64_t) T * l.rows, s);
 }
 // x += W . a for an F8 output projection whose input rows its producer already rounded into b.xq
-void chunk_residual_f8(Model& m, const Linear& l, int T, uint16_t* base, cudaStream_t s, bool defer = false,
-                       size_t* slot = nullptr) {
-    if (m.tp) {
-        prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, m.cs.tmp, l.rows,
-                           prefill::fp8::Epilogue::Store, s);
-        if (defer) { if (slot) *slot = tp_chunk_begin(m, m.cs.tmp, (int64_t) T * l.rows, s); }
-        else tp_chunk_add(m, m.cs.tmp, base, (int64_t) T * l.rows, s);
-        return;
-    }
-    prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, base, l.rows,
+void chunk_residual_f8(Model& m, const Linear& l, int T, cudaStream_t s) {
+    prefill::fp8::gemm((const uint8_t*) l.w, l.rows, l.cols, l.scale, m.cs.xq, T, residual(m.cs), l.rows,
                        prefill::fp8::Epilogue::AddBf16, s);
 }
-// x += W . a for an NVFP4 planes output projection of BF16 rows a whose producer gave each token's largest |value| (rowmax)
-void chunk_residual_fp4(Model& m, const Linear& l, const uint16_t* a, const float* rowmax, int64_t cols, int T,
-                        uint16_t* base, cudaStream_t s, bool defer = false, size_t* slot = nullptr) {
+// x += W . a for an NVFP4 planes output projection of BF16 rows a whose producer gave each row's largest |value| (rowmax)
+void chunk_residual_fp4(Model& m, const Linear& l, const uint16_t* a, const float* rowmax, int64_t cols, int T, cudaStream_t s) {
     ChunkScratch& b = m.cs;
     prefill::fp4_dense::quantize_amax(a, rowmax, T, cols, cols, b.a4, b.gs, s);
-    if (m.tp) {
-        prefill::fp4_dense::product(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, b.tmp, l.rows, false, s);
-        if (defer) { if (slot) *slot = tp_chunk_begin(m, b.tmp, (int64_t) T * l.rows, s); }
-        else tp_chunk_add(m, b.tmp, base, (int64_t) T * l.rows, s);
-        return;
-    }
-    prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, base, l.rows, s);
+    prefill::fp4_dense::product_add_bf16(l.w, l.scale, l.rows, cols, b.a4, b.gs, T, residual(b), l.rows, s);
 }
 
 // K/V streaming, a prompt chunk: an attention layer reads its far cells from the model's VRAM stage instead of host
@@ -510,14 +410,10 @@ kernels::KvInt8 prompt_cells(Model& m, const kernels::KvInt8& q8, int64_t cells,
 // and v products and the same cache write, without the queries, the attention and the output projection.  `far`: a
 // streamed cache's far cells (the chunk's rows are written there and read from the stage; stage_prefetch has run).
 void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
-                kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far_kv = {}, int first = 0,
-                bool defer = false, size_t* slot = nullptr) {
+                kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far_kv = {}) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim;
-    uint16_t* const xb = residual(b) + (size_t) first * H;   // this row range's residual rows
-    const int32_t* const pv = b.pos + (size_t) first * 3;    // and its rope positions
-    const int64_t p0 = pos + first;                          // its first cell
     const bool f8 = all_f8({&L.q, &L.k, &L.v, &L.o}), nvfp4 = all_nvfp4({&L.q, &L.k, &L.v, &L.o});
     if (f8 || nvfp4) {
         // the norm in the quantizer, the q, k and v products BF16 out (F8: one product), the gate's rows straight to E4M3 for
@@ -525,8 +421,8 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         const auto product = [&](const Linear& l, float* dst) {
             prefill::fp4_dense::product_bf16(l.w, l.scale, l.rows, H, b.a4, b.gs, T, bf(dst), l.rows, s);
         };
-        if (f8) prefill::fp8::rms_norm_quantize(xb, L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
-        else prefill::fp4_dense::rms_norm_quantize(xb, L.attn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
+        if (f8) prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, nullptr, s);
+        else prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
         if (cells_only) {
             if (f8) {
                 const prefill::fp8::Segment seg[2] = {f8_seg(L.k, b.k), f8_seg(L.v, b.v)};
@@ -535,8 +431,8 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
                 product(L.k, b.k);
                 product(L.v, b.v);
             }
-            kernels::attn_qk_prepare_bf16(nullptr, bf(b.k), bf(b.v), nullptr, L.k_norm, g.eps, g.rope, pv, T, 0, g.n_kv,
-                                          nullptr, p0, s, q8, kc, vc, far_kv);
+            kernels::attn_qk_prepare_bf16(nullptr, bf(b.k), bf(b.v), nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr,
+                                          pos, s, q8, kc, vc, far_kv);
             return;
         }
         if (f8) {
@@ -547,34 +443,34 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
             product(L.k, b.k);
             product(L.v, b.v);
         }
-        kernels::attn_qk_prepare_bf16(bf(b.qfull), bf(b.k), bf(b.v), L.q_norm, L.k_norm, g.eps, g.rope, pv, T, g.n_head,
-                                      g.n_kv, bf(b.qo), p0, s, q8, kc, vc, far_kv);
-        const kernels::KvFar read = stage_far(m, far_kv, p0, T, s);
+        kernels::attn_qk_prepare_bf16(bf(b.qfull), bf(b.k), bf(b.v), L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv,
+                                      bf(b.qo), pos, s, q8, kc, vc, far_kv);
+        const kernels::KvFar read = stage_far(m, far_kv, pos, T, s);
         const size_t split = kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits);
         uint8_t* e4 = (uint8_t*) b.xq;
         float* e4s = prefill::fp8::act_scales(b.xq, T, AQ);
         if (q8.k) {   // BF16 queries and output rows
-            const kernels::KvInt8 r8 = prompt_cells(m, q8, p0 + T, s);
-            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, p0, T, bf(b.ao), s, r8, b.attn_split, split, read);
+            const kernels::KvInt8 r8 = prompt_cells(m, q8, pos + T, s);
+            kernels::gqa_prompt_attn_bf16(bf(b.qo), g.n_head, g.n_kv, pos, T, bf(b.ao), s, r8, b.attn_split, split, read);
             if (f8) kernels::attn_gate_e4m3(bf(b.ao), bf(b.qfull), T, g.n_head, e4, e4s, s);
             else kernels::attn_gate_bf16(bf(b.ao), bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
         } else {      // an fp16 cache's prompt kernel reads FP32 queries (the gate's BF16 rows reuse their buffer)
             kernels::to_f32(bf(b.qo), b.ag, (int64_t) T * AQ, s);
-            kernels::gqa_prompt_attn(b.ag, kc, vc, g.n_head, g.n_kv, p0, T, b.ao, s, q8, b.attn_split, split, read);
+            kernels::gqa_prompt_attn(b.ag, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, q8, b.attn_split, split, read);
             if (f8) kernels::attn_gate_e4m3(b.ao, bf(b.qfull), T, g.n_head, e4, e4s, s);
             else kernels::attn_gate_bf16(b.ao, bf(b.qfull), T, g.n_head, bf(b.ag), b.hmax, s);
         }
-        if (f8) chunk_residual_f8(m, L.o, T, xb, s, defer, slot);
-        else chunk_residual_fp4(m, L.o, bf(b.ag), b.hmax, AQ, T, xb, s, defer, slot);
+        if (f8) chunk_residual_f8(m, L.o, T, s);
+        else chunk_residual_fp4(m, L.o, bf(b.ag), b.hmax, AQ, T, s);
         return;
     }
-    kernels::rms_norm_rows(xb, L.attn_norm, b.xn, T, H, g.eps, s);
+    kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
     if (cells_only) {
         chunk_act(m, b.xn, L.k.type, H, T, s);
         gemm(m, L.k, b.k, T, s);
         gemm(m, L.v, b.v, T, s);
-        kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, pv, T, 0, g.n_kv, nullptr, kc, vc, p0,
-                                 s, 256, true, 0, nullptr, q8, far_kv);
+        kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr, kc, vc, pos, s,
+                                 256, true, 0, nullptr, q8, far_kv);
         return;
     }
     chunk_act(m, b.xn, L.q.type, H, T, s);
@@ -582,20 +478,18 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
     if (L.k.type != L.q.type) chunk_act(m, b.xn, L.k.type, H, T, s);
     gemm(m, L.k, b.k, T, s);
     gemm(m, L.v, b.v, T, s);
-    kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, pv, T, g.n_head, g.n_kv, b.qo, kc, vc,
-                             p0, s, 256, true, 0, nullptr, q8, far_kv);
-    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, p0, T, b.ao, s, prompt_cells(m, q8, p0 + T, s), b.attn_split,
-                             kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far_kv, p0, T, s));
+    kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
+                             pos, s, 256, true, 0, nullptr, q8, far_kv);
+    kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, prompt_cells(m, q8, pos + T, s), b.attn_split,
+                             kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far_kv, pos, T, s));
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
-    chunk_residual(m, L.o, b.ag, AQ, T, xb, s, defer, slot);
+    chunk_residual(m, L.o, b.ag, AQ, T, s);
 }
 
-void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s, int first = 0,
-               bool defer = false, size_t* slot = nullptr) {
+void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, VD = g.value_width(), HV = g.gdn_v_heads;
-    uint16_t* const xb = residual(b) + (size_t) first * H;   // this row range's residual rows
     float* state = st.gdn + (size_t) gi * st.gdn_floats;
     float* hist = state + (size_t) g.gdn_state * HV * g.gdn_state;
     const bool f8 = all_f8({&L.qkv, &L.z, &L.out}), nvfp4 = all_nvfp4({&L.qkv, &L.z, &L.out});
@@ -604,66 +498,57 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
         // the conv and the recurrence on BF16 rows, the closing norm straight to E4M3 for an F8 out, else to BF16 rows with
         // each row's amax, read once by out's FP4 quantizer
         if (f8) {
-            prefill::fp8::rms_norm_quantize(xb, L.attn_norm, g.eps, T, H, b.xq, bf(b.xn), s);
+            prefill::fp8::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.xq, bf(b.xn), s);
             const prefill::fp8::Segment seg[2] = {f8_seg(L.qkv, b.qkv), f8_seg(L.z, b.z)};
             prefill::fp8::gemm_segmented(seg, 2, H, b.xq, T, prefill::fp8::Epilogue::StoreBf16, s);
         } else {
-            prefill::fp4_dense::rms_norm_quantize(xb, L.attn_norm, g.eps, T, H, b.a4, b.gs, bf(b.xn), s);
+            prefill::fp4_dense::rms_norm_quantize(residual(b), L.attn_norm, g.eps, T, H, b.a4, b.gs, bf(b.xn), s);
             prefill::fp4_dense::product_bf16(L.qkv.w, L.qkv.scale, L.qkv.rows, H, b.a4, b.gs, T, bf(b.qkv), L.qkv.rows, s);
             prefill::fp4_dense::product_bf16(L.z.w, L.z.scale, L.z.rows, H, b.a4, b.gs, T, bf(b.z), L.z.rows, s);
         }
         kernels::gdn_gating_proj(bf(b.xn), L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
-        kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s, g.gdn_k_heads, HV);
+        kernels::gdn_conv(hist, bf(b.qkv), L.conv, bf(b.hc), T, s);
         if (f8) {
             kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
-                                         (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD), nullptr, nullptr, g.gdn_k_heads, HV);
-            chunk_residual_f8(m, L.out, T, xb, s, defer, slot);
+                                         (uint8_t*) b.xq, prefill::fp8::act_scales(b.xq, T, VD));
+            chunk_residual_f8(m, L.out, T, s);
             return;
         }
         kernels::gdn_recurrence_bf16(state, bf(b.hc), b.gate, b.beta, bf(b.z), L.gamma, g.eps, b.work, b.y, T, s, g.gdn_gate,
-                                     nullptr, nullptr, bf(b.yn), b.hmax, g.gdn_k_heads, HV);
-        chunk_residual_fp4(m, L.out, bf(b.yn), b.hmax, VD, T, xb, s, defer, slot);
+                                     nullptr, nullptr, bf(b.yn), b.hmax);
+        chunk_residual_fp4(m, L.out, bf(b.yn), b.hmax, VD, T, s);
         return;
     }
     {
-        kernels::rms_norm_rows(xb, L.attn_norm, b.xn, T, H, g.eps, s);
+        kernels::rms_norm_rows(residual(b), L.attn_norm, b.xn, T, H, g.eps, s);
         chunk_act(m, b.xn, L.qkv.type, H, T, s);
         gemm(m, L.qkv, b.qkv, T, s);
         if (L.z.type != L.qkv.type) chunk_act(m, b.xn, L.z.type, H, T, s);
         gemm(m, L.z, b.z, T, s);
     }
     kernels::gdn_gating_proj(b.xn, L.w_ab, L.dt, L.ssm_a, b.gate, b.beta, T, HV, H, s);
-    kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s, g.gdn_k_heads, HV);
-    kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn,
-                             nullptr, nullptr, g.gdn_k_heads, HV);
-    chunk_residual(m, L.out, b.yn, VD, T, xb, s, defer, slot);
+    kernels::gdn_conv(hist, b.qkv, L.conv, b.hc, T, s);
+    kernels::gdn_recurrence(state, b.hc, b.gate, b.beta, b.z, L.gamma, g.eps, b.work, b.y, nullptr, T, s, g.gdn_gate, b.yn);
+    chunk_residual(m, L.out, b.yn, VD, T, s);
 }
 
 
-void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s, int first = 0, bool defer = false,
-               size_t* slot = nullptr) {
+void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
-    uint16_t* const xb = residual(b) + (size_t) first * H;   // this row range's residual rows
     if (L.gate.type == kTypeNvfp4Planes && L.up.type == kTypeNvfp4Planes && L.down.type == kTypeNvfp4Planes) {
         // NVFP4 planes: the norm in the quantizer, W4A4 on the TMA products, gate and up as one SwiGLU product, the residual
         // added by down's; H is BF16 (in b.h's buffer), read once by its quantizer
         uint16_t* h16 = reinterpret_cast<uint16_t*>(b.h);
-        prefill::fp4_dense::rms_norm_quantize(xb, L.ffn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
+        prefill::fp4_dense::rms_norm_quantize(residual(b), L.ffn_norm, g.eps, T, H, b.a4, b.gs, nullptr, s);
         prefill::fp4_dense::swiglu(L.gate.w, L.up.w, L.gate.scale, L.up.scale, L.gate.rows, H, b.a4, b.gs, T, h16, g.n_ff, s,
                                    b.hmax);
         prefill::fp4_dense::quantize_amax(h16, b.hmax, T, g.n_ff, g.n_ff, b.a4, b.gs, s);
-        if (m.tp) {
-            prefill::fp4_dense::product(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, b.tmp, H, false, s);
-            if (defer) { if (slot) *slot = tp_chunk_begin(m, b.tmp, (int64_t) T * H, s); }
-            else tp_chunk_add(m, b.tmp, xb, (int64_t) T * H, s);
-            return;
-        }
-        prefill::fp4_dense::product_add_bf16(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, xb, H, s);
+        prefill::fp4_dense::product_add_bf16(L.down.w, L.down.scale, L.down.rows, g.n_ff, b.a4, b.gs, T, residual(b), H, s);
         return;
     }
-    kernels::rms_norm_rows(xb, L.ffn_norm, b.xn, T, H, g.eps, s);
+    kernels::rms_norm_rows(residual(b), L.ffn_norm, b.xn, T, H, g.eps, s);
     chunk_act(m, b.xn, L.gate.type, H, T, s);
     gemm(m, L.gate, b.g, T, s);
     if (L.up.type != L.gate.type) chunk_act(m, b.xn, L.up.type, H, T, s);
@@ -671,13 +556,7 @@ void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s, int first = 0, b
     kernels::swiglu_scaled(b.g, b.u, L.gate.scale, L.up.scale, b.h, T, g.n_ff, g.n_ff, s);
     chunk_act(m, b.h, L.down.type, g.n_ff, T, s);
     gemm(m, L.down, b.tmp, T, s);
-    if (m.tp) {
-        if (L.down.scale) kernels::scale_values(b.tmp, L.down.scale, (int64_t) T * H, s);
-        if (defer) { if (slot) *slot = tp_chunk_begin(m, b.tmp, (int64_t) T * H, s); }
-        else tp_chunk_add(m, b.tmp, xb, (int64_t) T * H, s);
-        return;
-    }
-    kernels::add_scaled(xb, b.tmp, L.down.scale, (int64_t) T * H, s);
+    kernels::add_scaled(residual(b), b.tmp, L.down.scale, (int64_t) T * H, s);
 }
 
 // The block drafter's rope: plain positions over the whole head.
@@ -794,7 +673,7 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
         }
         win_ffn(m, L, T, s);
     }, s);
-    if (m.lb > 0 || m.tp_rank) return;   // the second card of a split has no head; the pair's rank 1 keeps the sampling
+    if (m.lb > 0) return;   // the second card of a split has no head
     prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, T, g.eps, s), st.logits, T, s);
     if (st.hid) cudaMemcpyAsync(st.hid, b.xn, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);   // the drafter's
 }
@@ -805,8 +684,7 @@ namespace {
 
 // One card's window: its inputs uploaded, then its graph for T rows (the first window of T rows runs as launched, then is
 // captured for the next ones).  `tokens` null: the card takes its rows from the other (a split's second card).
-bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3, std::string& err,
-                   bool launch = true) {
+bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3, std::string& err) {
     WindowScratch& b = m.ws;
     const cudaStream_t s = st.stream;
     const int32_t bounds[2] = {0, T}, first[2] = {(int32_t) pos, 0};
@@ -818,13 +696,13 @@ bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int
     st.alt_ready = T == 1 && st.gdn_alt != nullptr;
     cudaGraphExec_t& wg = st.wg[st.gdn != st.gdn_first ? 1 : 0][T];
     if (wg) {
-        if (launch && cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
+        if (cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
         return cuda_ok("dense window", err);
     }
     // The first window of T rows runs as launched, then is captured for the next ones.  A layer split's window waits on the
     // other card's inside its graph: it is captured first and only its graph runs, so no kernel loads lazily (which waits for
     // the card to idle) while a wait holds the card.
-    const bool split = m.hand != nullptr || m.tp != nullptr;   // a TP pair too: its first step must only be captured (its exchanges spin on the peer)
+    const bool split = m.hand != nullptr;
     if (!split) {
         window_body(m, st, T, pos);
         if (!cuda_ok("dense window", err)) return false;
@@ -838,16 +716,8 @@ bool launch_window(Model& m, SessionState& st, const int32_t* tokens, int T, int
         return cuda_ok("dense window capture", err);
     }
     cudaGraphDestroy(graph);
-    if (split && launch && cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
+    if (split && cudaGraphLaunch(wg, s) != cudaSuccess) return cuda_ok("dense window graph", err) && false;
     return cuda_ok("dense window", err);
-}
-
-// A pair's cached window graph for this row count (null when launch_window has not captured one yet). The TP
-// driver captures both cards' graphs before launching either: an exchange spins for its peer, and capturing the
-// second card's graph while the first one's already runs would hold that spin for the whole capture.
-cudaGraphExec_t* window_graph(Model& m, SessionState& st, int T) {
-    cudaGraphExec_t& wg = st.wg[st.gdn != st.gdn_first ? 1 : 0][T];
-    return wg ? &wg : nullptr;
 }
 
 // The split's flags lowered for the next window: both cards are past the last one's (the main card's stream has met the
@@ -861,48 +731,8 @@ void lower_flags(SplitHand& h) {
 
 }  // namespace
 
-// The pair's drivers queue each card's step on its own stream and never join them with an event: the mailbox's
-// per-round waits are the pair's only true dependencies (a card's exchange kernel cannot pass its peer's round), and
-// an event would have to live on one card's context while recorded on the other's - which CUDA refuses.
 bool forward_window(Model& m, SessionState& st, const int32_t* tokens, int T, int64_t pos, const int32_t* pos3,
                     std::string& err) {
-    if (m.tp) {   // the pair runs the same window half-wide on each card; the products' sums meet over the mailbox.
-                  // Rank 1 first (its graph's exchanges wait for rank 0's flags, so it may queue behind them freely).
-        if (m.tp->mb.hang_reported()) {
-            err = "dense tp: an earlier exchange diverged; the pair's results have split";
-            return false;
-        }
-        m.tp->epi[0] = m.tp->epi[1] = 0;
-        {
-            const core::OnDevice on(m.tp->peer_dev);
-            if (!launch_window(*m.tp->peer, *st.peer, tokens, T, pos, pos3, err, false)) return false;
-        }
-        if (!launch_window(m, st, tokens, T, pos, pos3, err, false)) return false;
-        if (m.tp->epi[0] != m.tp->epi[1]) {
-            err = "dense tp: window T=" + std::to_string(T) + " pos=" + std::to_string((long long) pos) + ": cards queued " +
-                  std::to_string((int) m.tp->epi[1]) + " and " + std::to_string((int) m.tp->epi[0]) + " exchanges (not lockstep)";
-            m.tp->mb.poison();
-            return false;
-        }
-        if (m.tp->epi[0] & 1) {   // the two slots alternate across the window's reset: an odd count reuses a slot back to back
-            err = "dense tp: window T=" + std::to_string(T) + ": a body must queue an even number of exchanges";
-            m.tp->mb.poison();
-            return false;
-        }
-        if (m.tp->mb.hang_reported()) {   // an exchange failed while the graphs were captured: launching would wedge the pair
-            err = "dense tp: an exchange diverged while the window's graphs were captured";
-            return false;
-        }
-        {
-            // both cards' graphs exist and both hosts finished queueing: queue back to back
-            const core::OnDevice on(m.tp->peer_dev);
-            if (cudaGraphLaunch(*window_graph(*m.tp->peer, *st.peer, T), st.peer->stream) != cudaSuccess)
-                return cuda_ok("dense tp peer window graph", err) && false;
-        }
-        if (cudaGraphLaunch(*window_graph(m, st, T), st.stream) != cudaSuccess)
-            return cuda_ok("dense tp window graph", err) && false;
-        return true;
-    }
     if (m.split) {   // the second card's graph first: it waits for the main card's rows
         lower_flags(*m.hand);
         const core::OnDevice on(m.split_dev);
@@ -1007,7 +837,7 @@ void batch_body(Model& m, const BatchSeg* segs, int S) {
             else batch_attn(m, L, m.attn_index[(size_t) il], segs, S, rows, s);
             win_ffn(m, L, rows, s);
         }, s);
-        if (m.lb > 0 || m.tp_rank) return;   // the second card of a split has no head; the pair's rank 1 keeps the sampling
+        if (m.lb > 0) return;   // the second card of a split has no head
         prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, rows, g.eps, s), b.hl, rows, s);
     }
     int row = 0;
@@ -1064,65 +894,9 @@ bool launch_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, 
     return cuda_ok("dense batch window", err);
 }
 
-// A pair's batch graph for this composition: staged, and captured if it is new — but not launched. The pair's
-// exchanges spin for their peer, so both cards' graphs exist before either one runs (see window_graph). Null with
-// `err`: the stage's copy or the capture failed.
-core::CapturedGraph* pair_batch_graph(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
-                                      const int32_t* pos3, std::string& err) {
-    const cudaStream_t s = segs[0].st->stream;
-    stage_batch(m, segs, S, tokens, pos3);
-    model::GraphLru<core::CapturedGraph>::Key key;
-    for (int k = 0; k < S; ++k) key.insert(key.end(), {(uint64_t) (uintptr_t) segs[k].st, (uint64_t) segs[k].T});
-    if (core::CapturedGraph* g = m.batch.graphs.find(key)) return g;
-    core::CapturedGraph fresh;
-    if (!fresh.begin(s, err)) return nullptr;
-    batch_body(m, segs, S);
-    if (!fresh.end(s, err)) return nullptr;
-    return &m.batch.graphs.insert(std::move(key), std::move(fresh));
-}
-
 }  // namespace
 
 bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens, const int32_t* pos3, std::string& err) {
-    if (m.tp) {   // the pair: one batch body per card, the same compositions, the products summed over the mailbox
-        if (m.tp->mb.hang_reported()) {
-            err = "dense tp: an earlier exchange diverged; the pair's results have split";
-            return false;
-        }
-        std::vector<BatchSeg> ps((size_t) S);
-        cudaStream_t s0 = segs[0].st->stream;
-        for (int k = 0; k < S; ++k) ps[(size_t) k] = {segs[k].st->peer.get(), segs[k].T, segs[k].pos};
-        m.tp->epi[0] = m.tp->epi[1] = 0;
-        core::CapturedGraph* pg = nullptr;
-        {
-            const core::OnDevice on(m.tp->peer_dev);
-            pg = pair_batch_graph(*m.tp->peer, ps.data(), S, tokens, pos3, err);
-        }
-        if (!pg) return false;
-        core::CapturedGraph* g = pair_batch_graph(m, segs, S, tokens, pos3, err);
-        if (!g) return false;
-        if (m.tp->epi[0] != m.tp->epi[1]) {
-            err = "dense tp: batch S=" + std::to_string(S) + ": cards queued " + std::to_string((int) m.tp->epi[1]) + " and " +
-                  std::to_string((int) m.tp->epi[0]) + " exchanges (not lockstep)";
-            m.tp->mb.poison();
-            return false;
-        }
-        if (m.tp->epi[0] & 1) {   // the two slots alternate across the batch's reset: an odd count reuses a slot back to back
-            err = "dense tp: batch S=" + std::to_string(S) + ": a body must queue an even number of exchanges";
-            m.tp->mb.poison();
-            return false;
-        }
-        if (m.tp->mb.hang_reported()) {   // an exchange failed while the graphs were captured: launching would wedge the pair
-            err = "dense tp: an exchange diverged while the batch's graphs were captured";
-            return false;
-        }
-        {
-            const core::OnDevice on(m.tp->peer_dev);
-            if (!pg->launch(ps[0].st->stream, err)) return cuda_ok("dense tp peer batch graph", err) && false;
-        }
-        if (!g->launch(s0, err)) return cuda_ok("dense tp batch graph", err) && false;
-        return true;
-    }
     if (m.split) {   // the second card's sessions, their graph first: it waits for the main card's rows
         lower_flags(*m.hand);
         std::vector<BatchSeg> ps((size_t) S);
@@ -1155,8 +929,7 @@ void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float*
     if (st.mtp_kc != nullptr) cudaMemcpyAsync(b.cat, b.tmp, (size_t) T * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
 }
 
-void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last,
-                    int scan_l1, int first) {
+void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last) {
     const Geometry& g = m.g;
     const Weights& w = m.w;
     const cudaStream_t s = st.stream;
@@ -1168,11 +941,9 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
                            (taps && std::find(taps->target_layers.begin(), taps->target_layers.end(), g.n_layers - 1) !=
                                         taps->target_layers.end());
     // K/V streaming: the next attention layer that attends gets its earlier far cells staged meanwhile
-    const int scan_end = scan_l1 > 0 ? scan_l1 : l1;   // the pair's drivers slice the layers but staging prefetch must
-                                                       // still see the chunk's whole layer span
     const auto prefetch_from = [&](int il0) {
         if (m.stage.at >= pos) return;
-        for (int j = il0; j < scan_end; ++j)
+        for (int j = il0; j < l1; ++j)
             if (w.layers[(size_t) j].kind == Mixer::Attention) {
                 if (j < g.n_layers - 1 || last_read) stage_prefetch(m, st.far_kv[(size_t) m.attn_index[(size_t) j]], pos, s);
                 return;
@@ -1186,43 +957,17 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
         const Layer& L = w.layers[(size_t) il];
         const bool unread = il == g.n_layers - 1 && !last_read;
         if (L.kind == Mixer::Gdn) {
-            chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s, first);
+            chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
         } else {
             const int ai = m.attn_index[(size_t) il];
-            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread,
-                       st.far_kv[(size_t) ai], first);
+            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread, st.far_kv[(size_t) ai]);
             if (!unread) prefetch_from(il + 1);
         }
         if (unread) break;
-        chunk_ffn(m, L, T, s, first);
+        chunk_ffn(m, L, T, s);
         if (taps && next_target < taps->target_layers.size() && taps->target_layers[next_target] == il)
             chunk_tap(m, st, T, *taps, next_target++);
     }
-}
-
-// One layer's mixer (GDN or attention) over a row range, ending with its exchange begun.  `unread`: nothing reads
-// the layer's rows, so only the K and V cells are made (no o-projection, no exchange).
-void chunk_layer_mixer(Model& m, SessionState& st, const Layer& L, int il, int first, int T, int64_t pos, bool unread,
-                       cudaStream_t s, bool defer = false, size_t* slot = nullptr) {
-    if (L.kind == Mixer::Gdn) {
-        chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s, first, defer, slot);
-        return;
-    }
-    const int ai = m.attn_index[(size_t) il];
-    chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread,
-               st.far_kv[(size_t) ai], first, defer, slot);
-}
-
-// The next attention layer's far cells, staged once per layer (independent of the row range a body is split into).
-void stage_prefetch_layer(Model& m, SessionState& st, int64_t pos, int il0, int scan_end, bool last_read) {
-    const Geometry& g = m.g;
-    const Weights& w = m.w;
-    if (m.stage.at >= pos) return;
-    for (int j = il0; j < scan_end; ++j)
-        if (w.layers[j].kind == Mixer::Attention) {
-            if (j < g.n_layers - 1 || last_read) stage_prefetch(m, st.far_kv[m.attn_index[j]], pos, st.stream);
-            return;
-        }
 }
 
 void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j) {
@@ -1280,190 +1025,6 @@ bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& e
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
                    const int32_t* pos3, std::string& err) {
     if (m.split) return split_chunk(m, st, tokens, rows, T, pos, pos3, err);
-    if (m.tp) {   // the pair: both cards run the whole chunk half-wide; the products' sums meet over the mailbox
-        if (m.tp->mb.hang_reported()) {
-            err = "dense tp: an earlier exchange diverged; the pair's results have split";
-            return false;
-        }
-        {
-            // the peer's chunk scratch must live on its own card
-            const core::OnDevice on(m.tp->peer_dev);
-            if (!m.tp->peer->ensure_chunk(err)) return false;
-        }
-        if (!m.ensure_chunk(err)) return false;
-        m.tp->epi[0] = m.tp->epi[1] = 0;
-        {
-            const core::OnDevice on(m.tp->peer_dev);
-            chunk_start(*m.tp->peer, *st.peer, tokens, rows, T, pos3);
-        }
-        chunk_start(m, st, tokens, rows, T, pos3);
-        // the layer bodies interleave across the cards: a card's queue only ever holds one layer's kernels, so the
-        // enqueue thread cannot block on a full stream while its peer's matching exchange still waits to be queued
-        // (a stream's pending-launch capacity is finite; a whole eager chunk's body exceeds it)
-        const bool block = m.o.drafter == Drafter::Block;
-        // the last layer's rows are read alike on both cards or on neither: rank 0's drafter decides (its state
-        // alone carries mtp_kc or the taps), and the peer's body must queue the same exchanges - a read on one
-        // card only leaves its o-projection and FFN-down rounds unpaired (the peer takes the cells-only exit)
-        const bool read_last =
-            st.mtp_kc != nullptr ||
-            (block && std::find(m.w.dflash.target_layers.begin(), m.w.dflash.target_layers.end(), m.g.n_layers - 1) !=
-                          m.w.dflash.target_layers.end());
-        const cudaStream_t s = st.stream;
-        const BlockDrafter* taps = block ? &m.w.dflash : nullptr;
-        const int split = prefill_overlap_split(T);
-        size_t next_target = 0;
-        if (taps)
-            while (next_target < taps->target_layers.size() && taps->target_layers[next_target] < 0) ++next_target;
-        if (split > 0) {
-            // The overlap, with real lanes: each layer's mixer and FFN run as two row halves, and each card's
-            // mailbox combines (wait, pull, residual add) run on that card's SIDE stream - the finished half's
-            // pull moves beside the main stream's compute. The exchange kernels' grids are SM-capped
-            // (BASALT_TP_GRID_BPSM): a capped pull coexists with compute on the machine; at the full grid the
-            // exchange owns every SM and the schedule serialises (the 11-23 measurement, 2.3x worse).
-            // Events gate the lanes in pairs - every record is followed by its waits at the same enqueue
-            // point, so the objects reuse across layers: 0-3 publish done (main -> side), 4-7 combine done
-            // (side -> main). A combine's gate is waited where those rows are next read: the half's FFN
-            // after its mixer combine, the next layer's mixer halves after this layer's FFN combines, the
-            // drafter's taps after both. Rank 1's op of every pair is enqueued first, as everywhere else.
-            // BASALT_TP_NO_SIDE=1 keeps the schedule but pulls on the main streams: no hiding, only doubled
-            // rounds (the 11-23 regression, kept as the switch matrix's old arm).
-            const bool lanes = std::getenv("BASALT_TP_NO_SIDE") == nullptr;
-            const int firsts[2] = {0, split};
-            const int counts[2] = {split, T - split};
-            const int64_t nh[2] = {(int64_t) counts[0] * m.g.n_embd, (int64_t) counts[1] * m.g.n_embd};
-            const cudaStream_t ps = st.peer->stream;
-            const cudaStream_t pside = lanes ? st.peer->side : ps;
-            const cudaStream_t sside = lanes ? st.side : s;
-            uint16_t* res0 = const_cast<uint16_t*>(residual(m.cs));
-            uint16_t* pres0 = const_cast<uint16_t*>(residual(m.tp->peer->cs));
-            const int64_t H = m.g.n_embd;
-            bool ev_ok = true;
-            const auto fork = [&](int gi) {   // this card's publish is done: its side lane may pull
-                {
-                    const core::OnDevice on(m.tp->peer_dev);
-                    ev_ok = ev_ok && cudaEventRecord(st.peer->tp_e[gi], ps) == cudaSuccess &&
-                            cudaStreamWaitEvent(pside, st.peer->tp_e[gi], 0) == cudaSuccess;
-                }
-                ev_ok = ev_ok && cudaEventRecord(st.tp_e[gi], s) == cudaSuccess &&
-                        cudaStreamWaitEvent(sside, st.tp_e[gi], 0) == cudaSuccess;
-            };
-            const auto fin = [&](size_t slot, int h, int gi) {   // the pull on the lanes; record its gate
-                {
-                    const core::OnDevice on(m.tp->peer_dev);
-                    tp_chunk_finish(*m.tp->peer, slot, pres0 + (size_t) firsts[h] * H, nh[h], pside);
-                    ev_ok = ev_ok && cudaEventRecord(st.peer->tp_e[gi], pside) == cudaSuccess;
-                }
-                tp_chunk_finish(m, slot, res0 + (size_t) firsts[h] * H, nh[h], sside);
-                ev_ok = ev_ok && cudaEventRecord(st.tp_e[gi], sside) == cudaSuccess;
-            };
-            const auto gate = [&](int gi) {   // the main streams wait a recorded combine before reading rows
-                {
-                    const core::OnDevice on(m.tp->peer_dev);
-                    ev_ok = ev_ok && cudaStreamWaitEvent(ps, st.peer->tp_e[gi], 0) == cudaSuccess;
-                }
-                ev_ok = ev_ok && cudaStreamWaitEvent(s, st.tp_e[gi], 0) == cudaSuccess;
-            };
-            bool exchanged_last = false;
-            for (int il = 0; il < m.g.n_layers; ++il) {
-                const bool unread = (il == m.g.n_layers - 1) && !read_last;
-                if (il > 0 && exchanged_last) gate(6);   // this half's mixer reads rows the last FFN's combine A completes
-                // stage the next attention layer's far cells once per layer: the staging depends only on the chunk,
-                // not on the row range
-                if (il + 1 < m.g.n_layers) {
-                    const core::OnDevice on(m.tp->peer_dev);
-                    stage_prefetch_layer(*m.tp->peer, *st.peer, pos, il + 1, m.g.n_layers, read_last);
-                }
-                stage_prefetch_layer(m, st, pos, il + 1, m.g.n_layers, read_last);
-                size_t slot_mixer[2] = {0, 0};
-                {
-                    const core::OnDevice on(m.tp->peer_dev);
-                    chunk_layer_mixer(*m.tp->peer, *st.peer, m.tp->peer->w.layers[(size_t) il], il, firsts[0],
-                                      counts[0], pos, unread, ps, !unread, &slot_mixer[0]);
-                }
-                chunk_layer_mixer(m, st, m.w.layers[(size_t) il], il, firsts[0], counts[0], pos, unread, s,
-                                  !unread, &slot_mixer[0]);
-                if (!unread) fork(0);
-                if (exchanged_last) gate(7);   // half B's mixer: the last FFN's combine B (enqueued after A's begin: pipelined)
-                {
-                    const core::OnDevice on(m.tp->peer_dev);
-                    chunk_layer_mixer(*m.tp->peer, *st.peer, m.tp->peer->w.layers[(size_t) il], il, firsts[1],
-                                      counts[1], pos, unread, ps, !unread, &slot_mixer[1]);
-                }
-                chunk_layer_mixer(m, st, m.w.layers[(size_t) il], il, firsts[1], counts[1], pos, unread, s, !unread,
-                                  &slot_mixer[1]);
-                if (!unread) {
-                    fork(1);
-                    fin(slot_mixer[0], 0, 4);
-                    fin(slot_mixer[1], 1, 5);
-                }
-                if (unread) { exchanged_last = false; break; }
-                gate(4);   // FFN A reads half A's residual rows
-                size_t slot_ffn[2] = {0, 0};
-                {
-                    const core::OnDevice on(m.tp->peer_dev);
-                    chunk_ffn(*m.tp->peer, m.tp->peer->w.layers[(size_t) il], counts[0], ps, firsts[0], true,
-                              &slot_ffn[0]);
-                }
-                chunk_ffn(m, m.w.layers[(size_t) il], counts[0], s, firsts[0], true, &slot_ffn[0]);
-                fork(2);
-                gate(5);   // FFN B reads half B's residual rows
-                {
-                    const core::OnDevice on(m.tp->peer_dev);
-                    chunk_ffn(*m.tp->peer, m.tp->peer->w.layers[(size_t) il], counts[1], ps, firsts[1], true,
-                              &slot_ffn[1]);
-                }
-                chunk_ffn(m, m.w.layers[(size_t) il], counts[1], s, firsts[1], true, &slot_ffn[1]);
-                fork(3);
-                fin(slot_ffn[0], 0, 6);
-                fin(slot_ffn[1], 1, 7);
-                exchanged_last = true;
-                // the block drafter's features come off the completed residual, so they wait both halves' FFN
-                // rounds (rank 0 alone carries the taps)
-                if (block && taps && next_target < taps->target_layers.size() &&
-                    taps->target_layers[next_target] == il) {
-                    gate(6);
-                    gate(7);
-                    const core::OnDevice on(m.tp_rank == 0 ? 0 : 1);
-                    chunk_tap(m, st, T, *taps, next_target++);
-                }
-            }
-            if (exchanged_last) { gate(6); gate(7); }   // chunk_finish reads the residual
-            if (!ev_ok) {
-                err = "dense tp: the pull lanes' events failed";
-                m.tp->mb.poison();
-                return false;
-            }
-        } else {
-            for (int il = 0; il < m.g.n_layers; ++il) {
-                {
-                    const core::OnDevice on(m.tp->peer_dev);
-                    chunk_layers(*m.tp->peer, *st.peer, T, pos, il, il + 1, nullptr, read_last, m.g.n_layers);
-                }
-                chunk_layers(m, st, T, pos, il, il + 1, block ? &m.w.dflash : nullptr, read_last, m.g.n_layers);
-            }
-        }
-        if (m.tp->epi[0] != m.tp->epi[1]) {
-            err = "dense tp: chunk T=" + std::to_string(T) + " pos=" + std::to_string((long long) pos) + ": cards queued " +
-                  std::to_string((int) m.tp->epi[1]) + " and " + std::to_string((int) m.tp->epi[0]) + " exchanges (not lockstep)";
-            m.tp->mb.poison();
-            return false;
-        }
-        if (m.tp->epi[0] & 1) {   // the two slots alternate across the chunk's reset: an odd count reuses a slot back to back
-            err = "dense tp: chunk T=" + std::to_string(T) + ": a body must queue an even number of exchanges";
-            m.tp->mb.poison();
-            return false;
-        }
-        if (m.tp->mb.hang_reported()) {   // an exchange failed to enqueue: the rounds already queued no longer pair
-            err = "dense tp: an exchange diverged while the chunk was enqueued";
-            return false;
-        }
-        if (!cuda_ok("dense tp chunk", err)) return false;
-        // the block drafter's context: the chunk's rows become its ring cells on rank 0 (its projections post no
-        // exchanges, and the residual the taps read is the pair's combined one). The MTP drafter's history stays
-        // unwired on a pair: its products would post exchanges only rank 0 queues (the load refuses it).
-        if (block && !chunk_finish(m, st, T, pos, err)) return false;
-        return true;
-    }
     if (!m.ensure_chunk(err)) return false;
     chunk_start(m, st, tokens, rows, T, pos3);
     chunk_layers(m, st, T, pos, 0, m.g.n_layers, m.o.drafter == Drafter::Block ? &m.w.dflash : nullptr);
