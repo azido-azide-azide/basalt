@@ -75,8 +75,9 @@ class Http(unittest.TestCase):
     def test_the_contract(self):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
-        self.assertEqual(set(m), {"engine", "live", "requests", "best", "p85", "totals", "conversation", "experts_map",
+        self.assertEqual(set(m), {"engine", "live", "requests", "best", "p85", "rates", "totals", "conversation", "experts_map",
                                  "hardware", "hardware_static", "history", "models", "swap"})
+        self.assertEqual(set(m["rates"]), {"decode", "prefill"})   # per-request rate series (Leon 11-25)
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
@@ -135,9 +136,11 @@ class Http(unittest.TestCase):
         rows = self.call("/metrics")[1]["requests"]
         self.assertEqual([r["id"] for r in rows], ["r_0004", "r_0003", "r_0002", "r_0001"])      # newest first
         self.assertEqual([r["path"] for r in rows], paths[::-1])
-        self.assertEqual(set(rows[0]), {"id", "path", "slot", "time", "duration_s", "finish", "prompt_tokens", "reused",
+        self.assertEqual(set(rows[0]), {"id", "path", "slot", "time", "duration_s", "finish", "error_msg",
+                                        "prompt_tokens", "reused",
                                         "output_tokens", "decode_tok_s", "prompt_ms", "hit_rate",
                                         "pcie_share", "ssd_share", "drafts_offered", "drafts_accepted", "ttft_s", "draft_len"})
+        self.assertIsNone(rows[0]["error_msg"])                    # a clean "stop" carries no error
         self.assertEqual((rows[0]["reused"], rows[0]["hit_rate"], rows[0]["drafts_accepted"]), (3, 0.9, 2))
         self.assertEqual(rows[0]["slot"], 0)
         self.assertGreaterEqual(rows[0]["ttft_s"], 0)

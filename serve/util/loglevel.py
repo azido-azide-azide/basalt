@@ -8,6 +8,12 @@ Markers, one per kind of writer:
            [server] warning: <text>         warning    (a startup block line reads `warning  <text>`)
            [server] error: <text>           error
   python   a "Traceback (most recent call last):" block, and the exception line that ends it   error
+  crash    marker-less crash output of native code (a `file.cu:123:` / `file.cpp:123:` diagnostic,
+           a CUDA_CHECK abort, `terminate called after throwing`, `what():`, "Segmentation
+           fault", "Aborted", "core dumped")                                     error
+           (added 11-25: these lines are what the Errors tab is opened for. The tested no-marker
+           noise — a bare "CUDA error: out of memory" from elastic KV, "request failed with a
+           timeout" — stays info: only unambiguous abort output crosses over)
   other    anything else (driver and library output, engine tables)                             info
 """
 from __future__ import annotations
@@ -22,6 +28,9 @@ LEGACY = re.compile(r"basalt (?P<lvl>warning|error): (?P<text>.*)", re.S)
 SERVER = re.compile(r"\[server\] (?:(?P<lvl>warning|error)(?:: | {2,}))?")
 TRACEBACK = "Traceback (most recent call last):"
 CHAINED = ("During handling of the above exception", "The above exception was the direct cause")
+CRASH = re.compile(
+    r"\.(?:cu|cpp|cc|cxx|hpp|hh|c):(\d+)|terminate called after throwing|CUDA_CHECK\w*.*failed|"
+    r"what\(\):|Segmentation fault|^Aborted|core dumped")
 
 
 class EngineLine(NamedTuple):
@@ -68,4 +77,6 @@ class LevelReader:
         if e is not None:
             return e.level
         s = server_level(line)
-        return INFO if s is None else s
+        if s is not None:
+            return s
+        return ERR if CRASH.search(line) else INFO
