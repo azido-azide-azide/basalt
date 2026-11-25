@@ -227,11 +227,10 @@ function openDist(kind) {
   bins.forEach((c, i) => {
     const hh = c / top * ih;
     if (c) bars += `<rect x="${(padL + i * bwid + bwid * .12).toFixed(1)}" y="${(padT + ih - hh).toFixed(1)}" width="${(bwid * .76).toFixed(1)}" height="${hh.toFixed(1)}" fill="${kind === "decode" ? "var(--accent)" : "var(--fg-2)"}" opacity=".9"/>`;
-    const edge = i === 0 ? padL + bwid * .5 : padL + i * bwid;
-    if (c && (i === 0 || bins[i - 1] === 0))
-      ticksHtml += `<span class="mtk" style="left:${edge / W * 100}%">${tick(i === 0 ? lo : lo + i * bw)}</span>`;
+    if (c)   // LEON 11-25: the number sits under EVERY bar: the bin's lower bound, centred
+      ticksHtml += `<span class="mtk" style="left:${(padL + i * bwid + bwid * .5) / W * 100}%">${tick(lo + i * bw)}</span>`;
   });
-  ticksHtml += `<span class="mtk end" style="right:0">${tick(hi)}</span>`;
+  if (hi > lo) ticksHtml += `<span class="mtk end" style="right:0">${tick(hi)}</span>`;   // the top of the last bar
   const svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`
     + [0, .5, 1].map(f => `<line x1="${padL}" x2="${W}" y1="${padT + ih - f * ih}" y2="${padT + ih - f * ih}" stroke="${f === 0 ? "var(--line)" : "var(--line-soft)"}" vector-effect="non-scaling-stroke"/>`).join("")
     + bars + `</svg>`;
