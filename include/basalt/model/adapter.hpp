@@ -108,8 +108,6 @@ struct LoadRequest {
     RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
-     int diag_split_at = 0;            ///< diagnostic: a model's layers split at this one across two cards (0: off)
-     int tp = 0;                       ///< --tp: tensor-parallel the dense model across this many cards (0 or 1: off)
 };
 
 struct DecodeRequest {
