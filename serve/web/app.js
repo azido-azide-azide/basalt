@@ -159,6 +159,7 @@ function drawHero(live, hist, reqs, best, slots, total) {
   text($("#dec-sub"), total > 1 ? `${total} slots · ${act ? `${act} busy` : "idle"}` : act ? "1 slot · busy" : "1 slot · idle");
   $("#dec-v").title = [bd ? `Best ${fmt(bd.tok_s, 1)} tok/s (${bd.id}, ${fmt(bd.output_tokens)} tokens, ${clock(bd.time * 1000)})` : "",
     pDec ? `P85 ${fmt(pDec.tok_s, 1)} tok/s · the 85th percentile of ${fmt(pDec.n)} kept requests with at least ${fmt(pDec.min_tokens)} output tokens` : "",
+    "click: the distribution of all requests since the engine started",
     cached(conv, live) ? `${conv.parked} chat${conv.parked === 1 ? "" : "s"} cached · ${gib(conv.bytes)} GiB` : ""].filter(Boolean).join("\n");
 
   // the live read rate while reading, else the newest finished request's that really read its prompt (a follow-up that read a
@@ -177,8 +178,72 @@ function drawHero(live, hist, reqs, best, slots, total) {
   text($("#pre-sub"), lp ? `last prompt ${lp}${hit != null ? ` · ${hit}% cached` : ""}` : "");
   $("#pre-v").title = [lp ? `Last prompt ${lp}` : "", hit != null ? `Prefix cache hit ${hit}%` : "",
     bp ? `Best ${fmt(bp.tok_s)} tok/s (${bp.id}, ${fmt(bp.read_tokens)} tokens read)` : "",
-    pPre ? `P85 ${fmt(pPre.tok_s)} tok/s · the 85th percentile of ${fmt(pPre.n)} kept reads of at least ${fmt(pPre.min_tokens)} newly read tokens` : ""].filter(Boolean).join("\n");
+    pPre ? `P85 ${fmt(pPre.tok_s)} tok/s · the 85th percentile of ${fmt(pPre.n)} kept reads of at least ${fmt(pPre.min_tokens)} newly read tokens` : "",
+    "click: the distribution of all requests since the engine started"].filter(Boolean).join("\n");
 }
+
+/* ---- modal: one overlay, reused by the error view and the rate distributions (Leon 11-25) ---- */
+let modalEl = null, onKey = null;
+function openModal(titleHtml, bodyHtml, tone) {
+  closeModal();
+  modalEl = document.createElement("div");
+  modalEl.className = "modal";
+  html(modalEl, `<div class="mbox" role="dialog" aria-modal="true">`
+    + `<div class="mhd ${tone || ""}"><span>${titleHtml}</span><button type="button" aria-label="Close">×</button></div>`
+    + `<div class="mbd">${bodyHtml}</div></div>`);
+  modalEl.addEventListener("click", e => { if (e.target === modalEl || e.target.tagName === "BUTTON") closeModal(); });
+  document.body.appendChild(modalEl);
+  onKey = e => { if (e.key === "Escape") closeModal(); };
+  document.addEventListener("keydown", onKey);
+}
+function closeModal() {
+  if (!modalEl) return;
+  modalEl.remove(); modalEl = null;
+  if (onKey) { document.removeEventListener("keydown", onKey); onKey = null; }
+}
+
+/* ---- rate distributions: click the big Decode/Prefill numbers (Leon 11-25) ----
+   histogram of the per-request rates of EVERY finished request the engine kept
+   (its history deque, ≤500 since the engine started), fed by /metrics .rates. */
+$(".hero").addEventListener("click", e => {
+  const d = e.target.closest(".col.dec, .col.pc"); if (!d) return;
+  openDist(d.classList.contains("pc") ? "prefill" : "decode");
+});
+function openDist(kind) {
+  const v = (((M || {}).rates) || {})[kind] || [];
+  const gate = kind === "decode" ? "generations of ≥ 256 output tokens enter the best/P85 figures"
+    : "prompt reads of ≥ 4,096 newly read tokens enter the best/P85 figures";
+  const title = `${kind === "decode" ? "Decode" : "Prefill"} tok/s · every request since the engine started`;
+  if (!v.length) { openModal(title, `<div class="empty">No ${kind} rates recorded yet.</div>`); return; }
+  const st = stats(v);
+  const W = 560, H = 190, padL = 34, padB = 20, padT = 10;
+  const lo = v[0], hi = v[v.length - 1];
+  const n = clamp(Math.ceil(Math.log2(v.length) + 1), 1, Math.min(20, new Set(v).size));
+  const bw = (hi - lo) / n || 1;
+  const bins = new Array(n).fill(0);
+  v.forEach(x => bins[clamp(Math.floor((x - lo) / bw), 0, n - 1)]++);
+  const top = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000].find(s2 => s2 >= Math.max(...bins)) || Math.ceil(Math.max(...bins) / 1000) * 1000;
+  const iw = W - padL, ih = H - padB - padT, bwid = iw / n;
+  let bars = "", ticksHtml = "";
+  bins.forEach((c, i) => {
+    const hh = c / top * ih;
+    if (c) bars += `<rect x="${(padL + i * bwid + bwid * .12).toFixed(1)}" y="${(padT + ih - hh).toFixed(1)}" width="${(bwid * .76).toFixed(1)}" height="${hh.toFixed(1)}" fill="${kind === "decode" ? "var(--accent)" : "var(--fg-2)"}" opacity=".9"/>`;
+    const edge = i === 0 ? padL + bwid * .5 : padL + i * bwid;
+    if (c && (i === 0 || bins[i - 1] === 0))
+      ticksHtml += `<span class="mtk" style="left:${edge / W * 100}%">${tick(i === 0 ? lo : lo + i * bw)}</span>`;
+  });
+  ticksHtml += `<span class="mtk end" style="right:0">${tick(hi)}</span>`;
+  const svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`
+    + [0, .5, 1].map(f => `<line x1="${padL}" x2="${W}" y1="${padT + ih - f * ih}" y2="${padT + ih - f * ih}" stroke="${f === 0 ? "var(--line)" : "var(--line-soft)"}" vector-effect="non-scaling-stroke"/>`).join("")
+    + bars + `</svg>`;
+  openModal(title, `<div class="mstat"><span><b>${fmt(v.length)}</b> requests</span>`
+    + `<span>min <b>${fmt(st.min, 1)}</b></span><span>median <b>${fmt(q(v, .5), 1)}</b></span>`
+    + `<span>p85 <b>${fmt(q(v, .85), 1)}</b></span><span>p95 <b>${fmt(q(v, .95), 1)}</b></span>`
+    + `<span>max <b>${fmt(st.max, 1)}</b></span></div>`
+    + `<div class="mchart">${svg}<span class="mtk yl" style="top:0">${tick(top)}</span><span class="mtk yl" style="top:50%">${tick(top / 2)}</span>${ticksHtml}</div>`
+    + `<div class="mnote">${fmt(v.length)} values · ${n} bin${n === 1 ? "" : "s"} · ${gate} · the live chart above stays the recent view</div>`);
+}
+const q = (sorted, p) => sorted.length ? sorted[clamp(Math.ceil(sorted.length * p) - 1, 0, sorted.length - 1)] : null;
 
 /* ---- the expert map. Its cells fill the column. Without a per-expert map from the server (PENDING) it is the last request's lookup
    split drawn as cells: one cell per 1/N of the lookups, in tier order, static until the next request. A dense model's weights
@@ -470,18 +535,36 @@ function requestsPane(live, reqs, multi) {
   const rows = [];
   if (!multi && (live.state === "reading" || live.state === "generating"))
     rows.push({ t: Date.now() / 1000 - (live.elapsed_s || 0), id: "Running", path: "", out: live.generated, tps: live.tok_s, dur: live.elapsed_s, live: true });
-  reqs.forEach(r => rows.push({ t: r.time, id: r.id, slot: r.slot, path: r.path, out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s, finish: r.finish }));
+  reqs.forEach(r => rows.push({ t: r.time, id: r.id, slot: r.slot, path: r.path, out: r.output_tokens, tps: r.decode_tok_s, dur: r.duration_s, finish: r.finish, err: r.error_msg }));
   if (!rows.length) return `<div class="qnone">No requests yet</div>`;
   return `<table><thead><tr><th>Time</th><th>ID</th>${multi ? "<th>Slot</th>" : ""}<th>Endpoint</th><th class="r">Output</th><th class="r">Rate</th><th class="r">Duration</th></tr></thead><tbody>`
     + rows.map(r => {
-      // a request that did not simply stop is marked on its id, with the reason
+      // a request that did not simply stop is marked on its id, with the reason;
+      // the short reason is clickable and opens the exact message (Leon 11-25)
       const odd = r.finish && r.finish !== "stop" ? (r.finish === "error" ? "err" : "warn") : "";
-      return `<tr${r.live ? ` class="live"` : ""}><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${odd ? ` · ${esc(r.finish)}` : ""}</td>`
+      const reason = r.finish && r.finish !== "stop"
+        ? ` · <span class="ereason" data-id="${esc(r.id)}" data-t="${r.t}" data-ep="${esc(r.path ? ep(r.path) : "-")}" data-msg="${esc(r.err || r.finish)}" tabindex="0" title="${esc((r.err || r.finish) + " · click for the exact message")}">${esc(shortReason(r.finish, r.err))}</span>`
+        : "";
+      return `<tr${r.live ? ` class="live"` : ""}><td>${clock(r.t * 1000)}</td><td class="${odd}">${esc(r.id)}${reason}</td>`
         + (multi ? `<td class="dim">${num(r.slot) ? `s${r.slot + 1}` : "-"}</td>` : "")
         + `<td>${r.live ? "-" : esc(ep(r.path))}</td><td class="r">${num(r.out) ? fmt(r.out) : "-"}</td><td class="r">${num(r.tps) ? r.tps.toFixed(1) : "-"}</td>`
         + `<td class="r">${num(r.dur) ? `${r.dur.toFixed(1)} s` : "-"}</td></tr>`;
     }).join("") + `</tbody></table>`;
 }
+// the chip's short label: the last meaningful segment of the message
+function shortReason(finish, errMsg) {
+  if (!errMsg) return finish;
+  const last = String(errMsg).split("|").pop().trim();
+  const m = last.match(/Error type:\s*(.+)/);
+  const core = (m ? m[1] : last).replace(/"/g, "");
+  return core.length > 42 ? core.slice(0, 41) + "…" : core || finish;
+}
+$("#p-req").addEventListener("click", e => {
+  const s = e.target.closest(".ereason"); if (!s || !s.dataset.msg) return;
+  openModal(`Request ${esc(s.dataset.id)} · ${clock((+s.dataset.t * 1000) || Date.now())}`
+    + (s.dataset.ep && s.dataset.ep !== "-" ? ` · ${esc(s.dataset.ep)}` : ""),
+    `<div class="emsg">${esc(s.dataset.msg)}</div>`, "error");
+});
 const mss = s => `${Math.floor(s / 60)}:${p2(Math.floor(s % 60))}`;
 function queuePane(live) {
   const q = live.queue || [], n = live.queued || 0;
