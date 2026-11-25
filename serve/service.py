@@ -1018,9 +1018,16 @@ class Service:
 
         p85 = {k: {"tok_s": round(nearest_rank(v), 1), "n": len(v), "min_tokens": gate}
                for k, v, gate in (("decode", dec, BEST_MIN_OUT), ("prefill", pre, BEST_MIN_READ)) if v}
+        # the whole per-request rate series (every kept finish, no gates, since the engine started):
+        # what the click-the-big-number distribution modal plots (Leon 11-25)
+        rates = {"decode": sorted(r["decode_tok_s"] for r in hist if r.get("decode_tok_s")),
+                 "prefill": sorted(round(((r["prompt_tokens"] or 0) - (r["reused"] or 0)) * 1000 / r["prompt_ms"], 1)
+                                   for r in hist
+                                   if (r["prompt_tokens"] or 0) - (r["reused"] or 0) > 0 and r.get("prompt_ms"))}
         console = getattr(self.engine, "console", None)
         return {**({"slots": rows if self.loaded() else []} if include_slots else {}),
                 "engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best, "p85": p85,
+                "rates": rates,
                 "experts_map": console.expert_map() if console is not None else None,
                 "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
                 "hardware": hardware_view(tel["now"], tel["static"], info, cards, l3), "hardware_static": tel["static"],
@@ -1800,10 +1807,12 @@ class Service:
                                 drained = True
                         except EngineDied as e:
                             finish = "error"
+                            st["err_msg"] = f"engine died: {e}"
                             self._say_died(e)
                             raise
                         except ValueError as e:             # the engine's ERR line
                             finish = "error"
+                            st["err_msg"] = str(e)
                             print(f"[server] error: engine reported {e}", flush=True)
                             raise
                         except GeneratorExit:               # the client went away
@@ -1814,6 +1823,7 @@ class Service:
                                 gen.close()             # STOP and drain to this request's DONE under the fifo
                             except EngineSilent as e:   # the STOP was never acknowledged
                                 finish = "error"
+                                st["err_msg"] = f"engine went silent: its STOP was never acknowledged ({e})"
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
@@ -1838,6 +1848,7 @@ class Service:
                                    "waited for room; the conversation is kept, so asking again continues it"
                                    if run_last.get("finish") == "room" else
                                    "the grammar allowed no token to continue the reply; the engine log has the state")
+                            st["err_msg"] = err
                             print(f"[server] error: engine reported {err}", flush=True)
                             raise EngineError(err)
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
@@ -1948,11 +1959,14 @@ class Service:
                                 sampling = {k: v for k, v in sampling.items() if k != GPROMPT_KEY}
                     if cancel.is_set():
                         finish = "cancel"
+                        st["err_msg"] = st.get("err_msg") or "cancelled by the client"
                     elif finish == "length" and n < max_new and self.stopping.is_set():
                         finish = "error"                # the engine's QUIT ended the reply short of its cap
+                        st["err_msg"] = "the server is stopping"
                         raise EngineDied("the server is stopping")
                 except GeneratorExit:                  # client disconnected
                     finish = "disconnect"
+                    st["err_msg"] = "client disconnected before the reply ended"
                     raise
                 finally:
                     # settle status and history under the fifo, before the next request sets its own
@@ -1999,6 +2013,7 @@ class Service:
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path, "slot": self._slot_of(st),
                                 "time": started, "duration_s": round(now_done - started, 1), "finish": finish,
+                                "error_msg": (st.get("err_msg") if finish != "stop" else None),
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "prompt_ms": last.get("prompt_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
