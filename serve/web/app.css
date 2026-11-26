@@ -660,7 +660,8 @@ a.tot { color: inherit; text-decoration: none; }
 .emsg { font: 12.5px/1.7 var(--font-mono); color: var(--err); white-space: pre-wrap; overflow-wrap: anywhere; }
 .mstat { display: flex; flex-wrap: wrap; gap: 16px; font: 12.5px/1 var(--font-mono); color: var(--fg-3); margin-bottom: 16px; white-space: nowrap; }
 .mstat b { color: var(--fg); font-weight: 600; }
-.mchart { position: relative; height: 200px; margin: 0 0 26px; }
+.msub { font: 600 10.5px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--fg-3); margin: 0 0 6px; }
+.mchart { position: relative; height: 176px; margin: 0 0 22px; }
 .mchart svg { position: absolute; inset: 0 0 16px 0; width: 100%; height: calc(100% - 16px); }
 .mchart .mtk { position: absolute; bottom: -2px; transform: translateX(-50%); font: 10.5px/1 var(--font-mono); color: var(--fg-3); white-space: nowrap; }
 .mchart .mtk.end { transform: none; }
