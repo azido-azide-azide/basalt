@@ -210,38 +210,61 @@ $(".hero").addEventListener("click", e => {
 });
 function openDist(kind) {
   const v = (((M || {}).rates) || {})[kind] || [];
-  const gate = kind === "decode" ? "generations of ≥ 256 output tokens enter the best/P85 figures"
-    : "prompt reads of ≥ 4,096 newly read tokens enter the best/P85 figures";
+  const gate = kind === "decode" ? "generations of >= 256 output tokens enter the best/P85 figures"
+    : "prompt reads of >= 4,096 newly read tokens enter the best/P85 figures";
   const title = `${kind === "decode" ? "Decode" : "Prefill"} tok/s · every request since the engine started`;
   if (!v.length) { openModal(title, `<div class="empty">No ${kind} rates recorded yet.</div>`); return; }
   const st = stats(v);
-  const W = 560, H = 190, padL = 34, padB = 20, padT = 10;
+  const W = 560, H = 176, padL = 34, padB = 20, padT = 10;
   const lo = v[0], hi = v[v.length - 1];
-  const n = clamp(Math.ceil(Math.log2(v.length) + 1), 1, Math.min(20, new Set(v).size));
-  const bw = (hi - lo) / n || 1;
-  const bins = new Array(n).fill(0);
-  v.forEach(x => bins[clamp(Math.floor((x - lo) / bw), 0, n - 1)]++);
-  const top = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000].find(s2 => s2 >= Math.max(...bins)) || Math.ceil(Math.max(...bins) / 1000) * 1000;
-  const iw = W - padL, ih = H - padB - padT, bwid = iw / n;
-  let bars = "", ticksHtml = "";
-  bins.forEach((c, i) => {
-    const hh = c / top * ih;
-    if (c) bars += `<rect x="${(padL + i * bwid + bwid * .12).toFixed(1)}" y="${(padT + ih - hh).toFixed(1)}" width="${(bwid * .76).toFixed(1)}" height="${hh.toFixed(1)}" fill="${kind === "decode" ? "var(--accent)" : "var(--fg-2)"}" opacity=".9"/>`;
-    const edge = i === 0 ? padL + bwid * .5 : padL + i * bwid;
-    if (c && (i === 0 || bins[i - 1] === 0))
-      ticksHtml += `<span class="mtk" style="left:${edge / W * 100}%">${tick(i === 0 ? lo : lo + i * bw)}</span>`;
+  const iw = W - padL, ih = H - padB - padT;
+  const fill = kind === "decode" ? "var(--accent)" : "var(--fg-2)";
+  const grid = [0, .5, 1].map(f => `<line x1="${padL}" x2="${W}" y1="${padT + ih - f * ih}" y2="${padT + ih - f * ih}" stroke="${f === 0 ? "var(--line)" : "var(--line-soft)"}" vector-effect="non-scaling-stroke"/>`).join("");
+  // binner: n bins over [lo, hi]; the count axis top is the ladder rung over the max bin
+  function binned(nWanted) {
+    const n = clamp(Math.max(1, Math.min(nWanted, new Set(v).size)), 1, nWanted);
+    const bw2 = (hi - lo) / n || 1;
+    const bs = new Array(n).fill(0);
+    v.forEach(x => bs[clamp(Math.floor((x - lo) / bw2), 0, n - 1)]++);
+    const top2 = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000].find(s2 => s2 >= Math.max(...bs)) || Math.ceil(Math.max(...bs) / 1000) * 1000;
+    return { n, bw: bw2, b: bs, top: top2, bwid: iw / n };
+  }
+  function yLabels(top2) { return `<span class="mtk yl" style="top:0">${tick(top2)}</span><span class="mtk yl" style="top:50%">${tick(top2 / 2)}</span>`; }
+
+  // panel 1: the bars (adaptive bin count; the number under EVERY bar = that bin's lower bound)
+  const nb = clamp(Math.ceil(Math.log2(v.length) + 1), 1, Math.min(20, new Set(v).size));
+  const B = binned(nb);
+  let barRects = "", barTicks = "";
+  B.b.forEach((c, i) => {
+    if (!c) return;
+    const hh = c / B.top * ih;
+    barRects += `<rect x="${(padL + i * B.bwid + B.bwid * .12).toFixed(1)}" y="${(padT + ih - hh).toFixed(1)}" width="${(B.bwid * .76).toFixed(1)}" height="${hh.toFixed(1)}" fill="${fill}" opacity=".9"/>`;
+    barTicks += `<span class="mtk" style="left:${(padL + i * B.bwid + B.bwid * .5) / W * 100}%">${tick(lo + i * B.bw)}</span>`;
   });
-  ticksHtml += `<span class="mtk end" style="right:0">${tick(hi)}</span>`;
-  const svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`
-    + [0, .5, 1].map(f => `<line x1="${padL}" x2="${W}" y1="${padT + ih - f * ih}" y2="${padT + ih - f * ih}" stroke="${f === 0 ? "var(--line)" : "var(--line-soft)"}" vector-effect="non-scaling-stroke"/>`).join("")
-    + bars + `</svg>`;
+  if (hi > lo) barTicks += `<span class="mtk end" style="right:0">${tick(hi)}</span>`;
+  const barSvg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${grid}${barRects}</svg>`;
+
+  // panel 2: the line (Leon 11-25): FIXED 20 bins, the curve through the bin midpoints,
+  // the tok/s of every bin's lower bound under every dot; no end tick, the max is in the stats row
+  const L = binned(20);
+  const pts = L.b.map((c, i) => [padL + i * L.bwid + L.bwid * .5, padT + ih - (c / L.top) * ih]);
+  const path = "M" + pts.map(pt => `${pt[0].toFixed(1)},${pt[1].toFixed(1)}`).join("L");
+  const area = `M${pts[0][0].toFixed(1)},${padT + ih} L` + pts.map(pt => `${pt[0].toFixed(1)},${pt[1].toFixed(1)}`).join("L") + ` L${pts[pts.length - 1][0].toFixed(1)},${padT + ih} Z`;
+  const dots = pts.map(pt => `<circle cx="${pt[0].toFixed(1)}" cy="${pt[1].toFixed(1)}" r="2.2" fill="var(--surface)" stroke="${fill}" stroke-width="1.4"/>`).join("");
+  const lineTicks = L.b.map((c, i) => `<span class="mtk" style="left:${(padL + i * L.bwid + L.bwid * .5) / W * 100}%">${tick(lo + i * L.bw)}</span>`).join("");
+  const lineSvg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${grid}<path d="${area}" fill="${fill}" opacity=".10"/><path d="${path}" fill="none" stroke="${fill}" stroke-width="1.8" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>${dots}</svg>`;
+
   openModal(title, `<div class="mstat"><span><b>${fmt(v.length)}</b> requests</span>`
     + `<span>min <b>${fmt(st.min, 1)}</b></span><span>median <b>${fmt(q(v, .5), 1)}</b></span>`
     + `<span>p85 <b>${fmt(q(v, .85), 1)}</b></span><span>p95 <b>${fmt(q(v, .95), 1)}</b></span>`
     + `<span>max <b>${fmt(st.max, 1)}</b></span></div>`
-    + `<div class="mchart">${svg}<span class="mtk yl" style="top:0">${tick(top)}</span><span class="mtk yl" style="top:50%">${tick(top / 2)}</span>${ticksHtml}</div>`
-    + `<div class="mnote">${fmt(v.length)} values · ${n} bin${n === 1 ? "" : "s"} · ${gate} · the live chart above stays the recent view</div>`);
+    + `<div class="msub">BAR CHART · ${nb} bin${nb === 1 ? "" : "s"}</div>`
+    + `<div class="mchart">${barSvg}${yLabels(B.top)}${barTicks}</div>`
+    + `<div class="msub">LINE · 20 BINS</div>`
+    + `<div class="mchart">${lineSvg}${yLabels(L.top)}${lineTicks}</div>`
+    + `<div class="mnote">${fmt(v.length)} values · tok/s at each bin's lower bound sits under it · ${gate} · the live chart above stays the recent view</div>`);
 }
+
 const q = (sorted, p) => sorted.length ? sorted[clamp(Math.ceil(sorted.length * p) - 1, 0, sorted.length - 1)] : null;
 
 /* ---- the expert map. Its cells fill the column. Without a per-expert map from the server (PENDING) it is the last request's lookup
