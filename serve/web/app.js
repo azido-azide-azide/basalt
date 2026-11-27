@@ -1018,6 +1018,7 @@ async function showLogs() {            // the level buttons ask the server for t
   } catch (e) { /* the metrics poll reports the connection */ }
 }
 function append(lines) {
+  if (!lines || !lines.length) return;      // SSE delivers empty frames; the ticker reads lines[len-1]
   logBuf.push(...lines);
   if (logBuf.length > MAXLOG) logBuf.splice(0, logBuf.length - MAXLOG);
   logCount += lines.length; warnCount += lines.filter(l => l.lvl === "warn" || l.lvl === "err").length;
