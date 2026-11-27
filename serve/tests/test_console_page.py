@@ -388,7 +388,9 @@ class LogStreamAndLevels(unittest.TestCase):
     def test_css_matches_server_log_levels(self):
         self.assertIn(f"#log .{ERR} span, #log .{ERR} u", APP_CSS)
         self.assertIn(f"#log.warnonly > div:not(.{WARN}):not(.{ERR}):not(.empty)", APP_CSS)
-        self.assertIn(f"#log > div:last-child:not(.{WARN}):not(.{ERR}):not(.empty) span", APP_CSS)
+        # this fork's rule puts :not(.empty) first and carries :not(.err)/:not(.warn) after it (11-25 pass);
+        # same meaning as upstream's :not(.warn):not(.err):not(.empty), different order
+        self.assertIn(f"#log > div:last-child:not(.empty):not(.{ERR}):not(.{WARN}) span", APP_CSS)
         self.assertIn(f'.ticker[data-lvl="{ERR}"] span', APP_CSS)
         self.assertNotIn("#log .error", APP_CSS)
         self.assertNotIn(":not(.error)", APP_CSS)
