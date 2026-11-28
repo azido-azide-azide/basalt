@@ -26,7 +26,7 @@ Upstream, plus the changes one deployment runs on top of it:
 
 Nothing else is changed.
 
-Synced to upstream main at `e0b322be` (0.5.7+, 2026-11-27). The BF16 PLE rows this fork pioneered shipped upstream in
+Synced to upstream main at `61552312` (0.5.7+, 2026-11-28). The BF16 PLE rows this fork pioneered shipped upstream in
 0.3.1 ([#185](https://github.com/jesdga95/basalt/pull/185)), and this rig's community runs now live upstream in
 `docs/community/benchmarks.json`, so neither is carried here any more.
 
